@@ -137,8 +137,8 @@ GSAPrefetchEngineC::GSAPrefetchEngineC(torch::Tensor& freeBlock, torch::Tensor& 
     mExtraTopkLen = extraTopkLen;
     mLogger.log(LogLevel::INFO,
                 "GSAPrefetchEngineC Init mLayerNum %d mMaxBs %u, mUseMla %d, mHeadSzie %u, mTPSize "
-                "%u mBlockSize %u mHeadNum %u\n",
-                mLayerNum, mMaxBs, mUseMla, mHeadSzie, mTPSize, mBlockSize, mHeadNum);
+                "%u mBlockSize %u mHeadNum %u, mIsPythonLoad %d\n",
+                mLayerNum, mMaxBs, mUseMla, mHeadSzie, mTPSize, mBlockSize, mHeadNum, mIsPythonLoad);
 }
 
 size_t GSAPrefetchEngineC::GetOffset(uint32_t layerID, bool isV)

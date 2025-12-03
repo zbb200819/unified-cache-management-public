@@ -119,6 +119,7 @@ class GSAReqStat:
             hash_value = self.request_hasher(
                 (parent_block_hash_value, curr_block_token_ids_tuple)
             )
+            self.block_hashes.append(str(hash_value))
             parent_block_hash_value = hash_value
 
         if self.rank != 0 and not self.use_mla:
