@@ -583,7 +583,7 @@ class GSA(UcmSparseBase):
             if not self.use_mla:
                 self.gsa_q_cache[current_layer_id][: len(ids)].copy_(query[ids])
             else:
-                self.gsa_q_cache[current_layer_id][:len(self.decode_index)].copy_(
+                self.gsa_q_cache[current_layer_id][: len(self.decode_index)].copy_(
                     query
                 )
             is_cal_kpre = len(self.model_input["calc_block_table"]) > 0
@@ -673,7 +673,7 @@ class GSA(UcmSparseBase):
                             current_layer_id
                         ][self.decode_index]
                     else:
-                        attn_metadata.decode.block_table[:len(self.decode_index)] = (
+                        attn_metadata.decode.block_table[: len(self.decode_index)] = (
                             self.model_input["block_tables_mp"][current_layer_id][
                                 self.decode_index
                             ]
