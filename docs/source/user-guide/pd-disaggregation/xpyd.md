@@ -13,21 +13,19 @@ For illustration purposes, let us take GPU as an example and assume the model us
 ### Run prefill servers
 Prefiller1 Launch Command:
 ```bash
-export PYTHONHASHSEED=123456
 export CUDA_VISIBLE_DEVICES=0 
 vllm serve /home/models/Qwen2.5-7B-Instruct \
 --max-model-len 20000 \
 --tensor-parallel-size 1 \
 --gpu_memory_utilization 0.87 \
 --trust-remote-code \
---enforce-eager \
 --no-enable-prefix-caching \
 --port 7800 \
 --block-size 128 \
 --kv-transfer-config \
 '{
-    "kv_connector": "UnifiedCacheConnectorV1",
-    "kv_connector_module_path": "ucm.integration.vllm.uc_connector",
+    "kv_connector": "UCMConnector",
+    "kv_connector_module_path": "ucm.integration.vllm.ucm_connector",
     "kv_role": "kv_producer",
     "kv_connector_extra_config": {
         "ucm_connector_name": "UcmNfsStore",
@@ -41,21 +39,19 @@ vllm serve /home/models/Qwen2.5-7B-Instruct \
 
 Prefiller2 Launch Command:
 ```bash
-export PYTHONHASHSEED=123456
 export CUDA_VISIBLE_DEVICES=1 
 vllm serve /home/models/Qwen2.5-7B-Instruct \
 --max-model-len 20000 \
 --tensor-parallel-size 1 \
 --gpu_memory_utilization 0.87 \
 --trust-remote-code \
---enforce-eager \
 --no-enable-prefix-caching \
 --port 7801 \
 --block-size 128 \
 --kv-transfer-config \
 '{
-    "kv_connector": "UnifiedCacheConnectorV1",
-    "kv_connector_module_path": "ucm.integration.vllm.uc_connector",
+    "kv_connector": "UCMConnector",
+    "kv_connector_module_path": "ucm.integration.vllm.ucm_connector",
     "kv_role": "kv_producer",
     "kv_connector_extra_config": {
         "ucm_connector_name": "UcmNfsStore",
@@ -83,8 +79,8 @@ vllm serve /home/models/Qwen2.5-7B-Instruct \
 --block-size 128 \
 --kv-transfer-config \
 '{
-    "kv_connector": "UnifiedCacheConnectorV1",
-    "kv_connector_module_path": "ucm.integration.vllm.uc_connector",
+    "kv_connector": "UCMConnector",
+    "kv_connector_module_path": "ucm.integration.vllm.ucm_connector",
     "kv_role": "kv_consumer",
     "kv_connector_extra_config": {
         "ucm_connector_name": "UcmNfsStore",
@@ -110,8 +106,8 @@ vllm serve /home/models/Qwen2.5-7B-Instruct \
 --block-size 128 \
 --kv-transfer-config \
 '{
-    "kv_connector": "UnifiedCacheConnectorV1",
-    "kv_connector_module_path": "ucm.integration.vllm.uc_connector",
+    "kv_connector": "UCMConnector",
+    "kv_connector_module_path": "ucm.integration.vllm.ucm_connector",
     "kv_role": "kv_consumer",
     "kv_connector_extra_config": {
         "ucm_connector_name": "UcmNfsStore",
