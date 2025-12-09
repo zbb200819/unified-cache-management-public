@@ -938,9 +938,9 @@ class GSA(UcmSparseBase):
         fn = getattr(self.connector, "load")
         precision = self.element_size
         if self.use_mla:
-            block_data_size = kv_caches[0].numel() * precision
-        else:
             block_data_size = kv_caches[0][0].numel() * precision
+        else:
+            block_data_size = kv_caches[0][0][0].numel() * precision
 
         offsets_k = []
         key_src_tensors = []
@@ -1072,7 +1072,6 @@ class GSA(UcmSparseBase):
                     is_decode.append(True)
                     one_topk_len = (
                         gsa_config.compute_topk_len(len(req_meta.blocks))
-                        + gsa_config.num_prefetch_blocks
                     )
                     topk_len_list.append(one_topk_len)
                     if CUDA_TOPK:
