@@ -138,7 +138,8 @@ GSAPrefetchEngineC::GSAPrefetchEngineC(torch::Tensor& freeBlock, torch::Tensor& 
     mLogger.log(LogLevel::INFO,
                 "GSAPrefetchEngineC Init mLayerNum %d mMaxBs %u, mUseMla %d, mHeadSzie %u, mTPSize "
                 "%u mBlockSize %u mHeadNum %u, mIsPythonLoad %d\n",
-                mLayerNum, mMaxBs, mUseMla, mHeadSzie, mTPSize, mBlockSize, mHeadNum, mIsPythonLoad);
+                mLayerNum, mMaxBs, mUseMla, mHeadSzie, mTPSize, mBlockSize, mHeadNum,
+                mIsPythonLoad);
 }
 
 size_t GSAPrefetchEngineC::GetOffset(uint32_t layerID, bool isV)
@@ -411,9 +412,7 @@ void GSAPrefetchEngineC::RunOneBsPrefetch(std::string reqID, int topkLen, int bs
         oneBsInfo.bsIndex = bsIndex;
         oneBsInfo.layerID = i;
         GetHitAndMissBlock(oneBsInfo, hitBlocks, hitBlocksIdx, missIdxs);
-        if (missIdxs.size() != 0) {
-            RunPrefetchH2D(oneBsInfo, hitBlocks, hitBlocksIdx, missIdxs);
-        }
+        if (missIdxs.size() != 0) { RunPrefetchH2D(oneBsInfo, hitBlocks, hitBlocksIdx, missIdxs); }
         int successIndex = 0;
         for (auto it = hitBlocksIdx.begin(); it != hitBlocksIdx.end(); it++) {
             mLoadSuccessBlocks[i][bsIndex][successIndex] = it->second;

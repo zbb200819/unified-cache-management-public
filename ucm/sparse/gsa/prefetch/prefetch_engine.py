@@ -140,8 +140,8 @@ class GSAPrefetchBase:
 
         if self.atb_gsa_enable:
             block_table_index = torch.tensor(self.select_bs_index, device="cpu")
-            self.topk_len = (
-                gsa_config.compute_topk_len(self._get_max_block_len(gsa_metadata))
+            self.topk_len = gsa_config.compute_topk_len(
+                self._get_max_block_len(gsa_metadata)
             )
             topk_buf_tmp = self.use_topk_caches[:, block_table_index, :]
             topk_buf_tmp = topk_buf_tmp[:, :, : self.topk_len]
@@ -189,8 +189,8 @@ class GSAPrefetchBase:
                     )
         self.topk_bs = []
         for index, req_id in enumerate(self.req_ids_bs):
-            one_topk_len = (
-                gsa_config.compute_topk_len(len(gsa_metadata.gsa_stats[req_id].blocks))
+            one_topk_len = gsa_config.compute_topk_len(
+                len(gsa_metadata.gsa_stats[req_id].blocks)
             )
             self.topk_bs.append(
                 [
