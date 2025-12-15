@@ -378,7 +378,6 @@ void GSAPrefetchEngineC::RunPrefetchH2D(PrefetchReqInfo oneBsInfo,
 {
     int layerID = oneBsInfo.layerID;
     std::string reqID = oneBsInfo.reqID;
-    int bsIndex = oneBsInfo.bsIndex;
 
     int oneFreeBlockLen = mPrefetchIdx[reqID][layerID].size();
     std::vector<int> oneFreeBlockTable;
@@ -412,7 +411,6 @@ void GSAPrefetchEngineC::RunOneBsPrefetch(std::string reqID, int topkLen, int bs
 #pragma omp parallel for num_threads(16) proc_bind(master)
     for (int i = 0; i < mLayerNum; i++) {
         mLoadSuccessBlocks[i][bsIndex].fill_(0);
-        int* freeBlockPtr = mFreeBlock[i][bsIndex].data_ptr<int>();
         std::unordered_set<int> hitBlocks;
         std::map<int, int> hitBlocksIdx;
         std::vector<int> missIdxs;
