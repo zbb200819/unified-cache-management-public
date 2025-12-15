@@ -105,8 +105,8 @@ void MutliBSThreadFun(void* args)
     if (ret == 0) { engine->SetPrefetchStatus(true); }
 }
 
-GSAPrefetchEngineC::GSAPrefetchEngineC(torch::Tensor& freeBlock, torch::Tensor& loadSuccessBlocks,
-                                       torch::Tensor& freeBlockLen, torch::Tensor& successTableLen,
+GSAPrefetchEngineC::GSAPrefetchEngineC(torch::Tensor& loadSuccessBlocks,
+                                       torch::Tensor& successTableLen,
                                        std::vector<uint32_t>& kvShape, bool useMla, bool isLog,
                                        int tpSize, int rank, int extraTopkLen, bool isPythonLoad)
     : mLogger("./log/kvcache_pre_log.txt", LogLevel::INFO, isLog)
@@ -115,8 +115,6 @@ GSAPrefetchEngineC::GSAPrefetchEngineC(torch::Tensor& freeBlock, torch::Tensor& 
     mLayerNum = mLoadSuccessBlocks.sizes()[0];
     mMaxBs = mLoadSuccessBlocks.sizes()[1];
     mMaxTopkLen = mLoadSuccessBlocks.sizes()[2];
-    mFreeBlock = freeBlock;
-    mFreeBlockLen = freeBlockLen;
     mSuccessTableLen = successTableLen;
     mIsLog = isLog;
     mBsIndexList = (int*)malloc(sizeof(int) * mMaxBs);
@@ -203,24 +201,32 @@ GSAPrefetchEngineC::~GSAPrefetchEngineC()
 }
 
 void GSAPrefetchEngineC::SetBlocksMap(std::string reqID, std::vector<int>& blockTableList,
-                                      std::vector<int>& selectIndex,
+                                      std::vector<int>& remainIdx, std::vector<int>& prefetchIdx,
                                       std::vector<std::string>& blocksHash, int maxIdx)
 {
     if (mBlocksMap.find(reqID) != mBlocksMap.end()) {
         mBlocksMap[reqID].clear();
         mDocsTables[reqID].clear();
         mAllBlcoksHash[reqID].clear();
+        mPrefetchIdx[reqID].clear();
     }
     mAllBlcoksHash[reqID] = blocksHash;
     for (int i = 0; i < mLayerNum; i++) {
         std::map<int, int> oneDocTable;
         std::map<int, int> oneBlockMap;
-        for (auto idx : selectIndex) {
+        std::vector<int> onePrefetchIdx;
+        for (auto idx : remainIdx) {
             oneDocTable[idx] = blockTableList[idx];
             oneBlockMap[blockTableList[idx]] = idx;
         }
+        for (auto idx : prefetchIdx) {
+            oneDocTable[idx] = blockTableList[idx];
+            oneBlockMap[blockTableList[idx]] = idx;
+            onePrefetchIdx.push_back(idx);
+        }
         mDocsTables[reqID].push_back(oneDocTable);
         mBlocksMap[reqID].push_back(oneBlockMap);
+        mPrefetchIdx[reqID].push_back(onePrefetchIdx);
     }
     mPromptLen[reqID] = maxIdx;
     PrintMap(reqID, 0);
@@ -235,11 +241,13 @@ void GSAPrefetchEngineC::SetBlocksMapMultiLayer(std::string reqID,
         mBlocksMap[reqID].clear();
         mDocsTables[reqID].clear();
         mAllBlcoksHash[reqID].clear();
+		mPrefetchIdx[reqID].clear();
     }
     mAllBlcoksHash[reqID] = blocksHash;
     for (int i = 0; i < mLayerNum; i++) {
         std::map<int, int> oneDocTable;
         std::map<int, int> oneBlockMap;
+        std::vector<int> onePrefetchIdx;
         for (auto it = remainMap[i].begin(); it != remainMap[i].end(); it++) {
             oneDocTable[it->first] = it->second;
             oneBlockMap[it->second] = it->first;
@@ -247,9 +255,11 @@ void GSAPrefetchEngineC::SetBlocksMapMultiLayer(std::string reqID,
         for (auto it = prefetchMap[i].begin(); it != prefetchMap[i].end(); it++) {
             oneDocTable[it->first] = it->second;
             oneBlockMap[it->second] = it->first;
+            onePrefetchIdx.push_back(it->first);
         }
         mDocsTables[reqID].push_back(oneDocTable);
         mBlocksMap[reqID].push_back(oneBlockMap);
+        mPrefetchIdx[reqID].push_back(onePrefetchIdx);
     }
     mPromptLen[reqID] = maxIdx;
 }
@@ -291,6 +301,7 @@ void GSAPrefetchEngineC::DelReqIDRun()
             mDocsTables.erase(*it);
             mAllBlcoksHash.erase(*it);
             mPromptLen.erase(*it);
+            mPrefetchIdx.erase(*it);
             std::cout << "Del reqID: " << *it << std::endl;
         }
         if (mPromptLen.find(*it) == mPromptLen.end()) {
@@ -369,14 +380,14 @@ void GSAPrefetchEngineC::RunPrefetchH2D(PrefetchReqInfo oneBsInfo,
     std::string reqID = oneBsInfo.reqID;
     int bsIndex = oneBsInfo.bsIndex;
 
-    int oneFreeBlockLen = mFreeBlockLen[layerID][bsIndex].item<int>();
-    int* freeBlockPtr = mFreeBlock[layerID][bsIndex].data_ptr<int>();
+    int oneFreeBlockLen = mPrefetchIdx[reqID][layerID].size();
     std::vector<int> oneFreeBlockTable;
 
     uint32_t index = 0;
+    std::vector<int> onePrefetchIdx = mPrefetchIdx[reqID][layerID];
     int oneFreeBlockIndex = 0;
     while (oneFreeBlockIndex < oneFreeBlockLen && index < missIdxs.size()) {
-        int oneFreeBlockID = freeBlockPtr[oneFreeBlockIndex];
+        int oneFreeBlockID = mDocsTables[reqID][layerID][onePrefetchIdx[oneFreeBlockIndex]];
         if (hitBlocks.find(oneFreeBlockID) != hitBlocks.end()) {
             oneFreeBlockIndex += 1;
             continue;
@@ -418,17 +429,15 @@ void GSAPrefetchEngineC::RunOneBsPrefetch(std::string reqID, int topkLen, int bs
             mLoadSuccessBlocks[i][bsIndex][successIndex] = it->second;
             successIndex += 1;
         }
-        int oneFreeBlockIndex = 0;
+        mPrefetchIdx[reqID][i].clear();
         for (auto it = mDocsTables[reqID][i].begin(); it != mDocsTables[reqID][i].end(); it++) {
             if (it->first >= mPromptLen[reqID]) { break; }
             if (hitBlocksIdx.find(it->first) != hitBlocksIdx.end()) {
                 continue;
             } else {
-                freeBlockPtr[oneFreeBlockIndex] = it->second;
-                oneFreeBlockIndex += 1;
+                mPrefetchIdx[reqID][i].push_back(it->first);
             }
         }
-        mFreeBlockLen[i][bsIndex] = oneFreeBlockIndex;
         mSuccessTableLen[i][bsIndex] = (int)(hitBlocks.size());
     }
 }

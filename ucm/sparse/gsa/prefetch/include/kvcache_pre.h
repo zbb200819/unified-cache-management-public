@@ -69,8 +69,6 @@ private:
     std::map<std::string, std::vector<std::map<int, int>>> mDocsTables;
     std::map<std::string, std::vector<std::map<int, int>>> mBlocksMap;
     torch::Tensor mLoadSuccessBlocks;
-    torch::Tensor mFreeBlock;
-    torch::Tensor mFreeBlockLen;
     torch::Tensor mSuccessTableLen;
     torch::Tensor mUseTopkIdxs;
     int mLayerNum;
@@ -103,6 +101,7 @@ private:
     uint32_t mKVSzieBytes = 0;
     uint32_t mExtraTopkLen = 16;
     bool mIsPythonLoad = false;
+    std::map<std::string, std::vector<std::vector<int>>> mPrefetchIdx;
 
 public:
     std::mutex mMutex;
@@ -123,14 +122,13 @@ private:
 public:
     ~GSAPrefetchEngineC();
 
-    GSAPrefetchEngineC(torch::Tensor& freeBlock, torch::Tensor& loadSuccessBlocks,
-                       torch::Tensor& freeBlockLen, torch::Tensor& successTableLen,
+    GSAPrefetchEngineC(torch::Tensor& loadSuccessBlocks, torch::Tensor& successTableLen,
                        std::vector<uint32_t>& kvShape, bool useMla, bool isLog, int tpSize,
                        int rank, int extraTopkLen, bool isPythonLoad);
 
     void SetBlocksMap(std::string reqID, std::vector<int>& blockTableList,
-                      std::vector<int>& selectIndex, std::vector<std::string>& blocksHash,
-                      int maxIdx);
+                      std::vector<int>& remainIdx, std::vector<int>& prefetchIdx,
+                      std::vector<std::string>& blocksHash, int maxIdx);
 
     void SetBlocksMapMultiLayer(std::string reqID, std::vector<std::map<int, int>>& remainMap,
                                 std::vector<std::map<int, int>>& prefetchMap,

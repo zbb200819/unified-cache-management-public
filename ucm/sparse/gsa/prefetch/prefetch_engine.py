@@ -87,9 +87,7 @@ class GSAPrefetchBase:
         kv_shape = [self.block_size, self.num_kv_heads, self.head_size]
         self.is_python_load = is_python_load
         self.prefetch_engine_c = gsa_prefetch.GSAPrefetchEngineC(
-            self.prefetch_blocks,
             self.m_load_success_list,
-            self.prefetch_block_len,
             self.block_table_len,
             kv_shape,
             self.use_mla,
@@ -258,12 +256,6 @@ class GSAPrefetchBase:
 
     def _init_tensor(self):
         device = "cpu"
-        self.prefetch_blocks = torch.zeros(
-            (self.num_attention_layers, self.max_bs, int(self.sp_max_len)),
-            dtype=torch.int32,
-            pin_memory=is_pin_memory_available(),
-            device=device,
-        )
         self.m_load_success_list = torch.zeros(
             (self.num_attention_layers, self.max_bs, int(self.sp_max_len)),
             dtype=torch.int32,
@@ -274,12 +266,6 @@ class GSAPrefetchBase:
             (self.num_attention_layers, self.max_bs, int(self.sp_max_len)),
             dtype=torch.int32,
             pin_memory=False,
-            device=device,
-        )
-        self.prefetch_block_len = torch.zeros(
-            (self.num_attention_layers, self.max_bs),
-            dtype=torch.int32,
-            pin_memory=is_pin_memory_available(),
             device=device,
         )
         self.gsa_seq_len = torch.zeros(
@@ -341,23 +327,15 @@ class GSAPrefetchBase:
             bs_index = self.select_bs_index[index]
             if gsa_metadata.gsa_stats[req_id].reamin_map != None:
                 topk_block_list_all = []
-                prefetch_blocks_list_all = []
                 for layer_id in range(self.num_attention_layers):
                     topk_block_list = sorted(
                         list(
                             gsa_metadata.gsa_stats[req_id].reamin_map[layer_id].values()
                         )
                     )
-                    prefetch_blocks_list = list(
-                        gsa_metadata.gsa_stats[req_id].prefetch_map[layer_id].values()
-                    )
                     topk_block_list_all.append(topk_block_list)
-                    prefetch_blocks_list_all.append(prefetch_blocks_list)
                 topk_block_tensor = torch.tensor(
                     topk_block_list_all, dtype=torch.int32, device="cpu"
-                )
-                prefetch_block_tensor = torch.tensor(
-                    prefetch_blocks_list_all, dtype=torch.int32
                 )
             else:
                 real_length = len(gsa_metadata.gsa_stats[req_id].blocks)
@@ -366,22 +344,14 @@ class GSAPrefetchBase:
                 prefetch_idx = gsa_metadata.gsa_stats[req_id].prefetch_idx
                 assert len(remain_index) < self.sp_max_len
 
-                prefetch_blocks_list = [block_table_list[x] for x in prefetch_idx]
                 topk_block_list = [block_table_list[x] for x in remain_index]
                 topk_block_tensor = torch.tensor(
                     topk_block_list, dtype=torch.int32, device="cpu"
                 )
-                prefetch_block_tensor = torch.tensor(
-                    prefetch_blocks_list, dtype=torch.int32
-                )
 
-            self.prefetch_block_len[:, bs_index] = len(prefetch_blocks_list)
             self.block_table_len[:, bs_index] = len(topk_block_list)
             self.use_block_table_len[:, bs_index] = len(topk_block_list)
 
-            self.prefetch_blocks[:, bs_index, : len(prefetch_blocks_list)] = (
-                prefetch_block_tensor
-            )
             self.use_block_table[:, bs_index, : len(topk_block_list)] = (
                 topk_block_tensor
             )
@@ -402,7 +372,8 @@ class GSAPrefetchBase:
                     self.prefetch_engine_c.set_blocks_map(
                         req_id,
                         block_table_list,
-                        prefetch_idx + remain_index,
+                        remain_index,
+                        prefetch_idx,
                         gsa_metadata.gsa_stats[req_id].block_hashes,
                         max_idx,
                     )
