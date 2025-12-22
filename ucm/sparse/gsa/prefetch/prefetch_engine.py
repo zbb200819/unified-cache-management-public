@@ -16,6 +16,7 @@ from ucm.sparse.utils import (
     VLLM_CUDA_MEM_ALIGN_KV_CACHE,
     align_to_256bytes,
     gsa_config,
+    SYNC_PREFETCH,
 )
 
 
@@ -96,6 +97,7 @@ class GSAPrefetchBase:
             self.rank,
             gsa_config.num_prefetch_blocks,
             self.is_python_load,
+            SYNC_PREFETCH,
         )
 
         self.topk_space = 0

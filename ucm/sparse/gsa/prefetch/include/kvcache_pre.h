@@ -102,6 +102,8 @@ private:
     uint32_t mExtraTopkLen = 16;
     bool mIsPythonLoad = false;
     std::map<std::string, std::vector<std::vector<int>>> mPrefetchIdx;
+    std::map<std::string, std::vector<std::vector<int>>> mPrefetchIdxSync;
+    bool mIsSyncPrefetch = false;
 
 public:
     std::mutex mMutex;
@@ -124,7 +126,7 @@ public:
 
     GSAPrefetchEngineC(torch::Tensor& loadSuccessBlocks, torch::Tensor& successTableLen,
                        std::vector<uint32_t>& kvShape, bool useMla, bool isLog, int tpSize,
-                       int rank, int extraTopkLen, bool isPythonLoad);
+                       int rank, int extraTopkLen, bool isPythonLoad, bool syncPrefetch);
 
     void SetBlocksMap(std::string reqID, std::vector<int>& blockTableList,
                       std::vector<int>& remainIdx, std::vector<int>& prefetchIdx,

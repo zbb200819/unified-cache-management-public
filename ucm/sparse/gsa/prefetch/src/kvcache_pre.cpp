@@ -108,7 +108,7 @@ void MutliBSThreadFun(void* args)
 GSAPrefetchEngineC::GSAPrefetchEngineC(torch::Tensor& loadSuccessBlocks,
                                        torch::Tensor& successTableLen,
                                        std::vector<uint32_t>& kvShape, bool useMla, bool isLog,
-                                       int tpSize, int rank, int extraTopkLen, bool isPythonLoad)
+                                       int tpSize, int rank, int extraTopkLen, bool isPythonLoad, bool syncPrefetch)
     : mLogger("./log/kvcache_pre_log.txt", LogLevel::INFO, isLog)
 {
     mLoadSuccessBlocks = loadSuccessBlocks;
@@ -133,6 +133,7 @@ GSAPrefetchEngineC::GSAPrefetchEngineC(torch::Tensor& loadSuccessBlocks,
         mIsLog = false;
     }
     mExtraTopkLen = extraTopkLen;
+    mIsSyncPrefetch = syncPrefetch;
     mLogger.log(LogLevel::INFO,
                 "GSAPrefetchEngineC Init mLayerNum %d mMaxBs %u, mUseMla %d, mHeadSzie %u, mTPSize "
                 "%u mBlockSize %u mHeadNum %u, mIsPythonLoad %d\n",
@@ -209,24 +210,29 @@ void GSAPrefetchEngineC::SetBlocksMap(std::string reqID, std::vector<int>& block
         mDocsTables[reqID].clear();
         mAllBlcoksHash[reqID].clear();
         mPrefetchIdx[reqID].clear();
+        mPrefetchIdxSync[reqID].clear();
     }
     mAllBlcoksHash[reqID] = blocksHash;
     for (int i = 0; i < mLayerNum; i++) {
         std::map<int, int> oneDocTable;
         std::map<int, int> oneBlockMap;
         std::vector<int> onePrefetchIdx;
+        std::vector<int> onePrefetchIdxSync;
         for (auto idx : remainIdx) {
             oneDocTable[idx] = blockTableList[idx];
             oneBlockMap[blockTableList[idx]] = idx;
+            onePrefetchIdxSync.push_back(idx);
         }
         for (auto idx : prefetchIdx) {
             oneDocTable[idx] = blockTableList[idx];
             oneBlockMap[blockTableList[idx]] = idx;
             onePrefetchIdx.push_back(idx);
+            onePrefetchIdxSync.push_back(idx);
         }
         mDocsTables[reqID].push_back(oneDocTable);
         mBlocksMap[reqID].push_back(oneBlockMap);
         mPrefetchIdx[reqID].push_back(onePrefetchIdx);
+        mPrefetchIdxSync[reqID].push_back(onePrefetchIdx);
     }
     mPromptLen[reqID] = maxIdx;
     PrintMap(reqID, 0);
@@ -242,24 +248,29 @@ void GSAPrefetchEngineC::SetBlocksMapMultiLayer(std::string reqID,
         mDocsTables[reqID].clear();
         mAllBlcoksHash[reqID].clear();
 		mPrefetchIdx[reqID].clear();
+        mPrefetchIdxSync[reqID].clear();
     }
     mAllBlcoksHash[reqID] = blocksHash;
     for (int i = 0; i < mLayerNum; i++) {
         std::map<int, int> oneDocTable;
         std::map<int, int> oneBlockMap;
         std::vector<int> onePrefetchIdx;
+        std::vector<int> onePrefetchIdxSync;
         for (auto it = remainMap[i].begin(); it != remainMap[i].end(); it++) {
             oneDocTable[it->first] = it->second;
             oneBlockMap[it->second] = it->first;
+            onePrefetchIdxSync.push_back(it->first);
         }
         for (auto it = prefetchMap[i].begin(); it != prefetchMap[i].end(); it++) {
             oneDocTable[it->first] = it->second;
             oneBlockMap[it->second] = it->first;
             onePrefetchIdx.push_back(it->first);
+            onePrefetchIdxSync.push_back(it->first);
         }
         mDocsTables[reqID].push_back(oneDocTable);
         mBlocksMap[reqID].push_back(oneBlockMap);
         mPrefetchIdx[reqID].push_back(onePrefetchIdx);
+        mPrefetchIdxSync[reqID].push_back(onePrefetchIdx);
     }
     mPromptLen[reqID] = maxIdx;
 }
@@ -302,6 +313,7 @@ void GSAPrefetchEngineC::DelReqIDRun()
             mAllBlcoksHash.erase(*it);
             mPromptLen.erase(*it);
             mPrefetchIdx.erase(*it);
+            mPrefetchIdxSync.erase(*it);
             std::cout << "Del reqID: " << *it << std::endl;
         }
         if (mPromptLen.find(*it) == mPromptLen.end()) {
@@ -379,11 +391,21 @@ void GSAPrefetchEngineC::RunPrefetchH2D(PrefetchReqInfo oneBsInfo,
     int layerID = oneBsInfo.layerID;
     std::string reqID = oneBsInfo.reqID;
 
-    int oneFreeBlockLen = mPrefetchIdx[reqID][layerID].size();
+    int oneFreeBlockLen = 0;
+    if (mIsSyncPrefetch) {
+        oneFreeBlockLen = mPrefetchIdxSync[reqID][layerID].size();
+    } else {
+        oneFreeBlockLen = mPrefetchIdx[reqID][layerID].size();
+    }
     std::vector<int> oneFreeBlockTable;
 
     uint32_t index = 0;
-    std::vector<int> onePrefetchIdx = mPrefetchIdx[reqID][layerID];
+    std::vector<int> onePrefetchIdx;
+    if (mIsSyncPrefetch) {
+        onePrefetchIdx = mPrefetchIdxSync[reqID][layerID];
+    } else {
+        onePrefetchIdx = mPrefetchIdx[reqID][layerID];
+    }
     int oneFreeBlockIndex = 0;
     while (oneFreeBlockIndex < oneFreeBlockLen && index < missIdxs.size()) {
         int oneFreeBlockID = mDocsTables[reqID][layerID][onePrefetchIdx[oneFreeBlockIndex]];
@@ -427,16 +449,18 @@ void GSAPrefetchEngineC::RunOneBsPrefetch(std::string reqID, int topkLen, int bs
             mLoadSuccessBlocks[i][bsIndex][successIndex] = it->second;
             successIndex += 1;
         }
-        mPrefetchIdx[reqID][i].clear();
-        for (auto it = mDocsTables[reqID][i].begin(); it != mDocsTables[reqID][i].end(); it++) {
-            if (it->first >= mPromptLen[reqID]) { break; }
-            if (hitBlocksIdx.find(it->first) != hitBlocksIdx.end()) {
-                continue;
-            } else {
-                mPrefetchIdx[reqID][i].push_back(it->first);
+        mSuccessTableLen[i][bsIndex] = (int)(hitBlocks.size());
+        if (!mIsSyncPrefetch) {
+            mPrefetchIdx[reqID][i].clear();
+            for (auto it = mDocsTables[reqID][i].begin(); it != mDocsTables[reqID][i].end(); it++) {
+                if (it->first >= mPromptLen[reqID]) { break; }
+                if (hitBlocksIdx.find(it->first) != hitBlocksIdx.end()) {
+                    continue;
+                } else {
+                    mPrefetchIdx[reqID][i].push_back(it->first);
+                }
             }
         }
-        mSuccessTableLen[i][bsIndex] = (int)(hitBlocks.size());
     }
 }
 
