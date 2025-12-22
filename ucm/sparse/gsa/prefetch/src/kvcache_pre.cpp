@@ -473,6 +473,11 @@ void GSAPrefetchEngineC::LoadKVToHBM(std::vector<int> loadNPUBlockIDs, std::vect
             }
             size_t taskID = mStore->Submit(std::move(task));
             auto ret = mStore->Wait(taskID);
+            // mLogger.log(LogLevel::INFO,
+            //         "Decode step: %u, Rank: %d, reqID: %s, layer: %d, blockID: %lu, miss "
+            //         "idx: %u, load blockid: %u load k error\n",
+            //         mDecodeStep, mRank, reqID.c_str(), layerID, blockId, missIdxs[i],
+            //         loadNPUBlockIDs[i]);
             if (ret != 0) {
                 mLogger.log(LogLevel::ERROR,
                             "Decode step: %u, Rank: %d, reqID: %s, layer: %d, blockID: %lu, miss "
@@ -536,6 +541,50 @@ void GSAPrefetchEngineC::RunAsyncPrefetchBs(std::vector<std::string>& reqIDsInpu
     } else {
         mThreadPool->Enqueue(MutliBSThreadFun, this);
     }
+}
+
+void GSAPrefetchEngineC::RunSyncPrefetchBs(std::vector<std::string>& reqIDsInput,
+                                            std::vector<int>& topkLensInput,
+                                            std::vector<int>& bsIndexInput,
+                                            std::vector<torch::Tensor>& kvCaches, void* storePtr)
+{
+    if (mKVSzieBytes == 0) {
+        mTensorElemSize = kvCaches[0].element_size();
+        if (mUseMla) {
+            mKVSzieBytes = kvCaches[0].element_size() * kvCaches[0][0].numel();
+        } else {
+            mKVSzieBytes = kvCaches[0].element_size() * kvCaches[0][0][0].numel();
+        }
+        if (storePtr == nullptr) {
+            mLogger.log(LogLevel::ERROR,
+                        "Decode step: %u, |KVCache Prefetch| storePtr is nullptr error\n",
+                        mDecodeStep);
+            std::abort();
+        }
+        mStore = static_cast<UC::CCStore<>*>(storePtr);
+        mLogger.log(LogLevel::INFO,
+                    "Decode step: %u, |KVCache Prefetch| start mKVSzieBytes: %u, mTensorElemSize "
+                    "%u, store %p\n",
+                    mDecodeStep, mKVSzieBytes, mTensorElemSize, mStore);
+    }
+    mKvCaches = kvCaches;
+    mLogger.log(LogLevel::INFO,
+                "Decode step: %u, |KVCache Prefetch| start sync pretch batch size: %lu\n",
+                mDecodeStep, reqIDsInput.size());
+    runBsLen = reqIDsInput.size();
+    if (runBsLen > mMaxBs) {
+        mLogger.log(LogLevel::ERROR, "Decode step: %u, |KVCache Prefetch| runBsLen %u, maxBs: %d\n",
+                    mDecodeStep, runBsLen, mMaxBs);
+        std::abort();
+    }
+    mReqIdList.clear();
+    mReqIdList.assign(reqIDsInput.begin(), reqIDsInput.end());
+    memcpy(mTopkLenList, topkLensInput.data(), sizeof(int) * runBsLen);
+    memcpy(mBsIndexList, bsIndexInput.data(), sizeof(int) * runBsLen);
+    mMutex.lock();
+    mIsPrefetchDone = false;
+    mMutex.unlock();
+    MutliBSThreadFun(this);
 }
 
 void GSAPrefetchEngineC::SetBlockTableInfo(torch::Tensor& blockTables, torch::Tensor& blockLengths,

@@ -148,6 +148,10 @@ public:
     void RunAsyncPrefetchBs(std::vector<std::string>& reqIDsInput, std::vector<int>& topkLensInput,
                             std::vector<int>& bsIndexInput, std::vector<torch::Tensor>& kvCaches,
                             void* storePtr);
+    
+    void RunSyncPrefetchBs(std::vector<std::string>& reqIDsInput, std::vector<int>& topkLensInput,
+                            std::vector<int>& bsIndexInput, std::vector<torch::Tensor>& kvCaches,
+                            void* storePtr);
 
     int CallPrefetchProcessFun();
 

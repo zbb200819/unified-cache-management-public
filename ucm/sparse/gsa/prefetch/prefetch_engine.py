@@ -244,6 +244,43 @@ class GSAPrefetchBase:
                 all_miss_ids = self.prefetch_engine_c.obtain_miss_idxs()
         return all_free_block_ids, all_miss_ids
 
+    def deal_sync_prefetch(self, is_prefetch_done, gsa_metadata, kvcache, store_ptr):
+        self.topk_space += 1
+        all_free_block_ids = None
+        all_miss_ids = None
+        if not self.atb_gsa_enable:
+            return all_free_block_ids, all_miss_ids
+        if is_prefetch_done and self.ptopk_prefetch_enable:
+            self._prepare_for_sync_prefetch(self.select_bs_index, gsa_metadata)
+            self.prefetch_engine_c.set_blocks_table_info(
+                self.use_block_table,
+                self.use_block_table_len,
+                self.prefetch_topk_buf[:, : len(self.select_bs_index), :],
+                self.step_time,
+            )
+            topk_len_list = []
+            req_id_list = []
+            for req_id in self.req_ids_bs:
+                req_id_list.append(req_id)
+                if not self.is_gsa_req_id[req_id]:
+                    topk_len_list.append(0)
+                    continue
+                else:
+                    if gsa_metadata.gsa_stats[req_id].topk_buf_tmp != None:
+                        topk_len_list.append(
+                            len(gsa_metadata.gsa_stats[req_id].topk_buf_tmp[0])
+                        )
+                    else:
+                        topk_len_list.append(0)
+            self.prefetch_engine_c.run_sync_prefetch_bs(
+                req_id_list, topk_len_list, self.select_bs_index, kvcache, store_ptr
+            )
+            self.is_topk_update = False
+            if self.is_python_load:
+                all_free_block_ids = self.prefetch_engine_c.obtain_load_blocks()
+                all_miss_ids = self.prefetch_engine_c.obtain_miss_idxs()
+        return all_free_block_ids, all_miss_ids
+
     def del_finish_meta(self, del_req, flag: bool = True) -> None:
         if del_req in self.block_map_flag:
             del self.block_map_flag[del_req]
@@ -466,6 +503,37 @@ class GSAPrefetchBase:
                         self.use_block_table_len[layer_id][bs_index].add_(1)
                 self.block_table_flag[req_id].clear()
 
+            if gsa_metadata.gsa_stats[req_id].topk_buf_tmp != None:
+                self.prefetch_topk_buf[
+                    :, index, : len(gsa_metadata.gsa_stats[req_id].topk_buf_tmp[0])
+                ].copy_(gsa_metadata.gsa_stats[req_id].topk_buf_tmp)
+        
+    def _prepare_for_sync_prefetch(
+        self,
+        bs_index_list: List[int],
+        gsa_metadata,
+    ) -> None:
+        for index, topk_info in enumerate(self.topk_bs):
+            if topk_info[1] and topk_info[0] in gsa_metadata.gsa_stats:
+                if not self.is_cpu_topk:
+                    gsa_metadata.gsa_stats[topk_info[0]].topk_buf_tmp = (
+                        self.topk_buf_tmp[:, index, : topk_info[2]].cpu()
+                    )
+                else:
+                    gsa_metadata.gsa_stats[topk_info[0]].topk_buf_tmp = (
+                        self.topk_buf_tmp[:, index, : topk_info[2]].clone()
+                    )
+        self.topk_bs = []
+
+        for index, bs_index in enumerate(bs_index_list):
+            req_id = self.req_ids_bs[index]
+            if req_id in self.block_map_flag:
+                for block_mp_add in self.block_map_flag[req_id]:
+                    self.prefetch_engine_c.add_blocks_map(
+                        req_id, block_mp_add[0], block_mp_add[1]
+                    )
+                self.block_map_flag[req_id].clear()
+            
             if gsa_metadata.gsa_stats[req_id].topk_buf_tmp != None:
                 self.prefetch_topk_buf[
                     :, index, : len(gsa_metadata.gsa_stats[req_id].topk_buf_tmp[0])

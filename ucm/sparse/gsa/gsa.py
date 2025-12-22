@@ -37,6 +37,7 @@ from ucm.sparse.utils import (
     PTOPK_PREFETCH_ENABLE,
     SEG_PREFILL_THRESHOLD,
     gsa_config,
+    SYNC_PREFETCH,
 )
 
 ReqType = Union[str, int]
@@ -144,6 +145,7 @@ class GSAReqStat:
         if len(self.repre_slot_mapping) > len(self.blocks):
             self.repre_slot_mapping = self.repre_slot_mapping[: len(self.blocks)]
         self.set_block_hashes(add_req_state.prompt_token_ids)
+        print(f"[GSA] add request new req_id:{self.req_id} num_prompt_tokens:{self.num_prompt_tokens}")
 
     def updata_req_state(
         self, num_scheduled_tokens, add_req_state, index_in_batch
@@ -919,14 +921,25 @@ class GSA(UcmSparseBase):
                 is_prefetch_done = (
                     self.prefetch_engine.prefetch_engine_c.get_prefetch_status()
                 )
-            all_free_block_ids, all_miss_ids = self.prefetch_engine.deal_async_prefetch(
-                is_prefetch_done,
-                self.gsa_metadata,
-                kv_caches,
-                self.connector.cc_store(),
-            )
+            if SYNC_PREFETCH:
+                all_free_block_ids, all_miss_ids = self.prefetch_engine.deal_sync_prefetch(
+                    is_prefetch_done,
+                    self.gsa_metadata,
+                    kv_caches,
+                    self.connector.cc_store(),
+                )
+            else:
+                all_free_block_ids, all_miss_ids = self.prefetch_engine.deal_async_prefetch(
+                    is_prefetch_done,
+                    self.gsa_metadata,
+                    kv_caches,
+                    self.connector.cc_store(),
+                )
             if self.is_python_load:
                 self.launch_transfer_task(all_free_block_ids, all_miss_ids, kv_caches)
+                if SYNC_PREFETCH:
+                    self.wait_transfer_task_done()
+                
         else:
             self.prefetch_engine.deal_async_prefetch(
                 False, self.gsa_metadata, kv_caches, None
