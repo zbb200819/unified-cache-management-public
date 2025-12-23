@@ -203,13 +203,12 @@ class GSAPrefetchBase:
             )
         self.topk_buf_tmp = topk_buf_tmp
 
-    def deal_async_prefetch(self, is_prefetch_done, gsa_metadata, kvcache, store_ptr):
-        self.topk_space += 1
+    def deal_async_prefetch(self, gsa_metadata, kvcache, store_ptr):
         all_free_block_ids = None
         all_miss_ids = None
         if not self.atb_gsa_enable:
             return all_free_block_ids, all_miss_ids
-        if is_prefetch_done and self.ptopk_prefetch_enable and self.is_topk_update:
+        if self.ptopk_prefetch_enable and self.is_topk_update:
             tmp = self.use_block_table
             self.use_block_table = self.m_load_success_list
             self.m_load_success_list = tmp

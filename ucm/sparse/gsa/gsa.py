@@ -37,10 +37,28 @@ from ucm.sparse.utils import (
     PTOPK_PREFETCH_ENABLE,
     SEG_PREFILL_THRESHOLD,
     gsa_config,
+    IS_NEW_TRANS,
 )
+
+from ucm.shared.simpletrans import ucm_sm_copy
 
 ReqType = Union[str, int]
 
+class GSASharedCPUPool:
+    def __init__(self, num_slots):
+        self.free_slots = set(range(num_slots))
+        self.allocated = set()
+
+    def allocate(self, num_new_slots):
+        assert len(self.free_slots) >= num_new_slots, f"Not enough free slots {len(self.free_slots)} {num_new_slots}"
+        allocated = list(self.free_slots)[:num_new_slots]
+        self.free_slots.difference_update(allocated)
+        self.allocated.update(allocated)
+        return allocated
+
+    def free(self, slots):
+        self.free_slots.update(slots)
+        self.allocated.difference_update(slots)
 
 class GSAReqStat:
     def __init__(self, req_id, vllm_config: VllmConfig) -> None:
@@ -72,6 +90,7 @@ class GSAReqStat:
         self.rank = vllm_config.parallel_config.rank
         self.use_mla = vllm_config.model_config.use_mla
         self.request_hasher = RequestHasher(vllm_config, 0)
+        self.slab_host_slot = None
 
     def step(self) -> int:
         return self.num_output_tokens
@@ -421,7 +440,7 @@ class TopkCal:
         dot_product_weights.masked_fill_(self.exclude_mask == 1, float("-inf"))
         selected_block_nums = self.topk_len_list[0]
         _, top_indices = torch.topk(
-            dot_product_weights, selected_block_nums, dim=-1, sorted=False
+            dot_product_weights, selected_block_nums, dim=-1, sorted=True
         )
         self.topk_caches[current_layer_id][self.cal_topk_id] = top_indices
 
@@ -498,10 +517,26 @@ class GSA(UcmSparseBase):
         self.dtype = vllm_config.model_config.dtype
         if PTOPK_PREFETCH_ENABLE:
             if role == UcmSparseRole.WORKER:
-                self.connector = get_kv_transfer_group().connector.store
+                store_device = torch.device(f"cuda:{self.rank}")
+                self.ucm_store_stream = torch.cuda.Stream(device=store_device)
+                self.ucm_store_backend = ucm_sm_copy.TransBackend(
+                    int(self.ucm_store_stream.cuda_stream)
+                )
+                self.ucm_load_stream = torch.cuda.Stream(device=store_device)
+                self.ucm_load_backend = ucm_sm_copy.TransBackend(
+                    int(self.ucm_load_stream.cuda_stream)
+                )
+                self.connector = get_kv_transfer_group().connector
+                # self.connector = None
             else:
                 self.connector = None
-        self.is_python_load = not torch.cuda.is_available()
+        num_slots = (
+            vllm_config.model_config.max_model_len
+            * vllm_config.scheduler_config.max_num_seqs
+            // vllm_config.cache_config.block_size
+        )
+        self.gsa_cpu_shared_pool = GSASharedCPUPool(num_slots)
+        self.is_python_load = not torch.cuda.is_available() or IS_NEW_TRANS
         if CUDA_TOPK:
             self.prefetch_engine = GSAPrefetchBase(
                 vllm_config, 16, True, False, False, 1, self.is_python_load
@@ -519,7 +554,11 @@ class GSA(UcmSparseBase):
         self.copy_k_flag = [False] * self.layer_num
         gsa_config.set_config(self.block_size)
         self.task_load = {}
-
+        self._slab_host_k = []
+        self._slab_host_v = []
+        self.block_bytes = (
+            self.block_size * self.num_key_heads * self.head_size * self.element_size
+        )
     def init_topk_cal(
         self,
         vllm_config: VllmConfig,
@@ -711,6 +750,14 @@ class GSA(UcmSparseBase):
                 and PTOPK_PREFETCH_ENABLE
             ):
                 blocks_len = len(self.gsa_metadata.gsa_stats[req_id].blocks)
+                if current_layer_id == 0:
+                    self.gsa_metadata.gsa_stats[req_id].slab_host_slot = self.gsa_cpu_shared_pool.allocate(blocks_len)
+                self.dump_prefill_kvcache(
+                    self.gsa_metadata.gsa_stats[req_id].blocks,
+                    self.gsa_metadata.gsa_stats[req_id].slab_host_slot,
+                    layer_name,
+                    forward_context,
+                )
                 remain_len = gsa_config.compute_topk_len(blocks_len)
                 prefetch_len = min(
                     gsa_config.num_prefetch_blocks, blocks_len - remain_len
@@ -905,6 +952,25 @@ class GSA(UcmSparseBase):
         self._start_topk_cal()
 
     def execute_finished(self, logits_indices: torch.Tensor):
+        self.prefetch_engine.topk_space += 1
+        if not PTOPK_PREFETCH_ENABLE:
+            return logits_indices
+
+        if IS_NEW_TRANS:
+            is_prefetch_done = self.ucm_load_stream.query()
+        elif self.is_python_load:
+            is_prefetch_done = self.check_transfer_task_done()
+        else:
+            is_prefetch_done = (
+                self.prefetch_engine.prefetch_engine_c.get_prefetch_status()
+            )
+        
+        if not is_prefetch_done:
+            return logits_indices
+        
+        if self.ucm_store_stream.query():
+            self.ucm_store_stream.synchronize()
+
         kv_caches = [None] * self.layer_num
         forward_context = get_forward_context()
         attn = forward_context.no_compile_layers
@@ -914,26 +980,80 @@ class GSA(UcmSparseBase):
             kv_cache = attn[layer_name].kv_cache[forward_context.virtual_engine]
             layer_id = int(layer_name.split(".")[2])
             kv_caches[layer_id] = kv_cache
-        if PTOPK_PREFETCH_ENABLE:
-            if self.is_python_load:
-                is_prefetch_done = self.check_transfer_task_done()
-            else:
-                is_prefetch_done = (
-                    self.prefetch_engine.prefetch_engine_c.get_prefetch_status()
-                )
-            all_free_block_ids, all_miss_ids = self.prefetch_engine.deal_async_prefetch(
-                is_prefetch_done,
-                self.gsa_metadata,
-                kv_caches,
-                self.connector.cc_store(),
-            )
-            if self.is_python_load:
-                self.launch_transfer_task(all_free_block_ids, all_miss_ids, kv_caches)
-        else:
-            self.prefetch_engine.deal_async_prefetch(
-                False, self.gsa_metadata, kv_caches, None
-            )
+
+        all_free_block_ids, all_miss_ids = self.prefetch_engine.deal_async_prefetch(
+            self.gsa_metadata,
+            kv_caches,
+            # self.connector.cc_store(),
+            None,
+        )
+        if IS_NEW_TRANS:
+            self.launch_transfer_task_trans(all_free_block_ids, all_miss_ids, kv_caches)
+        elif self.is_python_load:
+            self.launch_transfer_task(all_free_block_ids, all_miss_ids, kv_caches)
+
         return logits_indices
+
+    def launch_transfer_task_trans(self, all_free_block_ids, all_miss_ids, kv_caches):
+        if all_free_block_ids == None:
+            return
+
+        offsets_k = []
+        src_k_tensor_offset = []
+        current_stream = torch.cuda.current_stream()
+        self.ucm_load_stream.wait_stream(
+            current_stream
+        )  # # sync2 : load wait attention finish
+        for layer_id in range(self.layer_num):
+            for req_id in all_free_block_ids.keys():
+                slots = self.gsa_metadata.gsa_stats[req_id].slab_host_slot
+                length = len(all_free_block_ids[req_id][layer_id])
+                if length == 0:
+                    continue
+                offsets_k += [slots[i] for i in all_miss_ids[req_id][layer_id]]
+                src_k_tensor_offset += all_free_block_ids[req_id][layer_id]
+            
+            host_base_k = int(self._slab_host_k[layer_id].data_ptr())
+            if not self.use_mla:
+                dst_base_k = int(kv_caches[layer_id][0].data_ptr())
+            else:
+                dst_base_k = int(kv_caches[layer_id].data_ptr())
+            if layer_id == 0:
+                print(f"zambin layer_id: {layer_id}, host_base_k: {host_base_k}, dst_base_k: {dst_base_k}")
+            offsets_k = torch.tensor(
+                offsets_k,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            src_k_tensor_offset = torch.tensor(
+                src_k_tensor_offset,
+                dtype=torch.int64,
+                device=self.device,
+            )
+
+            host_dev_k = (host_base_k + offsets_k * self.block_bytes).contiguous()
+            dst_dev_k = (dst_base_k + src_k_tensor_offset * self.block_bytes).contiguous()
+            
+            with torch.cuda.stream(self.ucm_load_stream):
+                self.ucm_store_backend.copy_trans(
+                    host_dev_k.data_ptr(),
+                    dst_dev_k.data_ptr(),
+                    int(self.block_bytes),
+                    int(len(offsets_k)),
+                )
+                if not self.use_mla:
+                    host_base_v = int(self._slab_host_v[layer_id].data_ptr())
+                    dst_base_v = int(kv_caches[layer_id][1].data_ptr())
+
+                    host_dev_v = (host_base_v + offsets_k * self.block_bytes).contiguous()
+                    dst_dev_v = (dst_base_v + src_k_tensor_offset * self.block_bytes).contiguous()
+
+                    self.ucm_store_backend.copy_trans(
+                        host_dev_v.data_ptr(),
+                        dst_dev_v.data_ptr(),
+                        int(self.block_bytes),
+                        int(len(offsets_k)),
+                    )
 
     def launch_transfer_task(self, all_free_block_ids, all_miss_ids, kv_caches):
         if all_free_block_ids == None:
@@ -1031,6 +1151,8 @@ class GSA(UcmSparseBase):
         if self.topk_kpre_manger.is_exist(request_id):
             self.topk_kpre_manger.free(request_id)
         if request_id in self.gsa_stats:
+            if self.gsa_stats[request_id].slab_host_slot != None:
+                self.gsa_cpu_shared_pool.free(self.gsa_stats[request_id].slab_host_slot)
             del self.gsa_stats[request_id]
         self.prefetch_engine.del_finish_meta(request_id)
 
@@ -1160,3 +1282,93 @@ class GSA(UcmSparseBase):
             return None
         coordinator.allocate_new_blocks(request.request_id, num_slots_sparsed)
         return KVCacheBlocks(tuple([kept_blocks]))
+
+    def init_host_slabs_from_kv(self, kv_cache_config):
+        if not self._slab_host_k:
+            print(
+                " ========================== initialize slab host ========================== "
+            )
+            self.num_blocks = kv_cache_config.num_blocks
+
+            self._slab_host_k = [
+                torch.empty(
+                    (
+                        self.num_blocks,
+                        self.block_size,
+                        self.num_head,
+                        self.head_size,
+                    ),
+                    dtype=self.dtype,
+                    device=torch.device("cpu"),
+                    pin_memory=True,
+                )
+                for _ in range(self.layer_num)
+            ]
+
+            if not self.use_mla:
+                self._slab_host_v = [
+                    torch.empty(
+                        (
+                            self.num_blocks,
+                            self.block_size,
+                            self.num_head,
+                            self.head_size,
+                        ),
+                        dtype=self.dtype,
+                        device=torch.device("cpu"),
+                        pin_memory=True,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+    def dump_prefill_kvcache(self, vllm_block_ids, slots, layer_name, forward_context):
+        # print(f"zambin before dump: {self.ucm_store_stream.query()}")
+        num_blocks = len(vllm_block_ids)
+        current_stream = torch.cuda.current_stream()
+        current_layer_id = int(layer_name.split(".")[2])
+        if not self.use_mla:
+            layer_k_cache = forward_context.no_compile_layers[layer_name].kv_cache[
+                forward_context.virtual_engine
+            ][0]
+        else:
+            layer_k_cache = forward_context.no_compile_layers[layer_name].kv_cache[
+                forward_context.virtual_engine
+            ]
+
+        with torch.cuda.stream(self.ucm_store_stream):
+            self.ucm_store_stream.wait_stream(
+                current_stream
+            )  # sync1 : store wait attention finish
+            bids = torch.tensor(vllm_block_ids, device=layer_k_cache.device)
+            src_base_k = int(layer_k_cache.data_ptr())
+            dst_base_k = int(self._slab_host_k[current_layer_id].data_ptr())
+
+            offsets = bids * self.block_bytes
+            dev_ptrs_k = (src_base_k + offsets).contiguous()
+
+            host_slots = torch.tensor(slots, device=layer_k_cache.device)
+            host_offsets = host_slots * self.block_bytes
+            dst_ptrs_k = (dst_base_k + host_offsets).contiguous()
+            self.ucm_store_backend.copy_trans(
+                dev_ptrs_k.data_ptr(),
+                dst_ptrs_k.data_ptr(),
+                int(self.block_bytes),
+                int(num_blocks),
+            )
+
+            if not self.use_mla:
+                layer_v_cache = forward_context.no_compile_layers[layer_name].kv_cache[
+                    forward_context.virtual_engine
+                ][1]
+                src_base_v = int(layer_v_cache.data_ptr())
+                dst_base_v = int(self._slab_host_v[current_layer_id].data_ptr())
+
+                dev_ptrs_v = (src_base_v + offsets).contiguous()
+                dst_ptrs_v = (dst_base_v + host_offsets).contiguous()
+                self.ucm_store_backend.copy_trans(
+                    dev_ptrs_v.data_ptr(),
+                    dst_ptrs_v.data_ptr(),
+                    int(self.block_bytes),
+                    int(num_blocks),
+                )
+            # print(f"zambin after dump: {self.ucm_store_stream.query()}")

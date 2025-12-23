@@ -504,7 +504,6 @@ void GSAPrefetchEngineC::RunAsyncPrefetchBs(std::vector<std::string>& reqIDsInpu
             mLogger.log(LogLevel::ERROR,
                         "Decode step: %u, |KVCache Prefetch| storePtr is nullptr error\n",
                         mDecodeStep);
-            std::abort();
         }
         mStore = static_cast<UC::CCStore<>*>(storePtr);
         mLogger.log(LogLevel::INFO,
