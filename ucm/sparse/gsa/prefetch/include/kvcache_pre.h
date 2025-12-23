@@ -24,6 +24,7 @@
 #include <unordered_set>
 #include <vector>
 #include "../../../../store/ucmstore.h"
+#include "kvcache_trans.h"
 
 namespace py = pybind11;
 
@@ -77,7 +78,7 @@ private:
     std::vector<std::string> mReqIdList;
     int* mTopkLenList = NULL;
     int* mBsIndexList = NULL;
-    uint32_t runBsLen = 0;
+    uint32_t mRunBsLen = 0;
     bool mIsLog = false;
     bool mIsPrefetchDone = true;
     bool mUseMla = false;
@@ -102,6 +103,13 @@ private:
     uint32_t mExtraTopkLen = 16;
     bool mIsPythonLoad = false;
     std::map<std::string, std::vector<std::vector<int>>> mPrefetchIdx;
+    TransBackend mGSATransBackend;
+    std::vector<void *> mKcachePtr;
+    std::vector<void *> mVcachePtr;
+    std::vector<void *> mSlabKcachePtr;
+    std::vector<void *> mSlabVcachePtr;
+    bool mIsNewTrans = false;
+    std::map<std::string, std::vector<int>> mAllReqIdSlots;
 
 public:
     std::mutex mMutex;
@@ -110,6 +118,8 @@ public:
 private:
     void LoadKVToHBM(std::vector<int> loadNPUBlockIDs, std::vector<int> missIdxs, int layerID,
                      std::string reqID);
+    
+    void TransKVCache();
 
     void GetHitAndMissBlock(PrefetchReqInfo oneBsInfo, std::unordered_set<int>& hitBlocks,
                             std::map<int, int>& hitBlocksIdx, std::vector<int>& missIdxs);
@@ -128,11 +138,16 @@ public:
 
     void SetBlocksMap(std::string reqID, std::vector<int>& blockTableList,
                       std::vector<int>& remainIdx, std::vector<int>& prefetchIdx,
-                      std::vector<std::string>& blocksHash, int maxIdx);
+                      std::vector<std::string>& blocksHash, int maxIdx, std::vector<int>& slots);
 
     void SetBlocksMapMultiLayer(std::string reqID, std::vector<std::map<int, int>>& remainMap,
                                 std::vector<std::map<int, int>>& prefetchMap,
-                                std::vector<std::string>& blocksHash, int maxIdx);
+                                std::vector<std::string>& blocksHash, int maxIdx, std::vector<int>& slots);
+    
+    void SetKvCache(std::vector<torch::Tensor>& kvCaches,
+                    std::vector<torch::Tensor>& slabKCache,
+                    std::vector<torch::Tensor>& slabVCache,
+                    bool isNewTrans);
 
     void CheckInputIndex(uint32_t maxLen, uint32_t index);
 
@@ -148,12 +163,18 @@ public:
     void RunAsyncPrefetchBs(std::vector<std::string>& reqIDsInput, std::vector<int>& topkLensInput,
                             std::vector<int>& bsIndexInput, std::vector<torch::Tensor>& kvCaches,
                             void* storePtr);
+    
+    void RunAsyncPrefetchBsTrans(std::vector<std::string>& reqIDsInput,
+                                 std::vector<int>& topkLensInput,
+                                 std::vector<int>& bsIndexInput);
 
     int CallPrefetchProcessFun();
 
     void PrintMap(std::string reqID, int i);
 
     bool GetPrefetchStatus();
+
+    bool GetPrefetchStreamStatus();
 
     void SetPrefetchStatus(bool flag);
 

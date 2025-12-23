@@ -63,6 +63,11 @@ if(RUNTIME_ENVIRONMENT STREQUAL "ascend")
     else()
         message(WARNING "torch_npu not found, but RUNTIME_ENVIRONMENT is set to ascend")
     endif()
+else()
+    find_package(CUDAToolkit REQUIRED)
+    list(INSERT LIBRARY_DIRS 0 ${CMAKE_SOURCE_DIR}/ucm/shared/simpletrans)
+    list(INSERT INCLUDE_DIRS 0 ${CMAKE_SOURCE_DIR}/ucm/shared/simpletrans)
+    list(INSERT LIBRARIES 0 CUDA::cudart)
 endif()
 
 # 设置CXX11_ABI宏

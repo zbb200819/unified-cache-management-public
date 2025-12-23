@@ -202,15 +202,18 @@ GSAPrefetchEngineC::~GSAPrefetchEngineC()
 
 void GSAPrefetchEngineC::SetBlocksMap(std::string reqID, std::vector<int>& blockTableList,
                                       std::vector<int>& remainIdx, std::vector<int>& prefetchIdx,
-                                      std::vector<std::string>& blocksHash, int maxIdx)
+                                      std::vector<std::string>& blocksHash, int maxIdx,
+                                      std::vector<int>& slots)
 {
     if (mBlocksMap.find(reqID) != mBlocksMap.end()) {
         mBlocksMap[reqID].clear();
         mDocsTables[reqID].clear();
         mAllBlcoksHash[reqID].clear();
         mPrefetchIdx[reqID].clear();
+        mAllReqIdSlots[reqID].clear();
     }
     mAllBlcoksHash[reqID] = blocksHash;
+    mAllReqIdSlots[reqID] = slots;
     for (int i = 0; i < mLayerNum; i++) {
         std::map<int, int> oneDocTable;
         std::map<int, int> oneBlockMap;
@@ -235,15 +238,18 @@ void GSAPrefetchEngineC::SetBlocksMap(std::string reqID, std::vector<int>& block
 void GSAPrefetchEngineC::SetBlocksMapMultiLayer(std::string reqID,
                                                 std::vector<std::map<int, int>>& remainMap,
                                                 std::vector<std::map<int, int>>& prefetchMap,
-                                                std::vector<std::string>& blocksHash, int maxIdx)
+                                                std::vector<std::string>& blocksHash, int maxIdx,
+                                                std::vector<int>& slots)
 {
     if (mBlocksMap.find(reqID) != mBlocksMap.end()) {
         mBlocksMap[reqID].clear();
         mDocsTables[reqID].clear();
         mAllBlcoksHash[reqID].clear();
 		mPrefetchIdx[reqID].clear();
+        mAllReqIdSlots[reqID].clear();
     }
     mAllBlcoksHash[reqID] = blocksHash;
+    mAllReqIdSlots[reqID] = slots;
     for (int i = 0; i < mLayerNum; i++) {
         std::map<int, int> oneDocTable;
         std::map<int, int> oneBlockMap;
@@ -302,6 +308,7 @@ void GSAPrefetchEngineC::DelReqIDRun()
             mAllBlcoksHash.erase(*it);
             mPromptLen.erase(*it);
             mPrefetchIdx.erase(*it);
+            mAllReqIdSlots.erase(*it);
             std::cout << "Del reqID: " << *it << std::endl;
         }
         if (mPromptLen.find(*it) == mPromptLen.end()) {
@@ -440,11 +447,41 @@ void GSAPrefetchEngineC::RunOneBsPrefetch(std::string reqID, int topkLen, int bs
     }
 }
 
+void GSAPrefetchEngineC::TransKVCache()
+{
+    for(int layerID = 0; layerID < mLayerNum; layerID++) {
+        std::vector<void*> hostKPtr;
+        std::vector<void*> deviceKPtr;
+        std::vector<void*> hostVPtr;
+        std::vector<void*> deviceVPtr;
+        for (auto& it : allNeedLoadBlock) {
+            std::string reqID = it.first;
+            std::vector<int>& loadBlockIDs = allNeedLoadBlock[reqID][layerID];
+            std::vector<int>& oneMissIDs = allMissIdxs[reqID][layerID];
+            if (loadBlockIDs.size() == 0) {
+                continue;
+            }
+            for (uint32_t i = 0; i < loadBlockIDs.size(); i++) {
+                deviceKPtr.push_back(static_cast<void*>(static_cast<char*>(mKcachePtr[layerID]) + mKVSzieBytes * loadBlockIDs[i]));
+                hostKPtr.push_back(static_cast<void*>(static_cast<char*>(mSlabKcachePtr[layerID]) +  + mKVSzieBytes * mAllReqIdSlots[reqID][oneMissIDs[i]]));
+                if(!mUseMla) {
+                    deviceVPtr.push_back(static_cast<void*>(static_cast<char*>(mVcachePtr[layerID]) + mKVSzieBytes * loadBlockIDs[i]));
+                    hostVPtr.push_back(static_cast<void*>(static_cast<char*>(mSlabVcachePtr[layerID]) + mKVSzieBytes * mAllReqIdSlots[reqID][oneMissIDs[i]]));
+                }
+            }
+        }
+        mGSATransBackend.copy_trans(hostKPtr.data(), deviceKPtr.data(), deviceKPtr.size(), mKVSzieBytes);
+        if(!mUseMla) {
+            mGSATransBackend.copy_trans(hostVPtr.data(), deviceVPtr.data(), deviceVPtr.size(), mKVSzieBytes);
+        }
+    }
+}
+
 void GSAPrefetchEngineC::LoadKVToHBM(std::vector<int> loadNPUBlockIDs, std::vector<int> missIdxs,
                                      int layerID, std::string reqID)
 {
     for (size_t i = 0; i < loadNPUBlockIDs.size(); i++) {
-        if (!mIsPythonLoad) {
+        if (!mIsPythonLoad && !mIsNewTrans) {
             if (mDelSeqIds.find(reqID) != mDelSeqIds.end()) {
                 mLogger.log(LogLevel::INFO,
                             "Decode step: %u, Rank: %d, reqID: %s, layer: %d, stop prefetch\n",
@@ -517,16 +554,16 @@ void GSAPrefetchEngineC::RunAsyncPrefetchBs(std::vector<std::string>& reqIDsInpu
     mLogger.log(LogLevel::INFO,
                 "Decode step: %u, |KVCache Prefetch| start async pretch batch size: %lu\n",
                 mDecodeStep, reqIDsInput.size());
-    runBsLen = reqIDsInput.size();
-    if (runBsLen > mMaxBs) {
-        mLogger.log(LogLevel::ERROR, "Decode step: %u, |KVCache Prefetch| runBsLen %u, maxBs: %d\n",
-                    mDecodeStep, runBsLen, mMaxBs);
+    mRunBsLen = reqIDsInput.size();
+    if (mRunBsLen > mMaxBs) {
+        mLogger.log(LogLevel::ERROR, "Decode step: %u, |KVCache Prefetch| mRunBsLen %u, maxBs: %d\n",
+                    mDecodeStep, mRunBsLen, mMaxBs);
         std::abort();
     }
     mReqIdList.clear();
     mReqIdList.assign(reqIDsInput.begin(), reqIDsInput.end());
-    memcpy(mTopkLenList, topkLensInput.data(), sizeof(int) * runBsLen);
-    memcpy(mBsIndexList, bsIndexInput.data(), sizeof(int) * runBsLen);
+    memcpy(mTopkLenList, topkLensInput.data(), sizeof(int) * mRunBsLen);
+    memcpy(mBsIndexList, bsIndexInput.data(), sizeof(int) * mRunBsLen);
     mMutex.lock();
     mIsPrefetchDone = false;
     mMutex.unlock();
@@ -535,6 +572,58 @@ void GSAPrefetchEngineC::RunAsyncPrefetchBs(std::vector<std::string>& reqIDsInpu
     } else {
         mThreadPool->Enqueue(MutliBSThreadFun, this);
     }
+}
+
+void GSAPrefetchEngineC::SetKvCache(std::vector<torch::Tensor>& kvCaches,
+                                    std::vector<torch::Tensor>& slabKCache,
+                                    std::vector<torch::Tensor>& slabVCache,
+                                    bool isNewTrans)
+{
+    mTensorElemSize = kvCaches[0].element_size();
+    if (mUseMla) {
+        mKVSzieBytes = kvCaches[0].element_size() * kvCaches[0][0].numel();
+    } else {
+        mKVSzieBytes = kvCaches[0].element_size() * kvCaches[0][0][0].numel();
+    }
+    mLogger.log(LogLevel::INFO,
+                "Decode step: %u, |KVCache Prefetch| init kvcache mKVSzieBytes: %u, mTensorElemSize "
+                "%u,\n", mDecodeStep, mKVSzieBytes, mTensorElemSize);
+    for (int i = 0; i < mLayerNum; i++) {
+        if (mUseMla) {
+            mKcachePtr.push_back(kvCaches[i].data_ptr());
+            mSlabKcachePtr.push_back(slabKCache[i].data_ptr());
+        } else {
+            mKcachePtr.push_back(kvCaches[i][0].data_ptr());
+            mVcachePtr.push_back(kvCaches[i][1].data_ptr());
+            mSlabKcachePtr.push_back(slabKCache[i].data_ptr());
+            mSlabVcachePtr.push_back(slabVCache[i].data_ptr());
+        }
+    }
+    mKvCaches = kvCaches;
+    mIsNewTrans = isNewTrans;
+}
+
+void GSAPrefetchEngineC::RunAsyncPrefetchBsTrans(std::vector<std::string>& reqIDsInput,
+                                                 std::vector<int>& topkLensInput,
+                                                 std::vector<int>& bsIndexInput)
+{
+    mLogger.log(LogLevel::INFO,
+                "Decode step: %u, |KVCache Prefetch| start async pretch batch size: %lu\n",
+                mDecodeStep, reqIDsInput.size());
+    mRunBsLen = reqIDsInput.size();
+    if (mRunBsLen > mMaxBs) {
+        mLogger.log(LogLevel::ERROR, "Decode step: %u, |KVCache Prefetch| mRunBsLen %u, maxBs: %d\n",
+                    mDecodeStep, mRunBsLen, mMaxBs);
+        std::abort();
+    }
+    mReqIdList.clear();
+    mReqIdList.assign(reqIDsInput.begin(), reqIDsInput.end());
+    memcpy(mTopkLenList, topkLensInput.data(), sizeof(int) * mRunBsLen);
+    memcpy(mBsIndexList, bsIndexInput.data(), sizeof(int) * mRunBsLen);
+    mMutex.lock();
+    mIsPrefetchDone = false;
+    mMutex.unlock();
+    mThreadPool->Enqueue(MutliBSThreadFun, this);
 }
 
 void GSAPrefetchEngineC::SetBlockTableInfo(torch::Tensor& blockTables, torch::Tensor& blockLengths,
@@ -551,7 +640,7 @@ int GSAPrefetchEngineC::CallPrefetchProcessFun()
     auto start = std::chrono::high_resolution_clock::now();
     allNeedLoadBlock.clear();
     allMissIdxs.clear();
-    for (size_t i = 0; i < runBsLen; i++) {
+    for (size_t i = 0; i < mRunBsLen; i++) {
         if (mDocsTables.find(mReqIdList[i]) == mDocsTables.end() || mTopkLenList[i] <= 0) {
             mLogger.log(LogLevel::ERROR,
                         "Decode step: %u, |KVCache Prefetch| topk len is zero: %d\n", mDecodeStep,
@@ -562,6 +651,7 @@ int GSAPrefetchEngineC::CallPrefetchProcessFun()
         allNeedLoadBlock.insert({mReqIdList[i], std::vector<std::vector<int>>(mLayerNum)});
         RunOneBsPrefetch(mReqIdList[i], mTopkLenList[i], mBsIndexList[i], i);
     }
+    TransKVCache();
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     mLogger.log(LogLevel::INFO,
@@ -571,6 +661,8 @@ int GSAPrefetchEngineC::CallPrefetchProcessFun()
 }
 
 bool GSAPrefetchEngineC::GetPrefetchStatus() { return mIsPrefetchDone; }
+
+bool GSAPrefetchEngineC::GetPrefetchStreamStatus() { return mGSATransBackend.IsStreamIdle(); }
 
 void GSAPrefetchEngineC::SetPrefetchStatus(bool flag)
 {

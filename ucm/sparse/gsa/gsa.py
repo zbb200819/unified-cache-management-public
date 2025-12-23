@@ -957,10 +957,12 @@ class GSA(UcmSparseBase):
         if not PTOPK_PREFETCH_ENABLE:
             return logits_indices
 
-        if IS_NEW_TRANS:
-            is_prefetch_done = self.ucm_load_stream.query()
-        elif self.is_python_load:
+        if self.is_python_load:
             is_prefetch_done = self.check_transfer_task_done()
+        elif IS_NEW_TRANS:
+            is_prefetch_done = (
+                self.prefetch_engine.prefetch_engine_c.get_prefetch_stream_status()
+            )
         else:
             is_prefetch_done = (
                 self.prefetch_engine.prefetch_engine_c.get_prefetch_status()
@@ -999,13 +1001,13 @@ class GSA(UcmSparseBase):
         if all_free_block_ids == None:
             return
 
-        offsets_k = []
-        src_k_tensor_offset = []
         current_stream = torch.cuda.current_stream()
         self.ucm_load_stream.wait_stream(
             current_stream
         )  # # sync2 : load wait attention finish
         for layer_id in range(self.layer_num):
+            offsets_k = []
+            src_k_tensor_offset = []
             for req_id in all_free_block_ids.keys():
                 slots = self.gsa_metadata.gsa_stats[req_id].slab_host_slot
                 length = len(all_free_block_ids[req_id][layer_id])
@@ -1020,7 +1022,7 @@ class GSA(UcmSparseBase):
             else:
                 dst_base_k = int(kv_caches[layer_id].data_ptr())
             if layer_id == 0:
-                print(f"zambin layer_id: {layer_id}, host_base_k: {host_base_k}, dst_base_k: {dst_base_k}")
+                print(f"zambin layer_id: {layer_id}, host_base_k: {offsets_k}, dst_base_k: {src_k_tensor_offset}")
             offsets_k = torch.tensor(
                 offsets_k,
                 dtype=torch.int64,
@@ -1302,6 +1304,7 @@ class GSA(UcmSparseBase):
                 )
                 for _ in range(self.layer_num)
             ]
+            self.prefetch_engine._slab_host_k = self._slab_host_k
 
             if not self.use_mla:
                 self._slab_host_v = [
@@ -1318,6 +1321,7 @@ class GSA(UcmSparseBase):
                     )
                     for _ in range(self.layer_num)
                 ]
+                self.prefetch_engine._slab_host_v = self._slab_host_v
 
     def dump_prefill_kvcache(self, vllm_block_ids, slots, layer_name, forward_context):
         # print(f"zambin before dump: {self.ucm_store_stream.query()}")

@@ -16,6 +16,7 @@ from ucm.sparse.utils import (
     VLLM_CUDA_MEM_ALIGN_KV_CACHE,
     align_to_256bytes,
     gsa_config,
+    IS_NEW_TRANS,
 )
 
 
@@ -119,6 +120,8 @@ class GSAPrefetchBase:
         self.topk_buf_tmp = None
         self.topk_bs = []
         self.is_topk_update = False
+        self._slab_host_k = []
+        self._slab_host_v = []
 
     def model_input_deal(
         self,
@@ -220,6 +223,13 @@ class GSAPrefetchBase:
                 self.prefetch_topk_buf[:, : len(self.select_bs_index), :],
                 self.step_time,
             )
+            if IS_NEW_TRANS:
+                self.prefetch_engine_c.set_kvcache(
+                    kvcache,
+                    self._slab_host_k,
+                    self._slab_host_v,
+                    IS_NEW_TRANS)
+            
             topk_len_list = []
             req_id_list = []
             for req_id in self.req_ids_bs:
@@ -234,11 +244,16 @@ class GSAPrefetchBase:
                         )
                     else:
                         topk_len_list.append(0)
-            self.prefetch_engine_c.run_async_prefetch_bs(
-                req_id_list, topk_len_list, self.select_bs_index, kvcache, store_ptr
-            )
+            if IS_NEW_TRANS:
+                self.prefetch_engine_c.run_async_prefetch_bs_trans(
+                    req_id_list, topk_len_list, self.select_bs_index
+                )
+            else:
+                self.prefetch_engine_c.run_async_prefetch_bs(
+                    req_id_list, topk_len_list, self.select_bs_index, kvcache, store_ptr
+                )
             self.is_topk_update = False
-            if self.is_python_load:
+            if self.is_python_load and not IS_NEW_TRANS:
                 all_free_block_ids = self.prefetch_engine_c.obtain_load_blocks()
                 all_miss_ids = self.prefetch_engine_c.obtain_miss_idxs()
         return all_free_block_ids, all_miss_ids
@@ -366,6 +381,7 @@ class GSAPrefetchBase:
                         gsa_metadata.gsa_stats[req_id].prefetch_map,
                         gsa_metadata.gsa_stats[req_id].block_hashes,
                         max_idx,
+                        gsa_metadata.gsa_stats[req_id].slab_host_slot,
                     )
                 else:
                     self.prefetch_engine_c.set_blocks_map(
@@ -375,6 +391,7 @@ class GSAPrefetchBase:
                         prefetch_idx,
                         gsa_metadata.gsa_stats[req_id].block_hashes,
                         max_idx,
+                        gsa_metadata.gsa_stats[req_id].slab_host_slot,
                     )
 
     def _gsa_block_len_pre(
