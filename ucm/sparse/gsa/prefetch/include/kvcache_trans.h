@@ -24,12 +24,19 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
-#include "../../../../shared/simpletrans/cuda_sm_kernel.h"
+#include "cuda_sm_kernel.h"
+#include <iostream>
+#include <string>
 
 using Ptr = uintptr_t;
 
 class TransBackend {
 public:
+    static TransBackend* GetInst(cudaStream_t stream_)
+    {
+        static TransBackend trans(stream_);
+        return &trans;
+    }
     // 构造函数：内部新建一条 CUDA stream（非阻塞）
     TransBackend() : stream_(nullptr), own_stream_(true)
     {
@@ -41,9 +48,9 @@ public:
     }
 
     // 外部传入已有 stream 指针（uint64）
-    TransBackend(uint64_t stream_addr) : stream_(nullptr), own_stream_(false)
+    TransBackend(cudaStream_t stream_addr) : stream_(nullptr), own_stream_(false)
     {
-        stream_ = reinterpret_cast<cudaStream_t>(stream_addr);
+        stream_ = stream_addr;
         if (!stream_) { throw std::runtime_error("TransBackend: null stream pointer"); }
     }
 
@@ -59,37 +66,47 @@ public:
     //  size_bytes:    每个 block 拷贝的字节数（block_bytes）
     //  number:        block 个数（num_blocks）
     // ============================
-    void copy_trans(void** src_ptrs_addr, void** dst_ptrs_addr, size_t size_bytes, size_t number)
+    int32_t copy_trans(void** src_ptrs_addr, void** dst_ptrs_addr,
+                    size_t size_bytes, size_t number)
     {
         // 3. 直接调用底层的 CudaSMCopyAsync
         auto err = UC::Trans::CudaSMCopyAsync(src_ptrs_addr,  // void* src[]
                                               dst_ptrs_addr,  // void* dst[]
                                               size_bytes, number, stream_);
-
-        TORCH_CHECK(err == cudaSuccess, "CudaSMCopyAsync (D2H) failed: ", cudaGetErrorString(err));
+        if (err != cudaSuccess) {
+            std::cout << "CudaSMCopyAsync (H2D) failed: " << cudaGetErrorString(err) << std::endl;
+            return -1;
+        } else {
+            return 0;
+        }
     }
 
     // 同步内部 stream
-    void synchronize()
+    int32_t synchronize()
     {
         auto err = cudaStreamSynchronize(stream_);
-        TORCH_CHECK(err == cudaSuccess, "cudaStreamSynchronize failed: ", cudaGetErrorString(err));
+        if (err != cudaSuccess) {
+            std::cout << "cudaStreamSynchronize failed: " << cudaGetErrorString(err) << std::endl;
+            return -1;
+        } else {
+            return 0;
+        }
     }
 
     // 导出内部 stream 的地址
     uint64_t get_stream_ptr() const { return reinterpret_cast<uint64_t>(stream_); }
 
-    bool IsStreamIdle() {
+    bool IsStreamIdle()
+    {
         cudaError_t status = cudaStreamQuery(stream_);
-        
+
         if (status == cudaSuccess) {
             return true;  // 流中所有操作已完成
         } else if (status == cudaErrorNotReady) {
-            return false; // 流中仍有操作在执行
+            return false;  // 流中仍有操作在执行
         } else {
             // 其他错误情况
-            std::cerr << "Error querying stream: " 
-                    << cudaGetErrorString(status) << std::endl;
+            std::cerr << "Error querying stream: " << cudaGetErrorString(status) << std::endl;
             return false;
         }
     }

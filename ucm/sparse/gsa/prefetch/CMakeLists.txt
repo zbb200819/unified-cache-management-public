@@ -64,10 +64,18 @@ if(RUNTIME_ENVIRONMENT STREQUAL "ascend")
         message(WARNING "torch_npu not found, but RUNTIME_ENVIRONMENT is set to ascend")
     endif()
 else()
-    find_package(CUDAToolkit REQUIRED)
-    list(INSERT LIBRARY_DIRS 0 ${CMAKE_SOURCE_DIR}/ucm/shared/simpletrans)
-    list(INSERT INCLUDE_DIRS 0 ${CMAKE_SOURCE_DIR}/ucm/shared/simpletrans)
-    list(INSERT LIBRARIES 0 CUDA::cudart)
+    set(CUDA_ROOT "/usr/local/cuda/" CACHE PATH "Path to CUDA root directory")
+    set(CMAKE_CUDA_COMPILER ${CUDA_ROOT}/bin/nvcc)
+    set(CMAKE_CUDA_ARCHITECTURES 75 80 86 89 90)
+    enable_language(CUDA)
+    list(INSERT INCLUDE_DIRS 0 ${CUDA_ROOT}/include)
+    list(INSERT LIBRARY_DIRS 0 ${CUDA_ROOT}/lib64)
+    add_library(cudakernel OBJECT ${CMAKE_CURRENT_SOURCE_DIR}/include/cuda_sm_kernel.cu)
+    target_compile_options(cudakernel PRIVATE
+        --diag-suppress=128 --diag-suppress=2417 --diag-suppress=2597
+        -Wall -fPIC
+    )
+    list(INSERT LIBRARIES 0 cudakernel)
 endif()
 
 # 设置CXX11_ABI宏

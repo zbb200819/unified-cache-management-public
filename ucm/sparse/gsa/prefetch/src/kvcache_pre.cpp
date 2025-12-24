@@ -25,6 +25,7 @@
 #include <kvcache_log.h>
 #include <sched.h>
 #include <stdint.h>
+#define MAX_LOAD_NUM 2000u
 
 namespace ucmprefetch {
 ThreadPool::ThreadPool(size_t threadCount) : stop(false), maxThreads(threadCount)
@@ -128,6 +129,15 @@ GSAPrefetchEngineC::GSAPrefetchEngineC(torch::Tensor& loadSuccessBlocks,
     mTPSize = tpSize;
     mRank = rank;
     mIsPythonLoad = isPythonLoad;
+    cudaStream_t stream_;
+    auto err = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        mLogger.log(LogLevel::ERROR, "GSAPrefetchEngineC create stream error %s\n",
+                    cudaGetErrorString(err));
+    }
+    mLogger.log(LogLevel::INFO, "GSAPrefetchEngineC create stream success\n");
+    mGSATransBackend = TransBackend::GetInst(stream_);
+    mLogger.log(LogLevel::INFO, "GSAPrefetchEngineC create stream success\n");
     if (mRank != 0) {
         mLogger.SetLevel(LogLevel::WARNING);
         mIsLog = false;
@@ -138,50 +148,6 @@ GSAPrefetchEngineC::GSAPrefetchEngineC(torch::Tensor& loadSuccessBlocks,
                 "%u mBlockSize %u mHeadNum %u, mIsPythonLoad %d\n",
                 mLayerNum, mMaxBs, mUseMla, mHeadSzie, mTPSize, mBlockSize, mHeadNum,
                 mIsPythonLoad);
-}
-
-size_t GSAPrefetchEngineC::GetOffset(uint32_t layerID, bool isV)
-{
-    size_t kMinDataBlockSize =
-        static_cast<size_t>(mBlockSize) * mHeadNum * mHeadSzie * mTensorElemSize;
-    size_t vMinDataBlockSize = kMinDataBlockSize;
-    size_t layerSize = (kMinDataBlockSize + vMinDataBlockSize) * mTPSize;
-    if (mUseMla) {
-        vMinDataBlockSize = 0;
-        layerSize = kMinDataBlockSize;
-    }
-    size_t kOffset = 0;
-    if (mUseMla) {
-        kOffset = layerSize * layerID;
-    } else {
-        kOffset = layerSize * layerID + layerSize / mTPSize * mRank;
-    }
-    size_t vOffset = kOffset + kMinDataBlockSize;
-    if (isV) {
-        return vOffset;
-    } else {
-        return kOffset;
-    }
-}
-
-size_t GSAPrefetchEngineC::GetOffsetNew(uint32_t layerID, bool isV)
-{
-    size_t kMinDataBlockSize =
-        static_cast<size_t>(mBlockSize) * mHeadNum * mHeadSzie * mTensorElemSize;
-    size_t layerSize = kMinDataBlockSize * 2;
-    size_t kOffset = layerSize * layerID;
-    if (mUseMla) {
-        layerSize = kMinDataBlockSize;
-        kOffset = layerSize * layerID;
-        return kOffset;
-    }
-    size_t vOffset = kOffset + kMinDataBlockSize;
-
-    if (isV) {
-        return vOffset;
-    } else {
-        return kOffset;
-    }
 }
 
 void GSAPrefetchEngineC::CheckInputIndex(uint32_t maxLen, uint32_t index)
@@ -245,7 +211,7 @@ void GSAPrefetchEngineC::SetBlocksMapMultiLayer(std::string reqID,
         mBlocksMap[reqID].clear();
         mDocsTables[reqID].clear();
         mAllBlcoksHash[reqID].clear();
-		mPrefetchIdx[reqID].clear();
+        mPrefetchIdx[reqID].clear();
         mAllReqIdSlots[reqID].clear();
     }
     mAllBlcoksHash[reqID] = blocksHash;
@@ -449,30 +415,89 @@ void GSAPrefetchEngineC::RunOneBsPrefetch(std::string reqID, int topkLen, int bs
 
 void GSAPrefetchEngineC::TransKVCache()
 {
-    for(int layerID = 0; layerID < mLayerNum; layerID++) {
-        std::vector<void*> hostKPtr;
-        std::vector<void*> deviceKPtr;
-        std::vector<void*> hostVPtr;
-        std::vector<void*> deviceVPtr;
+    std::ostringstream oss;
+    for (int layerID = 0; layerID < mLayerNum; layerID++) {
+        oss << "Decode step: " << mDecodeStep << " Rnak: " << mRank << " layerID: " << layerID
+            << " load info(reqID-blockID-slot-ptr): ";
+        std::vector<uint64_t> hostKPtr;
+        std::vector<uint64_t> deviceKPtr;
+        std::vector<uint64_t> hostVPtr;
+        std::vector<uint64_t> deviceVPtr;
         for (auto& it : allNeedLoadBlock) {
             std::string reqID = it.first;
             std::vector<int>& loadBlockIDs = allNeedLoadBlock[reqID][layerID];
             std::vector<int>& oneMissIDs = allMissIdxs[reqID][layerID];
-            if (loadBlockIDs.size() == 0) {
-                continue;
-            }
+            if (loadBlockIDs.size() == 0) { continue; }
             for (uint32_t i = 0; i < loadBlockIDs.size(); i++) {
-                deviceKPtr.push_back(static_cast<void*>(static_cast<char*>(mKcachePtr[layerID]) + mKVSzieBytes * loadBlockIDs[i]));
-                hostKPtr.push_back(static_cast<void*>(static_cast<char*>(mSlabKcachePtr[layerID]) +  + mKVSzieBytes * mAllReqIdSlots[reqID][oneMissIDs[i]]));
-                if(!mUseMla) {
-                    deviceVPtr.push_back(static_cast<void*>(static_cast<char*>(mVcachePtr[layerID]) + mKVSzieBytes * loadBlockIDs[i]));
-                    hostVPtr.push_back(static_cast<void*>(static_cast<char*>(mSlabVcachePtr[layerID]) + mKVSzieBytes * mAllReqIdSlots[reqID][oneMissIDs[i]]));
+                deviceKPtr.push_back(mKcachePtr[layerID] + mKVSzieBytes * loadBlockIDs[i]);
+                hostKPtr.push_back(mSlabKcachePtr[layerID] +
+                                   mKVSzieBytes * mAllReqIdSlots[reqID][oneMissIDs[i]]);
+                if (!mUseMla) {
+                    deviceVPtr.push_back(mVcachePtr[layerID] + mKVSzieBytes * loadBlockIDs[i]);
+                    hostVPtr.push_back(mSlabVcachePtr[layerID] +
+                                       mKVSzieBytes * mAllReqIdSlots[reqID][oneMissIDs[i]]);
                 }
+                oss << "(" << reqID << "-" << loadBlockIDs[i] << "-"
+                    << mAllReqIdSlots[reqID][oneMissIDs[i]] << "-" << hostKPtr.back() << "-"
+                    << deviceKPtr.back() << ") ";
             }
         }
-        mGSATransBackend.copy_trans(hostKPtr.data(), deviceKPtr.data(), deviceKPtr.size(), mKVSzieBytes);
-        if(!mUseMla) {
-            mGSATransBackend.copy_trans(hostVPtr.data(), deviceVPtr.data(), deviceVPtr.size(), mKVSzieBytes);
+        oss << "------\n";
+        mLogger.log(LogLevel::DEBUG, oss.str().c_str());
+        oss.str("");
+        mLogger.log(LogLevel::DEBUG,
+                    "|KVCache Prefetch| Decode step: %u, Rank: %d, layerID: %d, H2D kvcache size: %lu\n",
+                    mDecodeStep, mRank, layerID, deviceKPtr.size());
+        if (deviceKPtr.size() == 0) { continue; }
+        uint32_t loadNum = deviceKPtr.size();
+        if (deviceKPtr.size() > MAX_LOAD_NUM) {
+            mLogger.log(LogLevel::WARNING,
+                        "|KVCache Prefetch| Decode step: %u, Rank: %d, layerID: %d, load size: %lu "
+                        "exceed max load num: %u\n",
+                        mDecodeStep, mRank, layerID, deviceKPtr.size(), MAX_LOAD_NUM);
+            loadNum = MAX_LOAD_NUM;
+        }
+        std::memcpy(mDeviceKPtrTensorCpu[0].data_ptr(), &deviceKPtr[0], sizeof(uint64_t) * loadNum);
+        std::memcpy(mDeviceKPtrTensorCpu[1].data_ptr(), &hostKPtr[0], sizeof(uint64_t) * loadNum);
+        if (!mUseMla) {
+            std::memcpy(mDeviceKPtrTensorCpu[2].data_ptr(), &deviceVPtr[0],
+                        sizeof(uint64_t) * loadNum);
+            std::memcpy(mDeviceKPtrTensorCpu[3].data_ptr(), &hostVPtr[0],
+                        sizeof(uint64_t) * loadNum);
+        }
+        mDeviceKPtrTensor = mDeviceKPtrTensorCpu.to(mDeviceKPtrTensor.device());
+        continue;
+        auto ret = mGSATransBackend->copy_trans(static_cast<void**>(mDeviceKPtrTensor[1].data_ptr()),
+                                     static_cast<void**>(mDeviceKPtrTensor[0].data_ptr()),
+                                     mKVSzieBytes, deviceKPtr.size());
+        if (ret != 0) {
+            mLogger.log(LogLevel::ERROR,
+                        "|KVCache Prefetch| Decode step: %u, Rank: %d, layerID: %d, H2D kvcache "
+                        "transfer error\n",
+                        mDecodeStep, mRank, layerID);
+        } else {
+            mLogger.log(LogLevel::DEBUG,
+                        "|KVCache Prefetch| Decode step: %u, Rank: %d, layerID: %d, H2D kvcache "
+                        "transfer success\n",
+                        mDecodeStep, mRank, layerID);
+        }
+        if (!mUseMla) {
+            mGSATransBackend->copy_trans(static_cast<void**>(mDeviceKPtrTensor[3].data_ptr()),
+                                         static_cast<void**>(mDeviceKPtrTensor[2].data_ptr()),
+                                         mKVSzieBytes, deviceKPtr.size());
+            mLogger.log(LogLevel::DEBUG, "|KVCache Prefetch| transfer vcache done\n");
+        }
+        ret = mGSATransBackend->synchronize();
+        if (ret != 0) {
+            mLogger.log(LogLevel::ERROR,
+                        "|KVCache Prefetch| Decode step: %u, Rank: %d, layerID: %d, synchronize "
+                        "error\n",
+                        mDecodeStep, mRank, layerID);
+        } else {
+            mLogger.log(LogLevel::DEBUG,
+                        "|KVCache Prefetch| Decode step: %u, Rank: %d, layerID: %d, H2D kvcache "
+                        "transfer success\n",
+                        mDecodeStep, mRank, layerID);
         }
     }
 }
@@ -481,45 +506,6 @@ void GSAPrefetchEngineC::LoadKVToHBM(std::vector<int> loadNPUBlockIDs, std::vect
                                      int layerID, std::string reqID)
 {
     for (size_t i = 0; i < loadNPUBlockIDs.size(); i++) {
-        if (!mIsPythonLoad && !mIsNewTrans) {
-            if (mDelSeqIds.find(reqID) != mDelSeqIds.end()) {
-                mLogger.log(LogLevel::INFO,
-                            "Decode step: %u, Rank: %d, reqID: %s, layer: %d, stop prefetch\n",
-                            mDecodeStep, mRank, reqID.c_str(), layerID);
-                return;
-            }
-            while (mStopPrefetch) { std::this_thread::sleep_for(std::chrono::microseconds(2)); }
-            UC::Task task{UC::Task::Type::LOAD, UC::Task::Location::DEVICE, "NFS::S2D"};
-            std::string blockId = mAllBlcoksHash[reqID][missIdxs[i]];
-            size_t kOffset = GetOffsetNew(layerID, false);
-            size_t vOffset = GetOffsetNew(layerID, true);
-            if (!mUseMla) {
-                task.Append(blockId, kOffset,
-                            reinterpret_cast<uintptr_t>(
-                                mKvCaches[layerID][0][loadNPUBlockIDs[i]].data_ptr()),
-                            mKVSzieBytes);
-                task.Append(blockId, vOffset,
-                            reinterpret_cast<uintptr_t>(
-                                mKvCaches[layerID][1][loadNPUBlockIDs[i]].data_ptr()),
-                            mKVSzieBytes);
-            } else {
-                task.Append(
-                    blockId, kOffset,
-                    reinterpret_cast<uintptr_t>(mKvCaches[layerID][loadNPUBlockIDs[i]].data_ptr()),
-                    mKVSzieBytes);
-            }
-            size_t taskID = mStore->Submit(std::move(task));
-            auto ret = mStore->Wait(taskID);
-            if (ret != 0) {
-                mLogger.log(LogLevel::ERROR,
-                            "Decode step: %u, Rank: %d, reqID: %s, layer: %d, blockID: %lu, miss "
-                            "idx: %u, load blockid: %u load k error\n",
-                            mDecodeStep, mRank, reqID.c_str(), layerID, blockId, missIdxs[i],
-                            loadNPUBlockIDs[i]);
-                return;
-            }
-        }
-
         int oriIdx = mBlocksMap[reqID][layerID][loadNPUBlockIDs[i]];
         mBlocksMap[reqID][layerID][loadNPUBlockIDs[i]] = missIdxs[i];
         mDocsTables[reqID][layerID].erase(oriIdx);
@@ -556,8 +542,9 @@ void GSAPrefetchEngineC::RunAsyncPrefetchBs(std::vector<std::string>& reqIDsInpu
                 mDecodeStep, reqIDsInput.size());
     mRunBsLen = reqIDsInput.size();
     if (mRunBsLen > mMaxBs) {
-        mLogger.log(LogLevel::ERROR, "Decode step: %u, |KVCache Prefetch| mRunBsLen %u, maxBs: %d\n",
-                    mDecodeStep, mRunBsLen, mMaxBs);
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| mRunBsLen %u, maxBs: %d\n", mDecodeStep,
+                    mRunBsLen, mMaxBs);
         std::abort();
     }
     mReqIdList.clear();
@@ -575,32 +562,44 @@ void GSAPrefetchEngineC::RunAsyncPrefetchBs(std::vector<std::string>& reqIDsInpu
 }
 
 void GSAPrefetchEngineC::SetKvCache(std::vector<torch::Tensor>& kvCaches,
-                                    std::vector<torch::Tensor>& slabKCache,
-                                    std::vector<torch::Tensor>& slabVCache,
-                                    bool isNewTrans)
+                                    std::vector<uint64_t>& kCachesPtr,
+                                    std::vector<uint64_t>& vCachesPtr,
+                                    std::vector<uint64_t>& slabKCachesPtr,
+                                    std::vector<uint64_t>& slabVCachesPtr, bool isNewTrans)
 {
+    if (mTensorElemSize != 0) { return; }
     mTensorElemSize = kvCaches[0].element_size();
     if (mUseMla) {
         mKVSzieBytes = kvCaches[0].element_size() * kvCaches[0][0].numel();
     } else {
         mKVSzieBytes = kvCaches[0].element_size() * kvCaches[0][0][0].numel();
     }
-    mLogger.log(LogLevel::INFO,
-                "Decode step: %u, |KVCache Prefetch| init kvcache mKVSzieBytes: %u, mTensorElemSize "
-                "%u,\n", mDecodeStep, mKVSzieBytes, mTensorElemSize);
+    mLogger.log(
+        LogLevel::INFO,
+        "Decode step: %u, |KVCache Prefetch| init kvcache mKVSzieBytes: %u, mTensorElemSize "
+        "%u,\n",
+        mDecodeStep, mKVSzieBytes, mTensorElemSize);
+    mKcachePtr = kCachesPtr;
+    mVcachePtr = vCachesPtr;
+    mSlabKcachePtr = slabKCachesPtr;
+    mSlabVcachePtr = slabVCachesPtr;
+    std::ostringstream oss;
+    oss << "Decode step: " << mDecodeStep << " Rnak: " << mRank
+        << " kvcache ptr (layerID-kptr-kslabptr-vptr-vslabptr): ";
     for (int i = 0; i < mLayerNum; i++) {
-        if (mUseMla) {
-            mKcachePtr.push_back(kvCaches[i].data_ptr());
-            mSlabKcachePtr.push_back(slabKCache[i].data_ptr());
-        } else {
-            mKcachePtr.push_back(kvCaches[i][0].data_ptr());
-            mVcachePtr.push_back(kvCaches[i][1].data_ptr());
-            mSlabKcachePtr.push_back(slabKCache[i].data_ptr());
-            mSlabVcachePtr.push_back(slabVCache[i].data_ptr());
-        }
+        oss << "(" << i << "-" << mKcachePtr[i] << "-" << mSlabKcachePtr[i] << "-" << mVcachePtr[i]
+            << "-" << mSlabVcachePtr[i] << ") ";
     }
+    oss << "------\n";
+    mLogger.log(LogLevel::INFO, oss.str().c_str());
+    oss.str("");
     mKvCaches = kvCaches;
     mIsNewTrans = isNewTrans;
+    auto device = mKvCaches[0].device();
+    auto options = torch::TensorOptions().dtype(torch::kUInt64).device(device);
+    mDeviceKPtrTensor = torch::empty({4, MAX_LOAD_NUM}, options);
+    auto optionsCpu = torch::TensorOptions().dtype(torch::kUInt64).device("cpu").pinned_memory(true);
+    mDeviceKPtrTensorCpu = torch::empty({4, MAX_LOAD_NUM}, optionsCpu);
 }
 
 void GSAPrefetchEngineC::RunAsyncPrefetchBsTrans(std::vector<std::string>& reqIDsInput,
@@ -612,8 +611,9 @@ void GSAPrefetchEngineC::RunAsyncPrefetchBsTrans(std::vector<std::string>& reqID
                 mDecodeStep, reqIDsInput.size());
     mRunBsLen = reqIDsInput.size();
     if (mRunBsLen > mMaxBs) {
-        mLogger.log(LogLevel::ERROR, "Decode step: %u, |KVCache Prefetch| mRunBsLen %u, maxBs: %d\n",
-                    mDecodeStep, mRunBsLen, mMaxBs);
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| mRunBsLen %u, maxBs: %d\n", mDecodeStep,
+                    mRunBsLen, mMaxBs);
         std::abort();
     }
     mReqIdList.clear();
@@ -662,7 +662,7 @@ int GSAPrefetchEngineC::CallPrefetchProcessFun()
 
 bool GSAPrefetchEngineC::GetPrefetchStatus() { return mIsPrefetchDone; }
 
-bool GSAPrefetchEngineC::GetPrefetchStreamStatus() { return mGSATransBackend.IsStreamIdle(); }
+bool GSAPrefetchEngineC::GetPrefetchStreamStatus() { return mGSATransBackend->IsStreamIdle(); }
 
 void GSAPrefetchEngineC::SetPrefetchStatus(bool flag)
 {
@@ -692,4 +692,4 @@ std::map<std::string, std::vector<std::map<int, int>>> GSAPrefetchEngineC::Obtai
 {
     return mDocsTables;
 }
-} // namespace ucmprefetch
+}  // namespace ucmprefetch

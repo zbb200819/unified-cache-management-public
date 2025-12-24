@@ -959,10 +959,6 @@ class GSA(UcmSparseBase):
 
         if self.is_python_load:
             is_prefetch_done = self.check_transfer_task_done()
-        elif IS_NEW_TRANS:
-            is_prefetch_done = (
-                self.prefetch_engine.prefetch_engine_c.get_prefetch_stream_status()
-            )
         else:
             is_prefetch_done = (
                 self.prefetch_engine.prefetch_engine_c.get_prefetch_status()
@@ -983,6 +979,18 @@ class GSA(UcmSparseBase):
             kv_cache = attn[layer_name].kv_cache[forward_context.virtual_engine]
             layer_id = int(layer_name.split(".")[2])
             kv_caches[layer_id] = kv_cache
+            if self.prefetch_engine.k_cache_ptr[layer_id] == None:
+                if self.use_mla:
+                    self.prefetch_engine.k_cache_ptr[layer_id] = int(
+                        kv_cache.data_ptr()
+                    )
+                else:
+                    self.prefetch_engine.k_cache_ptr[layer_id] = int(
+                        kv_cache[0].data_ptr()
+                    )
+                    self.prefetch_engine.v_cache_ptr[layer_id] = int(
+                        kv_cache[1].data_ptr()
+                    )
 
         all_free_block_ids, all_miss_ids = self.prefetch_engine.deal_async_prefetch(
             self.gsa_metadata,
@@ -1304,7 +1312,7 @@ class GSA(UcmSparseBase):
                 )
                 for _ in range(self.layer_num)
             ]
-            self.prefetch_engine._slab_host_k = self._slab_host_k
+            self.prefetch_engine._slab_host_k_ptr = [int(self._slab_host_k[i].data_ptr()) for i in range(self.layer_num)]
 
             if not self.use_mla:
                 self._slab_host_v = [
@@ -1321,7 +1329,7 @@ class GSA(UcmSparseBase):
                     )
                     for _ in range(self.layer_num)
                 ]
-                self.prefetch_engine._slab_host_v = self._slab_host_v
+                self.prefetch_engine._slab_host_v_ptr = [int(self._slab_host_v[i].data_ptr()) for i in range(self.layer_num)]
 
     def dump_prefill_kvcache(self, vllm_block_ids, slots, layer_name, forward_context):
         # print(f"zambin before dump: {self.ucm_store_stream.query()}")

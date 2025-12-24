@@ -120,8 +120,10 @@ class GSAPrefetchBase:
         self.topk_buf_tmp = None
         self.topk_bs = []
         self.is_topk_update = False
-        self._slab_host_k = []
-        self._slab_host_v = []
+        self._slab_host_k_ptr = []
+        self._slab_host_v_ptr = []
+        self.k_cache_ptr = [None] * self.num_attention_layers
+        self.v_cache_ptr = [None] * self.num_attention_layers
 
     def model_input_deal(
         self,
@@ -226,8 +228,10 @@ class GSAPrefetchBase:
             if IS_NEW_TRANS:
                 self.prefetch_engine_c.set_kvcache(
                     kvcache,
-                    self._slab_host_k,
-                    self._slab_host_v,
+                    self.k_cache_ptr,
+                    self.v_cache_ptr,
+                    self._slab_host_k_ptr,
+                    self._slab_host_v_ptr,
                     IS_NEW_TRANS)
             
             topk_len_list = []
