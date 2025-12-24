@@ -44,6 +44,7 @@ from ucm.shared.simpletrans import ucm_sm_copy
 
 ReqType = Union[str, int]
 
+
 class GSASharedCPUPool:
     def __init__(self, num_slots):
         self.free_slots = set(range(num_slots))
@@ -59,6 +60,7 @@ class GSASharedCPUPool:
     def free(self, slots):
         self.free_slots.update(slots)
         self.allocated.difference_update(slots)
+
 
 class GSAReqStat:
     def __init__(self, req_id, vllm_config: VllmConfig) -> None:
@@ -78,18 +80,9 @@ class GSAReqStat:
         self.remain_idx = None
         self.prefetch_idx = None
         self.topk_buf_tmp = None
-        self.init_window_kv = None
-        self.local_window_kv = []
         self.sparse_len = 0
-        self.block_size = vllm_config.cache_config.block_size
-        self.block_hashes = None
-        self.num_prompt_blocks = 0
         self.reamin_map = None
         self.prefetch_map = None
-        self._vllm_config = vllm_config
-        self.rank = vllm_config.parallel_config.rank
-        self.use_mla = vllm_config.model_config.use_mla
-        self.request_hasher = RequestHasher(vllm_config, 0)
         self.slab_host_slot = None
 
     def step(self) -> int:
@@ -117,35 +110,6 @@ class GSAReqStat:
     def get_seq_len(self) -> int:
         return self.num_computed_tokens + self.num_scheduled_tokens
 
-    def set_block_hashes(self, token_ids):
-        if self.block_hashes is not None:
-            return
-        self.block_hashes = []
-
-        parent_block_hash_value = compute_parent_block_hash(
-            self._vllm_config.model_config.model,
-            self._vllm_config.parallel_config.world_size,
-            self._vllm_config.model_config.dtype,
-            seed_rank=0,
-        )
-
-        for start in range(0, len(token_ids), self.block_size):
-            end = start + self.block_size
-            block_token_ids = token_ids[start:end]
-            if len(block_token_ids) < self.block_size:
-                break
-            curr_block_token_ids_tuple = tuple(block_token_ids)
-            hash_value = self.request_hasher(
-                (parent_block_hash_value, curr_block_token_ids_tuple)
-            )
-            self.block_hashes.append(str(hash_value))
-            parent_block_hash_value = hash_value
-
-        if self.rank != 0 and not self.use_mla:
-            self.newqrequest_hasher = RequestHasher(self._vllm_config, self.rank)
-            for i, ucm_block_id in enumerate(self.block_hashes):
-                self.block_hashes[i] = str(self.newqrequest_hasher(ucm_block_id))
-
     def add_req_new(
         self, num_scheduled_tokens, add_req_state, index_in_batch, offset
     ) -> None:
@@ -155,14 +119,12 @@ class GSAReqStat:
         self.num_scheduled_tokens = num_scheduled_tokens
         self.num_prompt_tokens = len(add_req_state.prompt_token_ids)
         self.num_output_tokens = len(add_req_state.output_token_ids)
-        self.num_prompt_blocks = math.ceil(self.num_prompt_tokens / self.block_size)
         self.is_use_gsa = (
             True if self.num_prompt_tokens > SEG_PREFILL_THRESHOLD else False
         )
         self._init_slot(offset)
         if len(self.repre_slot_mapping) > len(self.blocks):
             self.repre_slot_mapping = self.repre_slot_mapping[: len(self.blocks)]
-        self.set_block_hashes(add_req_state.prompt_token_ids)
 
     def updata_req_state(
         self, num_scheduled_tokens, add_req_state, index_in_batch
@@ -388,21 +350,6 @@ class TopKAndKpreManger:
             return False
 
 
-@cache
-def md5(input) -> int:
-    input_bytes = pickle.dumps(input, protocol=pickle.HIGHEST_PROTOCOL)
-    md5_bytes = hashlib.md5(input_bytes).digest()
-    return int.from_bytes(md5_bytes, byteorder="big")
-
-
-@cache
-def block_hash_func(parent_block_hash, curr_block_token_ids):
-    if not parent_block_hash:
-        parent_block_hash = md5("UCMHASHSEED")
-    curr_block_token_ids_tuple = tuple(curr_block_token_ids)
-    return md5((parent_block_hash, curr_block_token_ids_tuple))
-
-
 class TopkCal:
     def __init__(self, att_num_heads, kv_num_heads, head_size, kpre_caches, use_mla):
         self.att_num_heads = att_num_heads
@@ -446,52 +393,6 @@ class TopkCal:
         self.topk_caches[current_layer_id][self.cal_topk_id] = top_indices
 
 
-@cache
-def get_offset(block_shape, rank, tp_size, precision, layer_id, is_v, is_mla) -> int:
-    block_size, num_key_heads_per_tp, head_size = block_shape
-    k_min_data_block_size = block_size * num_key_heads_per_tp * head_size * precision
-    v_min_data_block_size = k_min_data_block_size if not is_mla else 0
-    layer_size = (k_min_data_block_size + v_min_data_block_size) * (
-        tp_size if not is_mla else 1
-    )
-    if is_mla:
-        k_offset = layer_size * layer_id
-    else:
-        k_offset = layer_size * layer_id + layer_size // tp_size * rank
-    v_offset = k_offset + k_min_data_block_size
-    return v_offset if is_v else k_offset
-
-
-@cache
-def compute_parent_block_hash(model_name, world_size, dtype, seed_rank=0) -> int:
-    meta = f"{model_name}:{world_size}:{dtype}:{seed_rank}"
-    meta_bytes = meta.encode("utf-8")
-    h_seed = hashlib.md5(meta_bytes + b"UCM_HASH_SEED").digest()
-    return int.from_bytes(h_seed, byteorder="big")
-
-
-@cache
-def compute_layer_offset(
-    block_data_size: int,
-    layer_id: int,
-    is_v: bool,
-    is_mla: bool,
-) -> int:
-    layer_data_size = block_data_size if is_mla else block_data_size * 2
-
-    k_offset = layer_data_size * layer_id
-
-    if is_mla:
-        return k_offset
-
-    v_offset = k_offset + block_data_size
-    return v_offset if is_v else k_offset
-
-
-def task_hash_func(block_ids, store_type, tensor_type):
-    return hash((tuple(block_ids), store_type, tensor_type))
-
-
 class GSA(UcmSparseBase):
     def __init__(self, vllm_config: VllmConfig, role: UcmSparseRole):
         super().__init__(vllm_config, role)
@@ -527,24 +428,19 @@ class GSA(UcmSparseBase):
                 self.ucm_load_backend = ucm_sm_copy.TransBackend(
                     int(self.ucm_load_stream.cuda_stream)
                 )
-                self.connector = get_kv_transfer_group().connector
-                # self.connector = None
-            else:
-                self.connector = None
         num_slots = (
             vllm_config.model_config.max_model_len
             * vllm_config.scheduler_config.max_num_seqs
             // vllm_config.cache_config.block_size
         )
         self.gsa_cpu_shared_pool = GSASharedCPUPool(num_slots)
-        self.is_python_load = not torch.cuda.is_available() or IS_NEW_TRANS
         if CUDA_TOPK:
             self.prefetch_engine = GSAPrefetchBase(
-                vllm_config, 16, True, False, False, 1, self.is_python_load
+                vllm_config, 16, True, False, False, 1
             )
         else:
             self.prefetch_engine = GSAPrefetchBase(
-                vllm_config, 16, True, True, False, 1, self.is_python_load
+                vllm_config, 16, True, True, False, 1
             )
         self.topk_kpre_manger = TopKAndKpreManger(MAX_BS)
         self.gsa_metadata = None
@@ -560,6 +456,7 @@ class GSA(UcmSparseBase):
         self.block_bytes = (
             self.block_size * self.num_key_heads * self.head_size * self.element_size
         )
+
     def init_topk_cal(
         self,
         vllm_config: VllmConfig,
@@ -957,12 +854,9 @@ class GSA(UcmSparseBase):
         if not PTOPK_PREFETCH_ENABLE:
             return logits_indices
 
-        if self.is_python_load:
-            is_prefetch_done = self.check_transfer_task_done()
-        else:
-            is_prefetch_done = (
-                self.prefetch_engine.prefetch_engine_c.get_prefetch_status()
-            )
+        is_prefetch_done = (
+            self.prefetch_engine.prefetch_engine_c.get_prefetch_status()
+        )
         
         if not is_prefetch_done:
             return logits_indices
@@ -992,151 +886,11 @@ class GSA(UcmSparseBase):
                         kv_cache[1].data_ptr()
                     )
 
-        all_free_block_ids, all_miss_ids = self.prefetch_engine.deal_async_prefetch(
+        self.prefetch_engine.deal_async_prefetch(
             self.gsa_metadata,
             kv_caches,
-            # self.connector.cc_store(),
-            None,
         )
-        if IS_NEW_TRANS:
-            self.launch_transfer_task_trans(all_free_block_ids, all_miss_ids, kv_caches)
-        elif self.is_python_load:
-            self.launch_transfer_task(all_free_block_ids, all_miss_ids, kv_caches)
-
         return logits_indices
-
-    def launch_transfer_task_trans(self, all_free_block_ids, all_miss_ids, kv_caches):
-        if all_free_block_ids == None:
-            return
-
-        current_stream = torch.cuda.current_stream()
-        self.ucm_load_stream.wait_stream(
-            current_stream
-        )  # # sync2 : load wait attention finish
-        for layer_id in range(self.layer_num):
-            offsets_k = []
-            src_k_tensor_offset = []
-            for req_id in all_free_block_ids.keys():
-                slots = self.gsa_metadata.gsa_stats[req_id].slab_host_slot
-                length = len(all_free_block_ids[req_id][layer_id])
-                if length == 0:
-                    continue
-                offsets_k += [slots[i] for i in all_miss_ids[req_id][layer_id]]
-                src_k_tensor_offset += all_free_block_ids[req_id][layer_id]
-            
-            host_base_k = int(self._slab_host_k[layer_id].data_ptr())
-            if not self.use_mla:
-                dst_base_k = int(kv_caches[layer_id][0].data_ptr())
-            else:
-                dst_base_k = int(kv_caches[layer_id].data_ptr())
-            if layer_id == 0:
-                print(f"zambin layer_id: {layer_id}, host_base_k: {offsets_k}, dst_base_k: {src_k_tensor_offset}")
-            offsets_k = torch.tensor(
-                offsets_k,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            src_k_tensor_offset = torch.tensor(
-                src_k_tensor_offset,
-                dtype=torch.int64,
-                device=self.device,
-            )
-
-            host_dev_k = (host_base_k + offsets_k * self.block_bytes).contiguous()
-            dst_dev_k = (dst_base_k + src_k_tensor_offset * self.block_bytes).contiguous()
-            
-            with torch.cuda.stream(self.ucm_load_stream):
-                self.ucm_store_backend.copy_trans(
-                    host_dev_k.data_ptr(),
-                    dst_dev_k.data_ptr(),
-                    int(self.block_bytes),
-                    int(len(offsets_k)),
-                )
-                if not self.use_mla:
-                    host_base_v = int(self._slab_host_v[layer_id].data_ptr())
-                    dst_base_v = int(kv_caches[layer_id][1].data_ptr())
-
-                    host_dev_v = (host_base_v + offsets_k * self.block_bytes).contiguous()
-                    dst_dev_v = (dst_base_v + src_k_tensor_offset * self.block_bytes).contiguous()
-
-                    self.ucm_store_backend.copy_trans(
-                        host_dev_v.data_ptr(),
-                        dst_dev_v.data_ptr(),
-                        int(self.block_bytes),
-                        int(len(offsets_k)),
-                    )
-
-    def launch_transfer_task(self, all_free_block_ids, all_miss_ids, kv_caches):
-        if all_free_block_ids == None:
-            return
-        fn = getattr(self.connector, "load")
-        precision = self.element_size
-        if self.use_mla:
-            block_data_size = kv_caches[0][0].numel() * precision
-        else:
-            block_data_size = kv_caches[0][0][0].numel() * precision
-
-        offsets_k = []
-        key_src_tensors = []
-        block_hashes = []
-
-        for req_id in all_free_block_ids.keys():
-            req_block_hash = self.gsa_metadata.gsa_stats[req_id].block_hashes
-            for layer_id in range(self.layer_num):
-                length = len(all_free_block_ids[req_id][layer_id])
-                if length == 0:
-                    continue
-
-                offset_k = compute_layer_offset(
-                    block_data_size,
-                    layer_id,
-                    is_v=False,
-                    is_mla=self.use_mla,
-                )
-                offsets_k += [offset_k] * length
-                block_hashes += [
-                    req_block_hash[i] for i in all_miss_ids[req_id][layer_id]
-                ]
-
-                if not self.use_mla:
-                    key_src_tensors += [
-                        kv_caches[layer_id][0][_id]
-                        for _id in all_free_block_ids[req_id][layer_id]
-                    ]
-                    offset_v = compute_layer_offset(
-                        block_data_size,
-                        layer_id,
-                        is_v=True,
-                        is_mla=self.use_mla,
-                    )
-                    offsets_k += [offset_v] * length
-                    block_hashes += [
-                        req_block_hash[i] for i in all_miss_ids[req_id][layer_id]
-                    ]
-                    key_src_tensors += [
-                        kv_caches[layer_id][1][_id]
-                        for _id in all_free_block_ids[req_id][layer_id]
-                    ]
-                else:
-                    key_src_tensors += [
-                        kv_caches[layer_id][_id]
-                        for _id in all_free_block_ids[req_id][layer_id]
-                    ]
-
-        task_all = fn(block_hashes, offsets_k, key_src_tensors)
-        task_all_hash = task_hash_func(block_hashes, "load", "value")
-        self.task_load[task_all_hash] = task_all
-
-    def check_transfer_task_done(self) -> bool:
-        if len(self.task_load) == 0:
-            return True
-
-        for task_hash, task in self.task_load.items():
-            ret = self.connector.check(task)
-            if not ret:
-                return False
-        self.task_load.clear()
-        return True
 
     def build_sparse_meta(
         self, scheduler_output: SchedulerOutput, requests, input_batch, attn_metadata

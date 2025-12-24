@@ -10,17 +10,15 @@ namespace ucmprefetch {
 PYBIND11_MODULE(gsa_prefetch, m)
 {
     pybind11::class_<ucmprefetch::GSAPrefetchEngineC>(m, "GSAPrefetchEngineC")
-        .def(pybind11::init<torch::Tensor&, torch::Tensor&,
-                            std::vector<uint32_t>&, bool, bool, int, int, int, bool>())
+        .def(pybind11::init<torch::Tensor&, torch::Tensor&, bool, bool, int>())
         .def("set_blocks_map", &ucmprefetch::GSAPrefetchEngineC::SetBlocksMap)
         .def("set_blocks_map_multilayer", &ucmprefetch::GSAPrefetchEngineC::SetBlocksMapMultiLayer)
         .def("add_blocks_map", &ucmprefetch::GSAPrefetchEngineC::AddBlocksMap)
         .def("del_blocks_map", &ucmprefetch::GSAPrefetchEngineC::DelBlocksMap)
-        .def("run_async_prefetch_bs", &ucmprefetch::GSAPrefetchEngineC::RunAsyncPrefetchBs)
-        .def("run_async_prefetch_bs_trans", &ucmprefetch::GSAPrefetchEngineC::RunAsyncPrefetchBsTrans)
+        .def("run_async_prefetch_bs_trans",
+             &ucmprefetch::GSAPrefetchEngineC::RunAsyncPrefetchBsTrans)
         .def("set_blocks_table_info", &ucmprefetch::GSAPrefetchEngineC::SetBlockTableInfo)
         .def("get_prefetch_status", &ucmprefetch::GSAPrefetchEngineC::GetPrefetchStatus)
-        .def("get_prefetch_stream_status", &ucmprefetch::GSAPrefetchEngineC::GetPrefetchStreamStatus)
         .def("set_prefetch_status", &ucmprefetch::GSAPrefetchEngineC::SetPrefetchStatus)
         .def("set_kvcache", &ucmprefetch::GSAPrefetchEngineC::SetKvCache)
         .def("set_modelrunning_status", &ucmprefetch::GSAPrefetchEngineC::SetModelRunningStatus)
@@ -29,4 +27,4 @@ PYBIND11_MODULE(gsa_prefetch, m)
         .def("obtain_docs_map", &ucmprefetch::GSAPrefetchEngineC::ObtainDocsMap)
         .def("obtain_blocks_map", &ucmprefetch::GSAPrefetchEngineC::ObtainBlocksMap);
 }
-} // namespace ucmprefetch
+}  // namespace ucmprefetch

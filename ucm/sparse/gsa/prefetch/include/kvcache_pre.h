@@ -93,15 +93,8 @@ private:
     std::map<std::string, int> mPromptLen;
     UC::CCStore<>* mStore = nullptr;
     std::vector<torch::Tensor> mKvCaches;
-    uint32_t mBlockSize = 128;
     uint32_t mTensorElemSize = 0;
-    uint32_t mHeadNum = 40;
-    uint32_t mHeadSzie = 128;
-    uint32_t mTPSize = 2;
-    std::map<std::string, std::vector<std::string>> mAllBlcoksHash;
     uint32_t mKVSzieBytes = 0;
-    uint32_t mExtraTopkLen = 16;
-    bool mIsPythonLoad = false;
     std::map<std::string, std::vector<std::vector<int>>> mPrefetchIdx;
     TransBackend* mGSATransBackend;
     std::vector<uint64_t> mKcachePtr;
@@ -135,16 +128,14 @@ public:
     ~GSAPrefetchEngineC();
 
     GSAPrefetchEngineC(torch::Tensor& loadSuccessBlocks, torch::Tensor& successTableLen,
-                       std::vector<uint32_t>& kvShape, bool useMla, bool isLog, int tpSize,
-                       int rank, int extraTopkLen, bool isPythonLoad);
+                       bool useMla, bool isLog, int rank);
 
     void SetBlocksMap(std::string reqID, std::vector<int>& blockTableList,
-                      std::vector<int>& remainIdx, std::vector<int>& prefetchIdx,
-                      std::vector<std::string>& blocksHash, int maxIdx, std::vector<int>& slots);
+                      std::vector<int>& remainIdx, std::vector<int>& prefetchIdx, int maxIdx,
+                      std::vector<int>& slots);
 
     void SetBlocksMapMultiLayer(std::string reqID, std::vector<std::map<int, int>>& remainMap,
-                                std::vector<std::map<int, int>>& prefetchMap,
-                                std::vector<std::string>& blocksHash, int maxIdx,
+                                std::vector<std::map<int, int>>& prefetchMap, int maxIdx,
                                 std::vector<int>& slots);
 
     void SetKvCache(std::vector<torch::Tensor>& kvCaches, std::vector<uint64_t>& kCachesPtr,
@@ -162,10 +153,6 @@ public:
     void SetBlockTableInfo(torch::Tensor& blockTables, torch::Tensor& blockLengths,
                            torch::Tensor& inputTopkBuf, int step);
 
-    void RunAsyncPrefetchBs(std::vector<std::string>& reqIDsInput, std::vector<int>& topkLensInput,
-                            std::vector<int>& bsIndexInput, std::vector<torch::Tensor>& kvCaches,
-                            void* storePtr);
-
     void RunAsyncPrefetchBsTrans(std::vector<std::string>& reqIDsInput,
                                  std::vector<int>& topkLensInput, std::vector<int>& bsIndexInput);
 
@@ -174,8 +161,6 @@ public:
     void PrintMap(std::string reqID, int i);
 
     bool GetPrefetchStatus();
-
-    bool GetPrefetchStreamStatus();
 
     void SetPrefetchStatus(bool flag);
 
