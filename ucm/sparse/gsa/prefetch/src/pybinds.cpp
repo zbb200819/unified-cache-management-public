@@ -18,6 +18,7 @@ PYBIND11_MODULE(gsa_prefetch, m)
         .def("run_async_prefetch_bs_trans",
              &ucmprefetch::GSAPrefetchEngineC::RunAsyncPrefetchBsTrans)
         .def("set_blocks_table_info", &ucmprefetch::GSAPrefetchEngineC::SetBlockTableInfo)
+        .def("add_prefetch_task", &ucmprefetch::GSAPrefetchEngineC::AddPrefetchTask)
         .def("get_prefetch_status", &ucmprefetch::GSAPrefetchEngineC::GetPrefetchStatus)
         .def("set_prefetch_status", &ucmprefetch::GSAPrefetchEngineC::SetPrefetchStatus)
         .def("set_kvcache", &ucmprefetch::GSAPrefetchEngineC::SetKvCache)

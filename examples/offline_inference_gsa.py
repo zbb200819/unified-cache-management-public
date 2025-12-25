@@ -25,7 +25,7 @@ def setup_environment_variables():
     os.environ["VLLM_USE_V1"] = "1"
     os.environ["PYTHONHASHSEED"] = "123456"
     os.environ["ENABLE_SPARSE"] = "true"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
     os.system("rm -rf ./log/*")
     os.system("rm -rf ./ucm/kv_cache/*")
 
@@ -157,11 +157,11 @@ def main():
         for i in range(batch_size):
             line = lines[i]
             data = json.loads(line)
-            prompt = f"""阅读以下文字并用中文简短回答：\n\n{data["context"]}\n\n现在请基于上面的文章回答下面的问题，只告诉我答案，不要输出任何其他字词。\n\n问题：{data["input"]}\n回答："""
+            prompt = f"""阅读以下文字并用中文简短回答：\n\n{(data["context"] * 20)[:16000]}\n\n现在请基于上面的文章回答下面的问题，只告诉我答案，不要输出任何其他字词。\n\n问题：{data["input"]}\n回答："""
             prompts.append(get_prompt(prompt))
 
         sampling_params = SamplingParams(
-            temperature=0, top_p=0.95, max_tokens=256, ignore_eos=True
+            temperature=0, top_p=0.95, max_tokens=1024, ignore_eos=True
         )
 
         print_output(llm, prompts, sampling_params, "first")

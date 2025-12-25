@@ -24,6 +24,8 @@
 #include <unordered_set>
 #include <vector>
 #include "../../../../store/ucmstore.h"
+#include "kvcache_safe_queue.h"
+#include "kvcache_thread.h"
 #include "kvcache_trans.h"
 
 namespace py = pybind11;
@@ -37,33 +39,11 @@ typedef struct {
     int bsIndex;
 } PrefetchReqInfo;
 
-class ThreadPool {
-public:
-    static ThreadPool* GetInst()
-    {
-        static ThreadPool pool(1);
-        return &pool;
-    }
-
-    ~ThreadPool();
-
-    template <class F, class... Args>
-    auto Enqueue(F&& f, Args&&... args) -> std::future<typename std::result_of<F(Args...)>::type>;
-
-    size_t GetActiveThreads() const;
-
-private:
-    explicit ThreadPool(size_t threadCount);
-    std::vector<std::thread> workers;
-    std::queue<std::function<void()>> tasks;
-    mutable std::mutex queueMutex;
-    bool stop;
-    std::condition_variable condition;
-    std::atomic<size_t> activeThreads{0};
-    size_t maxThreads;
-};
-
 void MutliBSThreadFun(void* args);
+
+void RunQueuePolling(void* args);
+
+void CallPrefetchBSLayer(void* args, PrefetchInfoLayer oneBsInfo);
 
 class __attribute__((visibility("hidden"))) GSAPrefetchEngineC {
 private:
@@ -105,6 +85,8 @@ private:
     std::map<std::string, std::vector<int>> mAllReqIdSlots;
     torch::Tensor mDeviceKPtrTensor;
     torch::Tensor mDeviceKPtrTensorCpu;
+    KvCacheSafeQueue mLoadQueue;
+    bool mIsPrefetchRunning = true;
 
 public:
     std::mutex mMutex;
@@ -156,9 +138,26 @@ public:
     void RunAsyncPrefetchBsTrans(std::vector<std::string>& reqIDsInput,
                                  std::vector<int>& topkLensInput, std::vector<int>& bsIndexInput);
 
+    void AddPrefetchTask(uint32_t layerID, std::vector<std::string>& reqIDList,
+                         std::vector<std::vector<int32_t>>& topkList, std::vector<int>& bsIndexList,
+                         std::vector<int>& topkLenList);
+
+    void RunPrefetchBSLayer(PrefetchInfoLayer oneBsInfo);
+
+    void RunOneBsPrefetchLayer(std::string reqID, int bsIndex, int layerID,
+                               std::vector<int>& oneFreeBlockTable, std::vector<int>& missIdxs,
+                               std::vector<int>& topkList);
+
+    void TransKVCacheLayer(int layerID, std::map<std::string, std::vector<int>>& batchLoadBlock,
+                           std::map<std::string, std::vector<int>>& batchMissIdxs);
+
+    void QueuePolling();
+
     int CallPrefetchProcessFun();
 
     void PrintMap(std::string reqID, int i);
+
+    void PrintVector(std::vector<int>& vec, int layerID, std::string reqID, std::string name);
 
     bool GetPrefetchStatus();
 
