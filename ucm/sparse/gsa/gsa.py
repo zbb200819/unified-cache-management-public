@@ -41,6 +41,7 @@ from ucm.sparse.utils import (
 )
 
 from ucm.shared.simpletrans import ucm_sm_copy
+from ucm.sparse.gsa.time_cal import time_us
 
 ReqType = Union[str, int]
 
@@ -369,27 +370,51 @@ class TopkCal:
         self.topk_caches = topk_caches
         self.topk_len_list = topk_len_list
 
+    @time_us
     def cal_topk(self, intermediate_q, current_layer_id):
+        begin = time.time()
         bs = len(self.cal_topk_id)
         head_group_num = self.att_num_heads // self.kv_num_heads
-        q_decode = intermediate_q[self.cal_topk_id]
+        # if len(self.cal_topk_id) == len(intermediate_q):
+        #     q_decode = intermediate_q
+        # else:
+        q_decode = intermediate_q[:bs]
+        print(self.cal_topk_id)
+        end = time.time()
+        print(f"zambin GSA select q time 1: {(end - begin) * 1000000} us")
+
         kpre_index = self.repre_slot_mapping.flatten()
         kpre_need = self.kpre_caches[current_layer_id][kpre_index]
+        begin = time.time()
+        print(f"zambin GSA select kpre time 1: {(begin - end) * 1000000} us")
+
         max_norm_num = kpre_need.shape[1]
         kpre_out = kpre_need.unsqueeze(2).expand(-1, -1, head_group_num, -1, -1)
-        kpre_out = kpre_out.reshape(bs, -1, self.att_num_heads, self.head_size)
+        kpre_out = kpre_out.reshape(bs, -1, self.att_num_heads, self.head_size) 
         blk_num = kpre_out.shape[1] // max_norm_num
+        end = time.time()
+        print(f"zambin GSA kpre_out pre time 2: {(end - begin) * 1000000} us")
+
         qk = torch.einsum("bij,bmij->bim", q_decode, kpre_out)
         attention_weights_without_norm, _ = torch.max(
             qk.reshape(bs, self.att_num_heads, blk_num, max_norm_num), dim=-1
         )
+        begin = time.time()
+        print(f"zambin GSA qk cal time 3: {(begin - end) * 1000000} us")
+
         dot_product_weights = attention_weights_without_norm.mean(1)
         dot_product_weights.masked_fill_(self.include_mask == 1, float("inf"))
         dot_product_weights.masked_fill_(self.exclude_mask == 1, float("-inf"))
+
+        end = time.time()
+        print(f"zambin GSA topk mask time 4: {(end - begin) * 1000000} us")
+
         selected_block_nums = self.topk_len_list[0]
         _, top_indices = torch.topk(
             dot_product_weights, selected_block_nums, dim=-1, sorted=True
         )
+        begin = time.time()
+        print(f"zambin GSA topk sort time 5: {(begin - end) * 1000000} us")
         self.topk_caches[current_layer_id][self.cal_topk_id] = top_indices
 
 
@@ -527,6 +552,7 @@ class GSA(UcmSparseBase):
                 is_cal_kpre, current_layer_id, ids, self.gsa_q_cache[current_layer_id]
             )
 
+    # @time_us
     def copy_k(self, layer_name: str, forward_context: ForwardContext) -> None:
         current_layer_id = int(layer_name.split(".")[2])
         block_ids = self.model_input["calc_block_table"]
@@ -563,6 +589,7 @@ class GSA(UcmSparseBase):
                 True, current_layer_id, [], k_needed
             )  #####  todo  适配kcache形状
 
+    # @time_us
     def attention_begin(
         self,
         query: torch.Tensor,
@@ -623,6 +650,7 @@ class GSA(UcmSparseBase):
 
         return query, key, value, output
 
+    # @time_us
     def attention_finished(
         self,
         query: torch.Tensor,
@@ -825,6 +853,7 @@ class GSA(UcmSparseBase):
         self.gsa_stats = gsa_meta.gsa_stats
         return gsa_meta
 
+    # @time_us
     def execute_begin(self, scheduler_output: SchedulerOutput):
         self.copy_k_flag = [False] * self.layer_num
         batch_size = len(scheduler_output.num_scheduled_tokens.items())
@@ -849,6 +878,7 @@ class GSA(UcmSparseBase):
         self.gsa_stats = self.gsa_metadata.gsa_stats
         self._start_topk_cal()
 
+    # @time_us
     def execute_finished(self, logits_indices: torch.Tensor):
         self.prefetch_engine.topk_space += 1
         if not PTOPK_PREFETCH_ENABLE:
@@ -892,6 +922,7 @@ class GSA(UcmSparseBase):
         )
         return logits_indices
 
+    # @time_us
     def build_sparse_meta(
         self, scheduler_output: SchedulerOutput, requests, input_batch, attn_metadata
     ) -> None:

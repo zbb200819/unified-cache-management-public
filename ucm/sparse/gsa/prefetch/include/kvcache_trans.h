@@ -21,6 +21,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
+#ifndef ATB_KV_CACHE_TRANS_H
+#define ATB_KV_CACHE_TRANS_H
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
@@ -115,3 +117,5 @@ private:
     cudaStream_t stream_;
     bool own_stream_;  // 是否自己创建并负责销毁 stream_
 };
+
+#endif  //ATB_KV_CACHE_TRANS    

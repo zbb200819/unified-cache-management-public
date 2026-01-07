@@ -18,6 +18,7 @@ from ucm.sparse.utils import (
     gsa_config,
     IS_NEW_TRANS,
 )
+from ucm.sparse.gsa.time_cal import time_us
 
 
 class GSAPrefetchBase:
@@ -118,6 +119,7 @@ class GSAPrefetchBase:
         self.k_cache_ptr = [None] * self.num_attention_layers
         self.v_cache_ptr = [None] * self.num_attention_layers
 
+    # @time_us
     def model_input_deal(
         self,
         req_ids,
@@ -172,6 +174,7 @@ class GSAPrefetchBase:
             gsa_model_input["gsa_seq_len"] = gsa_len_list
         gsa_model_input["atb_gsa_enable"] = self.atb_gsa_enable
 
+    # @time_us
     def _topk_tmp_deal(self, gsa_metadata, topk_buf_tmp):
         for index, topk_info in enumerate(self.topk_bs):
             if topk_info[1] and topk_info[0] in gsa_metadata.gsa_stats:
@@ -197,6 +200,7 @@ class GSAPrefetchBase:
             )
         self.topk_buf_tmp = topk_buf_tmp
 
+    # @time_us
     def deal_async_prefetch(self, gsa_metadata, kvcache):
         if not self.atb_gsa_enable:
             return
@@ -378,6 +382,7 @@ class GSAPrefetchBase:
                         gsa_metadata.gsa_stats[req_id].slab_host_slot,
                     )
 
+    # @time_us
     def _gsa_block_len_pre(
         self,
         gsa_metadata,
@@ -424,6 +429,7 @@ class GSAPrefetchBase:
                     device="cpu",
                 )
 
+    # @time_us
     def _topk_insert_last_idx(self, gsa_metadata) -> None:
         for index in range(len(self.req_ids_bs)):
             req_id = self.req_ids_bs[index]
@@ -441,6 +447,7 @@ class GSAPrefetchBase:
                 value=last_idx,
             )
 
+    # @time_us
     def _swap_block_table_tensor(
         self,
         bs_index_list: List[int],

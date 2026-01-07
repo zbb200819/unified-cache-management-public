@@ -88,6 +88,7 @@ find_package(OpenMP REQUIRED)
 set(SOURCES
     src/pybinds.cpp
     src/kvcache_pre.cpp
+    src/kvcache_safe_queue.cpp
 )
 
 # 创建pybind11模块
