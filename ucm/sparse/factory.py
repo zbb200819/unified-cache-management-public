@@ -46,8 +46,10 @@ class UcmSparseFactory:
 
 # Register available sparse methods
 UcmSparseFactory.register_sparse_method("ESA", "ucm.sparse.esa.esa", "ESA")
-UcmSparseFactory.register_sparse_method("KvComp", "ucm.sparse.kvcomp.kvcomp", "KvComp")
-UcmSparseFactory.register_sparse_method("GSA", "ucm.sparse.gsa.gsa", "GSA")
+UcmSparseFactory.register_sparse_method(
+    "GSAOnDevice", "ucm.sparse.gsa_on_device.gsa_on_device", "GSAOnDevice"
+)
+# UcmSparseFactory.register_sparse_method("GSA", "ucm.sparse.gsa.gsa", "GSA")
 UcmSparseFactory.register_sparse_method(
     "KVStarMultiStep", "ucm.sparse.kvstar.multistep", "KVStarMultiStep"
 )

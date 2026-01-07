@@ -22,6 +22,7 @@
 # SOFTWARE.
 #
 
+import atexit
 import os
 import subprocess
 import sys
@@ -32,6 +33,37 @@ from setuptools.command.build_ext import build_ext
 ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
 PLATFORM = os.getenv("PLATFORM")
 ENABLE_SPARSE = os.getenv("ENABLE_SPARSE")
+
+
+_warning_printed = False
+
+
+def print_platform_warning():
+    global _warning_printed
+    if not PLATFORM and not _warning_printed:
+        _warning_printed = True
+        RED = "\033[91m"
+        YELLOW = "\033[93m"
+        BOLD = "\033[1m"
+        RESET = "\033[0m"
+
+        warning_msg = f"""
+{RED}{'=' * 80}
+{BOLD}⚠️  WARNING: PLATFORM environment variable is not set! ⚠️{RESET}
+{RED}{'=' * 80}{RESET}
+{YELLOW}Please set PLATFORM to one of: cuda, ascend, musa, maca{RESET}
+Example:
+  {BOLD}export PLATFORM=cuda{RESET}    # For CUDA platform
+{YELLOW}In CI scenarios only, you don't need to specify PLATFORM. If it's not a CI scenario, please uninstall and then reinstall with PLATFORM specified.{RESET}
+{RED}{'=' * 80}{RESET}
+"""
+        # Use write and flush to ensure output even without -v flag
+        sys.stderr.write(warning_msg)
+        sys.stderr.flush()
+
+
+if not PLATFORM:
+    atexit.register(print_platform_warning)
 
 
 def enable_sparse() -> bool:
@@ -107,7 +139,7 @@ class CMakeBuild(build_ext):
 
 setup(
     name="uc-manager",
-    version="0.2.0rc1",
+    version="0.2.0",
     description="Unified Cache Management",
     author="Unified Cache Team",
     packages=find_packages(),
@@ -116,4 +148,5 @@ setup(
     cmdclass={"build_ext": CMakeBuild},
     zip_safe=False,
     include_package_data=False,
+    package_data={"ucm": ["sparse/kvcomp/configs/**/*.json"]},
 )

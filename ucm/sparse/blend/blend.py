@@ -189,6 +189,8 @@ class Blend(UcmSparseBase):
 
     def _update_attn_metadata(self):
         # update attn_metadata, cause we sparse the prefill tokens
+        # golden kv caches are available in current blend layer, so maybe we should cache all of them
+        # so maybe we should modify slot_mapping at the beginning of next layer/attn
         self.attn_metadata.slot_mapping = self.attn_metadata.slot_mapping[
             self.blend_req_metas.compute_mask
         ]
@@ -218,6 +220,9 @@ class Blend(UcmSparseBase):
         forward_context: ForwardContext,
         output: Optional[torch.Tensor] = None,
         phase: Optional[str] = None,
+        k_hash: Optional[torch.Tensor] = None,
+        decode_ql_nope: Optional[torch.Tensor] = None,
+        decode_q_pe: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         attn = forward_context.no_compile_layers[layer_name]
         kv_cache = attn.kv_cache[forward_context.virtual_engine]

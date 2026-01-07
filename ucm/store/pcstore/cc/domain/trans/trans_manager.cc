@@ -34,7 +34,7 @@ Status TransManager::Setup(const size_t rankSize, const int32_t deviceId, const 
 {
     auto s = Status::OK();
     if (rankSize > 1) {
-        s = this->shareQueue_.Setup(rankSize, deviceId, streamNumber, blockSize, ioSize, ioDirect,
+        s = this->shareQueue_.Setup(deviceId, streamNumber, blockSize, ioSize, ioDirect,
                                     bufferNumber, layout, &this->failureSet_, uniqueId);
         if (s.Failure()) { return s; }
     }
@@ -94,6 +94,8 @@ Status TransManager::Wait(const size_t taskId) noexcept
         UC_ERROR("Task({}) timeout({}).", task->Str(), timeoutMs_);
         failureSet_.Insert(taskId);
         waiter->Wait();
+        failureSet_.Remove(taskId);
+        return Status::Timeout();
     }
     auto failure = failureSet_.Contains(taskId);
     if (failure) {

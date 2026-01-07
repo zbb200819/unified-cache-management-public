@@ -1,7 +1,6 @@
 import hashlib
 import math
 import pickle
-import time
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import cache
@@ -18,7 +17,6 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.request import Request, RequestStatus
 
 from ucm.integration.vllm.ucm_connector import RequestHasher
-from ucm.shared.simpletrans import ucm_sm_copy
 from ucm.sparse.base import (
     INVALID_SLOT,
     UcmSparseBase,
@@ -122,6 +120,23 @@ class ESASparseMetaData(UcmSparseMetadata):
         )
         self.requests.append(meta)
 
+
+@cache
+def get_offset(block_shape, rank, tp_size, precision, layer_id, is_v, is_mla) -> int:
+    block_size, num_key_heads_per_tp, head_size = block_shape
+    k_min_data_block_size = block_size * num_key_heads_per_tp * head_size * precision
+    v_min_data_block_size = k_min_data_block_size if not is_mla else 0
+    layer_size = (k_min_data_block_size + v_min_data_block_size) * (
+        tp_size if not is_mla else 1
+    )
+    if is_mla:
+        k_offset = layer_size * layer_id
+    else:
+        k_offset = layer_size * layer_id + layer_size // tp_size * rank
+    v_offset = k_offset + k_min_data_block_size
+    return v_offset if is_v else k_offset
+
+
 @cache
 def get_sparse_range(init_window_sz, local_window_sz, prompt_len, block_size):
     num_blocks_upper_bound = math.ceil(prompt_len / block_size)
@@ -136,6 +151,27 @@ def compute_parent_block_hash(model_name, world_size, dtype, seed_rank=0) -> int
     h_seed = hashlib.md5(meta_bytes + b"UCM_HASH_SEED").digest()
     return int.from_bytes(h_seed, byteorder="big")
 
+
+@cache
+def compute_layer_offset(
+    block_data_size: int,
+    layer_id: int,
+    is_v: bool,
+    is_mla: bool,
+) -> int:
+    layer_data_size = block_data_size if is_mla else block_data_size * 2
+
+    k_offset = layer_data_size * layer_id
+
+    if is_mla:
+        return k_offset
+
+    v_offset = k_offset + block_data_size
+    return v_offset if is_v else k_offset
+
+
+def task_hash_func(block_ids, store_type, tensor_type):
+    return hash((tuple(block_ids), store_type, tensor_type))
 
 
 def diff_two_map(map1: dict, map2: dict):
@@ -163,22 +199,18 @@ class ReqStatePerLayer:
         layer_name: str,
         rank: int,
         tp_size: int,
+        store_instance: UcmKVStoreBase,
         vllm_config: VllmConfig,
         retrieval_worker: Optional[RetrievalWorker] = None,
         repre_pool: Optional[ReprePool] = None,
         esa_cfg: Optional[Dict[str, Any]] = None,
-        slab_host_k: Optional[torch.Tensor] = None,
-        slab_host_v: Optional[torch.Tensor] = None,
-        ucm_store_stream: Optional[torch.cuda.Stream] = None,
-        store_backend: Optional["ucm_sm_copy.TransBackend"] = None,
-        ucm_load_stream: Optional[torch.cuda.Stream] = None,
-        load_backend: Optional["ucm_sm_copy.TransBackend"] = None,
     ):
         self.layer_name = layer_name
         self.layer_id = int(layer_name.split(".")[2])
         self.slots = []
         self.slots_to_relative_indexes = {}
         self.repre_pool: ReprePool | None = repre_pool
+        self.store_instance = store_instance
         self.retrieval_worker: Optional[RetrievalWorker] = retrieval_worker
         self.retrieval_task = None
         self.req_meta = None
@@ -205,22 +237,40 @@ class ReqStatePerLayer:
         self.is_mla = self.vllm_config.model_config.is_deepseek_mla
         self.step = 0
 
-        # new trans
-        self.precision = self.vllm_config.model_config.dtype.itemsize
-        self.block_bytes = (
-            self.block_size * self.num_key_heads * self.head_size * self.precision
-        )
-
-        self.slab_host_k = slab_host_k
-        self.slab_host_v = slab_host_v
-
-        self.ucm_store_stream = ucm_store_stream
-        self.store_backend = store_backend
-        self.ucm_load_stream = ucm_load_stream
-        self.load_backend = load_backend
-
     def update_meta(self, req_meta: ReqMeta):
         self.req_meta = req_meta
+
+    def launch_transfer_task(self, transfer_type, block_hashes, vllm_block_ids):
+        fn = getattr(self.store_instance, transfer_type)
+        length = len(block_hashes)
+        precision = self.vllm_config.model_config.dtype.itemsize
+        block_data_size = self.k_cache[0].numel() * precision
+
+        offset_k = compute_layer_offset(
+            block_data_size,
+            self.layer_id,
+            is_v=False,
+            is_mla=self.is_mla,
+        )
+        offsets_k = [offset_k] * length
+
+        key_src_tensors = [self.k_cache[id_] for id_ in vllm_block_ids]
+        task_k = fn(block_hashes, offsets_k, key_src_tensors)
+        task_k_hash = task_hash_func(block_hashes, transfer_type, "key")
+        self.tasks[task_k_hash] = task_k
+
+        if not self.is_mla:
+            offset_v = compute_layer_offset(
+                block_data_size,
+                self.layer_id,
+                is_v=True,
+                is_mla=self.is_mla,
+            )
+            offsets_v = [offset_v] * length
+            value_src_tensors = [self.v_cache[id_] for id_ in vllm_block_ids]
+            task_v = fn(block_hashes, offsets_v, value_src_tensors)
+            task_v_hash = task_hash_func(block_hashes, transfer_type, "value")
+            self.tasks[task_v_hash] = task_v
 
     def extract_block_repre(self, vllm_block_ids):
         return self.k_cache[vllm_block_ids].mean(1)
@@ -237,13 +287,14 @@ class ReqStatePerLayer:
             self.k_cache = kv_cache[0]
             self.v_cache = kv_cache[1]
         self.block_hashes = self.req_meta.ucm_block_hashes
-        self.sparse_range = get_sparse_range(
-            self.esa_cfg["init_window_sz"],
-            self.esa_cfg["local_window_sz"],
-            self.req_meta.num_prompt_tokens,
-            self.block_size,
-        )
         self.init_static_flag = True
+
+    def wait_transfer_task_done(self):
+        # assert len(self.tasks) > 0
+        for task_hash, task in self.tasks.items():
+            # TODO: handle exceptions
+            ret = self.store_instance.wait(task)
+        self.tasks.clear()  # reset
 
     def start_retrieval(self, batch_query, forward_context):
         query_start_loc = self.req_meta.query_start_loc
@@ -261,106 +312,81 @@ class ReqStatePerLayer:
         elif num_q_heads < self.num_key_heads:
             query = torch.repeat_interleave(query, self.num_key_heads // num_q_heads, 1)
         query_flat = query.reshape(query.shape[0], -1)
-
         top_k = int(self.sparse_range * self.esa_cfg["sparse_ratio"])
-        # 检索范围 去除init和local window
-        indexes = [
-            self.slots[
-                self.esa_cfg["init_window_sz"] : self.esa_cfg["init_window_sz"]
-                + self.sparse_range
-            ]
-        ]
-        # self.retrieval_task = self.retrieval_worker.submit(
-        #     query_flat, topk=top_k, indexes=indexes
-        # )
+        indexes = [self.slots]
+        self.retrieval_task = self.retrieval_worker.submit(
+            query_flat, topk=top_k, indexes=indexes
+        )
 
     def wait_retrieval_and_start_load(self):
-        # self.retrieval_worker.wait(self.retrieval_task)
-        # result = self.retrieval_worker.get_result(self.retrieval_task)
-        # choosed_slots = result["indices"][0]
-        # choosed_slots -> prefill block id
-        # rel_block_ids = [self.slots_to_relative_indexes[int(e)] for e in choosed_slots]
+        self.retrieval_worker.wait(self.retrieval_task)
+        result = self.retrieval_worker.get_result(self.retrieval_task)
+        choosed_slots = result["indices"][0]
+        rel_block_ids = [self.slots_to_relative_indexes[int(e)] for e in choosed_slots]
+        block_hashes = [self.block_hashes[id_] for id_ in rel_block_ids]
         top_k = int(self.sparse_range * self.esa_cfg["sparse_ratio"])
-        slots_head = self.slots[: self.esa_cfg["init_window_sz"]]
-        # slots_mid = [self.slots[idx] for idx in rel_block_ids]
-        slots_mid = self.slots[
+        vllm_block_ids = self.req_meta.vllm_block_ids[
             self.esa_cfg["init_window_sz"] : self.esa_cfg["init_window_sz"] + top_k
         ]
-        slots_tail = self.slots[self.esa_cfg["init_window_sz"] + self.sparse_range :]
-        slots = slots_head + slots_mid + slots_tail
-        # repre pool host侧更大一点
-
-        vllm_block_ids = self.req_meta.vllm_block_ids
-        # load all
         ## 1. load delta
-        target_map = {b_id: b_hash for b_id, b_hash in zip(vllm_block_ids, slots)}
+        target_map = {
+            b_id: b_hash for b_id, b_hash in zip(vllm_block_ids, block_hashes)
+        }
         self.pre_topk_block_hashes, diff_blocks = diff_two_map(
             self.pre_topk_block_hashes, target_map
         )
-
         if diff_blocks:
-            current_stream = torch.cuda.current_stream()
-            with torch.cuda.stream(self.ucm_load_stream):
-                host_base_k = int(self.slab_host_k.data_ptr())
-                dst_base_k = int(self.k_cache.data_ptr())
+            self.launch_transfer_task(
+                "load", list(diff_blocks.values()), list(diff_blocks.keys())
+            )
 
-                slots = torch.tensor(
-                    list(diff_blocks.values()),
-                    dtype=torch.int64,
-                    device=self.k_cache.device,
-                )
-                bids = torch.tensor(
-                    list(diff_blocks.keys()),
-                    dtype=torch.int64,
-                    device=self.k_cache.device,
-                )
-
-                host_dev_k = (host_base_k + slots * self.block_bytes).contiguous()
-                dst_dev_k = (dst_base_k + bids * self.block_bytes).contiguous()
-
-                self.ucm_load_stream.wait_stream(
-                    current_stream
-                )  # # sync2 : load wait attention finish
-
-                self.load_backend.copy_trans(
-                    host_dev_k.data_ptr(),  # GPU 上的 void** src (里面是 host address)
-                    dst_dev_k.data_ptr(),  # GPU 上的 void** dst
-                    int(self.block_bytes),  # 或 self.block_bytes
-                    int(len(diff_blocks)),  # 或 num_blocks
-                )
-
-                if not self.is_mla:
-                    host_base_v = int(self.slab_host_v.data_ptr())
-                    dst_base_v = int(self.v_cache.data_ptr())
-
-                    host_dev_v = host_base_v + slots * self.block_bytes
-                    dst_dev_v = dst_base_v + bids * self.block_bytes
-
-                    self.load_backend.copy_trans(
-                        host_dev_v.data_ptr(),
-                        dst_dev_v.data_ptr(),
-                        int(self.block_bytes),
-                        int(len(diff_blocks)),
-                    )
+        ## 2. load all
+        # self.launch_transfer_task(
+        #     "load", block_hashes, vllm_block_ids
+        # )
 
         self.retrieval_task = None
 
     def block_repre_data(self):
+        self.sparse_range = get_sparse_range(
+            self.esa_cfg["init_window_sz"],
+            self.esa_cfg["local_window_sz"],
+            self.req_meta.num_prompt_tokens,
+            self.block_size,
+        )
         vllm_block_ids = self.req_meta.vllm_block_ids
-        # gather + mean
-        # repre = self.extract_block_repre(vllm_block_ids)
-
-        # repre_flat = repre.reshape(repre.shape[0], -1)
-        new_slots = self.repre_pool.allocate(len(vllm_block_ids))
+        vllm_block_ids_dump = vllm_block_ids[
+            self.esa_cfg["init_window_sz"] : self.esa_cfg["init_window_sz"]
+            + self.sparse_range
+        ]
+        repre = self.extract_block_repre(vllm_block_ids_dump)
+        repre_flat = repre.reshape(repre.shape[0], -1)
+        new_slots = self.repre_pool.allocate(self.sparse_range)
         og_len = len(self.slots)
         for i, slot in enumerate(new_slots):
             self.slots_to_relative_indexes[slot] = og_len + i
         self.slots.extend(new_slots)
+        vals = repre_flat.to("cpu", dtype=torch.float32)
+        data[self.layer_id][new_slots] = vals
+        # NOTE: in Preemption, local_window_start != -self.esa_cfg['local_window_sz']
+        local_window_start = self.esa_cfg["init_window_sz"] + self.sparse_range
 
-        # GPU -> CPU copy
-        # vals = repre_flat.to("cpu", dtype=torch.float32)
-        # CPU 写 data[]
-        # data[self.layer_id][new_slots] = vals
+        if not self.is_mla:
+            self.init_window = (
+                self.k_cache[vllm_block_ids[: self.esa_cfg["init_window_sz"]]].clone(),
+                self.v_cache[vllm_block_ids[: self.esa_cfg["init_window_sz"]]].clone(),
+            )
+            self.local_window = (
+                self.k_cache[vllm_block_ids[local_window_start:]].clone(),
+                self.v_cache[vllm_block_ids[local_window_start:]].clone(),
+            )
+        else:
+            self.init_window = self.k_cache[
+                vllm_block_ids[: self.esa_cfg["init_window_sz"]]
+            ].clone()
+            self.local_window = self.k_cache[
+                vllm_block_ids[local_window_start:]
+            ].clone()
 
     def attention_begin(
         self,
@@ -370,73 +396,34 @@ class ReqStatePerLayer:
         forward_context: ForwardContext,
     ) -> None:
         self.maybe_register_static_data(forward_context)
-        # wait load (i wait i-1) step0 单独处理
         if self.step % self.esa_cfg["retrieval_stride"] == 1:
             if self.step == 1:
+                vllm_block_ids = self.req_meta.vllm_block_ids
                 # NOTE: in Preemption, local_window_start != -self.esa_cfg['local_window_sz']
+                if not self.is_mla:
+                    local_window_sz = self.local_window[0].shape[0]
+                    self.k_cache[vllm_block_ids[: self.esa_cfg["init_window_sz"]]] = (
+                        self.init_window[0]
+                    )
+                    self.v_cache[vllm_block_ids[: self.esa_cfg["init_window_sz"]]] = (
+                        self.init_window[1]
+                    )
+                    self.k_cache[vllm_block_ids[-local_window_sz:]] = self.local_window[
+                        0
+                    ]
+                    self.v_cache[vllm_block_ids[-local_window_sz:]] = self.local_window[
+                        1
+                    ]
+                else:
+                    local_window_sz = self.local_window.shape[0]
+                    self.k_cache[vllm_block_ids[: self.esa_cfg["init_window_sz"]]] = (
+                        self.init_window
+                    )
+                    self.k_cache[vllm_block_ids[-local_window_sz:]] = self.local_window
                 self.start_retrieval(query, forward_context)
-                with torch.cuda.nvtx.range(
-                    f"reqid_{self.req_meta.request_id}_step{self.step}_layer_{self.layer_id}_start_load"
-                ):
-                    self.wait_retrieval_and_start_load()
-            self.ucm_load_stream.synchronize()
-
-    def dump_prefill_kvcache(self):
-        vllm_block_ids = self.req_meta.vllm_block_ids
-        num_blocks = len(vllm_block_ids)
-
-        current_stream = torch.cuda.current_stream()
-
-        with torch.cuda.stream(self.ucm_store_stream):
-            self.ucm_store_stream.wait_stream(
-                current_stream
-            )  # sync1 : store wait attention finish
-            bids = torch.tensor(vllm_block_ids, device=self.k_cache.device)
-            src_base_k = int(self.k_cache.data_ptr())
-            dst_base_k = int(self.slab_host_k.data_ptr())
-
-            offsets = bids * self.block_bytes
-            dev_ptrs_k = (src_base_k + offsets).contiguous()
-
-            host_slots = torch.tensor(self.slots, device=self.k_cache.device)
-            host_offsets = host_slots * self.block_bytes
-            dst_ptrs_k = (dst_base_k + host_offsets).contiguous()
-            self.store_backend.copy_trans(
-                dev_ptrs_k.data_ptr(),
-                dst_ptrs_k.data_ptr(),
-                int(self.block_bytes),
-                int(num_blocks),
-            )
-
-            if not self.is_mla:
-                src_base_v = int(self.v_cache.data_ptr())
-                dst_base_v = int(self.slab_host_v.data_ptr())
-
-                dev_ptrs_v = (src_base_v + offsets).contiguous()
-                dst_ptrs_v = (dst_base_v + host_offsets).contiguous()
-                self.store_backend.copy_trans(
-                    dev_ptrs_v.data_ptr(),
-                    dst_ptrs_v.data_ptr(),
-                    int(self.block_bytes),
-                    int(num_blocks),
-                )
-        # --- Bandwidth Calculation ---
-        # 总D2H字节数 = num_blocks * block_bytes * (# of KV tensors)
-        # elapsed_ms = self.trans_startevent.elapsed_time(self.trans_endevent)
-        # total_bytes = num_blocks * self.block_bytes * (2 if not self.is_mla else 1)
-        # total_gb = total_bytes / 1e9
-        # time_s = elapsed_ms / 1000.0
-        # bw_gbps = total_gb / time_s if time_s > 0 else 0.0
-
-        # print(
-        #     f"[KV D2H Copy] blocks={num_blocks}, "
-        #     f"bytes={total_gb:.4f} GB, "
-        #     f"time={elapsed_ms:.3f} ms, "
-        #     f"bandwidth={bw_gbps:.3f} GB/s"
-        # )
-        # elapsed_ms = self.trans_startevent.elapsed_time(self.trans_endevent)
-        # print(f"[KV D2H Copy] blocks={(num_blocks)}, time={elapsed_ms:.3f} ms")
-        # torch.cuda.current_stream().wait_event(self.trans_endevent)
+                self.wait_retrieval_and_start_load()
+            if len(self.tasks) > 0:
+                self.wait_transfer_task_done()
 
     def attention_finished(
         self,
@@ -448,33 +435,13 @@ class ReqStatePerLayer:
     ) -> None:
         if self.step == 0:
             if self.req_meta.is_last_chunk:
-                with torch.cuda.nvtx.range(
-                    f"reqid_{self.req_meta.request_id}_step{self.step}_layer_{self.layer_id}_block_repre"
-                ):
-                    self.block_repre_data()
-                with torch.cuda.nvtx.range(
-                    f"reqid_{self.req_meta.request_id}_step{self.step}_layer_{self.layer_id}_dump_prefill_kvcache"
-                ):
-                    self.dump_prefill_kvcache()
-
-                # rest of logic
-                # self.prefill_block_table = torch.tensor(self.req_meta.vllm_block_ids)
+                self.block_repre_data()
                 self.step += 1
-                # block_repre_data_ms = (t1 - t0) * 1e-6
-                # dump_prefill_kvcache_ms = (t2 - t0) * 1e-6
-                # print(
-                #     f"====[prefill][req={self.req_meta.request_id}][layer={self.layer_id}] "
-                #     f"block_repre_data_ms={block_repre_data_ms:.3f} ms, "
-                #     f"dump_prefill_kvcache_ms={dump_prefill_kvcache_ms:.3f} ms, "
-                # )
         else:
             if self.step % self.esa_cfg["retrieval_stride"] == 2:
                 self.start_retrieval(query, forward_context)
             if self.step % self.esa_cfg["retrieval_stride"] == 0:
-                with torch.cuda.nvtx.range(
-                    f"reqid_{self.req_meta.request_id}_step{self.step}_layer_{self.layer_id}_start_load"
-                ):
-                    self.wait_retrieval_and_start_load()
+                self.wait_retrieval_and_start_load()
             self.step += 1
 
 
@@ -486,16 +453,9 @@ class ESA(UcmSparseBase):
         self.rank = vllm_config.parallel_config.rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         if role == UcmSparseRole.WORKER:
-            self.device = torch.device(f"cuda:{self.rank}")
-            self.ucm_store_stream = torch.cuda.Stream(device=self.device)
-            self.ucm_store_backend = ucm_sm_copy.TransBackend(
-                int(self.ucm_store_stream.cuda_stream)
-            )
-
-            self.ucm_load_stream = torch.cuda.Stream(device=self.device)
-            self.ucm_load_backend = ucm_sm_copy.TransBackend(
-                int(self.ucm_load_stream.cuda_stream)
-            )
+            self.connector = get_kv_transfer_group().connector.store
+        else:
+            self.connector = None
         self.esa_cfg = (
             Config(vllm_config.kv_transfer_config)
             .get_config()
@@ -510,16 +470,8 @@ class ESA(UcmSparseBase):
         self._sparse_metadata_decode: ESASparseMetaData = ESASparseMetaData()
         self._sparse_metadata: ESASparseMetaData = ESASparseMetaData()
         self.request_hasher = RequestHasher(vllm_config, 0)
-
         self.block_size = vllm_config.cache_config.block_size
         self.block_hashes: dict[int, dict[int, list[str]]] = {}
-        self._slab_host_k = []
-        self._slab_host_v = []
-        self.num_kv_heads = vllm_config.model_config.get_num_kv_heads(
-            vllm_config.parallel_config
-        )
-        self.head_size = vllm_config.model_config.get_head_size()
-
         global data
 
         if data is None:
@@ -580,16 +532,11 @@ class ESA(UcmSparseBase):
                 layer_name,
                 self.rank,
                 self.tp_size,
+                self.connector,
                 self._vllm_config,
                 self.retrieval_workers[layer_id],
                 self.layer_pools[layer_id],
                 self.esa_cfg,
-                self._slab_host_k[layer_id],
-                self._slab_host_v[layer_id] if not self.is_mla else None,
-                self.ucm_store_stream,
-                self.ucm_store_backend,
-                self.ucm_load_stream,
-                self.ucm_load_backend,
             )
         return self.req_states[req_meta.request_id][layer_id]
 
@@ -609,6 +556,9 @@ class ESA(UcmSparseBase):
         forward_context: ForwardContext,
         output: Optional[torch.Tensor] = None,
         phase: Optional[str] = None,
+        k_hash: Optional[torch.Tensor] = None,
+        decode_ql_nope: Optional[torch.Tensor] = None,
+        decode_q_pe: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self.is_mla:
             for req_meta in self._sparse_metadata.requests:
@@ -626,6 +576,7 @@ class ESA(UcmSparseBase):
                     self.create_req_state_attention_begin(
                         req_meta, layer_name, query, key, value, forward_context
                     )
+
         return query, key, value, output
 
     def update_req_state_attention_end(
@@ -686,7 +637,6 @@ class ESA(UcmSparseBase):
             len(req.prompt_token_ids)
             >= self._vllm_config.cache_config.block_size * self.esa_cfg["min_blocks"]
         )
-        # todo: host侧 内存占满
 
     def set_block_hashes(self, req_id, token_ids):
         if req_id not in self.block_hashes:
@@ -831,8 +781,6 @@ class ESA(UcmSparseBase):
         pass
 
     def estimate_num_slots_sparsed(self, request: Request) -> int:
-        print("==estimate begin", time.time())
-        t0 = time.perf_counter_ns()
         if request.status == RequestStatus.PREEMPTED:
             self.preempt_req_output_tokens[request.request_id] = (
                 request.num_output_tokens
@@ -872,14 +820,9 @@ class ESA(UcmSparseBase):
             + int(sparse_range * self.esa_cfg["sparse_ratio"]) * block_size
             + local_window_tokens
         )
-        t1 = time.perf_counter_ns()
-        print(f"===[esa estimate_num_slots_sparsed] {(t1-t0)*1e-9} s")
-        print("==estimate end", time.time())
         return compressed_prompt_len + output_len
 
     def allocate_slots(self, kv_cache_manager, request, num_slots_sparsed):
-        print("==allocate_slots begin", time.time())
-        t0 = time.perf_counter_ns()
         coordinator = kv_cache_manager.coordinator
         block_pool = kv_cache_manager.block_pool
         kv_cache_groups = kv_cache_manager.kv_cache_config.kv_cache_groups
@@ -908,51 +851,4 @@ class ESA(UcmSparseBase):
             return None
         coordinator.allocate_new_blocks(request.request_id, num_slots_sparsed)
         blocks = coordinator.single_type_managers[0].req_to_blocks[request.request_id]
-        t1 = time.perf_counter_ns()
-        print(f"===[esa allocate_slots] {(t1-t0)*1e-9} s")
-        print("==allocate_slots end", time.time())
         return KVCacheBlocks(tuple([blocks]))
-
-    def init_host_slabs_from_kv(self, kv_cache_config):
-        if not self._slab_host_k:
-            print(
-                " ========================== initialize slab host ========================== "
-            )
-            self.num_blocks = kv_cache_config.num_blocks
-
-            self._slab_host_k = [
-                torch.empty(
-                    (
-                        self.num_blocks,
-                        self.block_size,
-                        self.num_kv_heads,
-                        self.head_size,
-                    ),
-                    dtype=torch.bfloat16,
-                    device=torch.device("cpu"),
-                    pin_memory=True,
-                )
-                for _ in range(self.total_num_hidden_layers)
-            ]
-
-            if not self.is_mla:
-                self._slab_host_v = [
-                    torch.empty(
-                        (
-                            self.num_blocks,
-                            self.block_size,
-                            self.num_kv_heads,
-                            self.head_size,
-                        ),
-                        dtype=torch.bfloat16,
-                        device=torch.device("cpu"),
-                        pin_memory=True,
-                    )
-                    for _ in range(self.total_num_hidden_layers)
-                ]
-
-    def execute_finished(self, logits_indices: torch.Tensor):
-        # 判断prefill 查看是否耗时
-        if self.ucm_store_stream is not None:
-            self.ucm_store_stream.synchronize()
-        return logits_indices
