@@ -45,9 +45,16 @@ inline int KVPackFail(SharedKVPackHeader* header)
     return -1;
 }
 
+// Coverage flush helper: flushes gcov data before abort (for death-test coverage).
+// Declared without weak so the linker pulls __gcov_dump from libgcov.a; the
+// -lgcov link flag is added by run_tests.sh only in COVERAGE mode.
+extern "C" void __gcov_dump(void);
+
 [[noreturn]] inline void KVPackAbort(SharedKVPackHeader* header)
 {
     if (header != nullptr) { header->fatalError.store(-1, std::memory_order_release); }
+    // Flush coverage data before abort so death-test lines are counted.
+    __gcov_dump();
     std::abort();
 }
 

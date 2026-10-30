@@ -279,6 +279,10 @@ float average2d(const std::vector<std::vector<float>>& matrix)
     size_t count = 0;
     for (const auto& row : matrix) { count += row.size(); }
 
+    // FIX: guard against division by zero when all rows are empty (returns nan).
+    if (count == 0) {
+        return 0.0f;
+    }
     return static_cast<float>(sum / count);
 }
 
