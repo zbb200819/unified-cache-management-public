@@ -24,12 +24,19 @@
 #ifndef UNIFIEDCACHE_INFRA_THREAD_POOL_H
 #define UNIFIEDCACHE_INFRA_THREAD_POOL_H
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <future>
 #include <list>
+#include <memory>
 #include <mutex>
+#include <sys/syscall.h>
 #include <thread>
+#include <unistd.h>
+#include <vector>
+#include "cpu_affinity.h"
+#include "logger/logger.h"
 
 namespace UC {
 
@@ -37,7 +44,24 @@ template <class Task, class WorkerArgs = void*>
 class ThreadPool {
     using WorkerInitFn = std::function<bool(WorkerArgs&)>;
     using WorkerFn = std::function<void(Task&, const WorkerArgs&)>;
+    using WorkerTimeoutFn = std::function<void(Task&, const ssize_t)>;
     using WorkerExitFn = std::function<void(WorkerArgs&)>;
+
+    class StopToken {
+        std::shared_ptr<std::atomic<bool>> flag_ = std::make_shared<std::atomic<bool>>(false);
+
+    public:
+        void RequestStop() noexcept { this->flag_->store(true, std::memory_order_relaxed); }
+        bool StopRequested() const noexcept { return this->flag_->load(std::memory_order_relaxed); }
+    };
+
+    struct Worker {
+        ssize_t tid;
+        std::thread th;
+        StopToken stop;
+        std::weak_ptr<Task> current;
+        std::atomic<std::chrono::steady_clock::time_point> tp{};
+    };
 
 public:
     ThreadPool() = default;
@@ -46,12 +70,13 @@ public:
     ~ThreadPool()
     {
         {
-            std::unique_lock<std::mutex> lk(this->mtx_);
+            std::lock_guard<std::mutex> lock(this->taskMtx_);
             this->stop_ = true;
             this->cv_.notify_all();
         }
-        for (auto& w : this->workers_) {
-            if (w.joinable()) { w.join(); }
+        if (this->monitor_.joinable()) { this->monitor_.join(); }
+        for (auto& worker : this->workers_) {
+            if (worker->th.joinable()) { worker->th.join(); }
         }
     }
     ThreadPool& SetWorkerFn(WorkerFn&& fn)
@@ -69,72 +94,203 @@ public:
         this->exitFn_ = std::move(fn);
         return *this;
     }
+    ThreadPool& SetWorkerTimeoutFn(WorkerTimeoutFn&& fn, const size_t timeoutMs,
+                                   const size_t intervalMs = 1000)
+    {
+        this->timeoutFn_ = std::move(fn);
+        this->timeoutMs_ = timeoutMs;
+        this->intervalMs_ = intervalMs;
+        return *this;
+    }
     ThreadPool& SetNWorker(const size_t nWorker)
     {
         this->nWorker_ = nWorker;
         return *this;
     }
+    ThreadPool& SetCpuAffinity(std::vector<ssize_t> cores)
+    {
+        cpuAffinityCores_ = std::move(cores);
+        return *this;
+    }
+    size_t NWorker() const { return this->nWorker_; }
     bool Run()
     {
         if (this->nWorker_ == 0) { return false; }
-        if (!this->fn_) { return false; }
-        std::list<std::promise<bool>> start(this->nWorker_);
-        std::list<std::future<bool>> fut;
-        for (auto& s : start) {
-            fut.push_back(s.get_future());
-            this->workers_.emplace_back([&] { this->Worker(s); });
+        if (this->fn_ == nullptr) { return false; }
+        this->workers_.reserve(this->nWorker_);
+        for (size_t i = 0; i < this->nWorker_; i++) {
+            if (!this->AddOneWorker()) { return false; }
         }
-        auto success = true;
-        for (auto& f : fut) {
-            if (!f.get()) { success = false; }
+        if (this->timeoutMs_ > 0) {
+            this->monitor_ = std::thread([this] { this->MonitorLoop(); });
         }
-        return success;
+        return true;
     }
-    void Push(std::list<Task>& tasks) noexcept
+    void Push(std::list<Task>& tasks)
     {
-        std::unique_lock<std::mutex> lk(this->mtx_);
+        std::unique_lock<std::mutex> lock(this->taskMtx_);
+        if (drain_) {
+            taskPending_.splice(taskPending_.end(), tasks);
+            return;
+        }
+        const auto n = tasks.size() < this->nWorker_ ? tasks.size() : this->nWorker_;
         this->taskQ_.splice(this->taskQ_.end(), tasks);
-        this->cv_.notify_all();
+        for (size_t i = 0; i < n; ++i) { this->cv_.notify_one(); }
     }
-    void Push(Task&& task) noexcept
+    void Push(Task&& task)
     {
-        std::unique_lock<std::mutex> lk(this->mtx_);
+        std::unique_lock<std::mutex> lock(this->taskMtx_);
+        if (drain_) {
+            taskPending_.push_back(std::move(task));
+            return;
+        }
         this->taskQ_.push_back(std::move(task));
         this->cv_.notify_one();
     }
+    void TraverseWaitQueue(std::function<bool(Task&)> filter, std::function<void(Task&)> visitor,
+                           std::function<bool(Task&)> earlyStopper)
+    {
+        if (!filter || !visitor) { return; }
+        std::list<Task> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(taskMtx_);
+            if (drain_.exchange(true)) { return; }
+            snapshot.swap(taskQ_);
+        }
+        size_t processed = 0;
+        auto it = snapshot.begin();
+        while (it != snapshot.end()) {
+            if (earlyStopper && earlyStopper(*it)) { break; }
+            if (filter(*it)) {
+                visitor(*it);
+                it = snapshot.erase(it);
+                continue;
+            }
+            ++it;
+            ++processed;
+            if (processed == nWorker_) {
+                std::lock_guard<std::mutex> lock(taskMtx_);
+                taskQ_.splice(taskQ_.end(), snapshot, snapshot.begin(), it);
+                cv_.notify_all();
+                processed = 0;
+            }
+        }
+        std::lock_guard<std::mutex> lock(taskMtx_);
+        if (!snapshot.empty()) { taskQ_.splice(taskQ_.end(), snapshot); }
+        if (!taskPending_.empty()) { taskQ_.splice(taskQ_.end(), taskPending_); }
+        drain_.store(false);
+        cv_.notify_all();
+    }
 
 private:
-    void Worker(std::promise<bool>& started) noexcept
+    bool AddOneWorker()
     {
+        try {
+            auto worker = std::make_shared<Worker>();
+            std::promise<bool> prom;
+            auto fut = prom.get_future();
+            worker->th = std::thread([this, worker, &prom] { this->WorkerLoop(prom, worker); });
+            auto success = fut.get();
+            if (!success) { return false; }
+            this->workers_.push_back(worker);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+    void WorkerLoop(std::promise<bool>& prom, std::shared_ptr<Worker> worker)
+    {
+        auto nameStatus = CpuAffinity::SetCurrentThreadName("ucm_pool_work");
+        if (nameStatus.Failure()) {
+            UC_WARN("Failed({}) to set UCM worker thread name.", nameStatus);
+        }
+        worker->tid = syscall(SYS_gettid);
         WorkerArgs args = nullptr;
         auto success = true;
         if (this->initFn_) { success = this->initFn_(args); }
-        started.set_value(success);
+        prom.set_value(success);
+        if (!cpuAffinityCores_.empty()) {
+            CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
+        }
         while (success) {
-            std::unique_lock<std::mutex> lk(this->mtx_);
-            this->cv_.wait(lk, [this] { return this->stop_ || !this->taskQ_.empty(); });
-            if (this->stop_) { break; }
-            if (this->taskQ_.empty()) { continue; }
-            auto task = std::make_shared<Task>(std::move(this->taskQ_.front()));
-            this->taskQ_.pop_front();
-            lk.unlock();
+            std::list<Task> slot;
+            {
+                std::unique_lock<std::mutex> lock(this->taskMtx_);
+                this->cv_.wait(lock, [this, worker] {
+                    return this->stop_ || worker->stop.StopRequested() || !this->taskQ_.empty();
+                });
+                if (this->stop_ || worker->stop.StopRequested()) { break; }
+                if (this->taskQ_.empty()) { continue; }
+                slot.splice(slot.end(), this->taskQ_, this->taskQ_.begin());
+            }
+            auto task = std::make_shared<Task>(std::move(slot.front()));
+            slot.pop_front();
+            worker->current = task;
+            worker->tp.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
             this->fn_(*task, args);
+            if (worker->stop.StopRequested()) { break; }
+            worker->current.reset();
+            worker->tp.store({}, std::memory_order_relaxed);
         }
         if (this->exitFn_) { this->exitFn_(args); }
     }
 
+    void MonitorLoop()
+    {
+        auto nameStatus = CpuAffinity::SetCurrentThreadName("ucm_pool_mon");
+        if (nameStatus.Failure()) {
+            UC_WARN("Failed({}) to set UCM monitor thread name.", nameStatus);
+        }
+        if (!cpuAffinityCores_.empty()) {
+            CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
+        }
+        const auto interval = std::chrono::milliseconds(this->intervalMs_);
+        while (!this->stop_) {
+            std::this_thread::sleep_for(interval);
+            size_t nWorker = this->Monitor();
+            for (size_t i = nWorker; i < this->nWorker_; i++) { (void)this->AddOneWorker(); }
+        }
+    }
+
+    size_t Monitor()
+    {
+        using namespace std::chrono;
+        const auto timeout = milliseconds(this->timeoutMs_);
+        for (auto it = this->workers_.begin(); it != this->workers_.end();) {
+            auto tp = (*it)->tp.load(std::memory_order_relaxed);
+            auto task = (*it)->current.lock();
+            auto now = steady_clock::now();
+            if (task && tp != steady_clock::time_point{} && now - tp > timeout) {
+                if (this->timeoutFn_) { this->timeoutFn_(*task, (*it)->tid); }
+                (*it)->stop.RequestStop();
+                if ((*it)->th.joinable()) { (*it)->th.detach(); }
+                it = this->workers_.erase(it);
+            } else {
+                it++;
+            }
+        }
+        return this->workers_.size();
+    }
+
 private:
+    WorkerInitFn initFn_{nullptr};
+    WorkerFn fn_{nullptr};
+    WorkerTimeoutFn timeoutFn_{nullptr};
+    WorkerExitFn exitFn_{nullptr};
+    size_t timeoutMs_{0};
+    size_t intervalMs_{0};
+    size_t nWorker_{0};
+    std::vector<ssize_t> cpuAffinityCores_{};
     bool stop_{false};
-    size_t nWorker_{1};
-    std::list<std::thread> workers_;
-    WorkerInitFn initFn_;
-    WorkerFn fn_;
-    WorkerExitFn exitFn_;
+    std::atomic_bool drain_{false};
+    std::list<Task> taskPending_;
+    std::vector<std::shared_ptr<Worker>> workers_;
+    std::thread monitor_;
+    std::mutex taskMtx_;
     std::list<Task> taskQ_;
-    std::mutex mtx_;
     std::condition_variable cv_;
 };
 
-} // namespace UC
+}  // namespace UC
 
 #endif

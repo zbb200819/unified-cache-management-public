@@ -29,16 +29,17 @@ namespace UC {
 Status TransManager::Setup(const size_t rankSize, const int32_t deviceId, const size_t streamNumber,
                            const size_t blockSize, const size_t ioSize, const bool ioDirect,
                            const size_t bufferNumber, const SpaceLayout* layout,
-                           const size_t timeoutMs, const bool scatterGatherEnable)
+                           const size_t timeoutMs, const bool scatterGatherEnable,
+                           const bool useGdr, const std::string& uniqueId)
 {
     auto s = Status::OK();
     if (rankSize > 1) {
-        s = this->shareQueue_.Setup(rankSize, deviceId, streamNumber, blockSize, ioSize, ioDirect,
-                                    bufferNumber, layout, &this->failureSet_);
+        s = this->shareQueue_.Setup(deviceId, streamNumber, blockSize, ioSize, ioDirect,
+                                    bufferNumber, layout, &this->failureSet_, uniqueId, useGdr);
         if (s.Failure()) { return s; }
     }
     s = this->queue_.Setup(deviceId, streamNumber, blockSize, ioSize, ioDirect, bufferNumber,
-                           layout, &this->failureSet_, scatterGatherEnable);
+                           layout, &this->failureSet_, scatterGatherEnable, useGdr, timeoutMs);
     if (s.Failure()) { return s; }
     this->rankSize_ = rankSize;
     this->timeoutMs_ = timeoutMs;
@@ -93,6 +94,8 @@ Status TransManager::Wait(const size_t taskId) noexcept
         UC_ERROR("Task({}) timeout({}).", task->Str(), timeoutMs_);
         failureSet_.Insert(taskId);
         waiter->Wait();
+        failureSet_.Remove(taskId);
+        return Status::Timeout();
     }
     auto failure = failureSet_.Contains(taskId);
     if (failure) {
@@ -115,4 +118,4 @@ Status TransManager::Check(const size_t taskId, bool& finish) noexcept
     return Status::OK();
 }
 
-} // namespace UC
+}  // namespace UC

@@ -8,37 +8,65 @@ vllm-ascend: >=v0.9.1 (vllm == 0.9.2 to use the Sparse Feature)
 
 ## Step 1: UCM Installation
 
-We offer 3 options to install UCM.
+We offer 2 options to install UCM.
 
-### Option 1: Build from source
+If you want to build UCM from source code (e.g. for development or customization), see [Building and Installing UCM from Source](../developer-guide/build_from_source.md).
 
-Follow commands below to install unified-cache-management from source code:
-**Note:** The sparse module was not compiled by default. To enable it, set the environment variable `export ENABLE_SPARSE=TRUE` before you build.
-```bash
-# Replace <branch_or_tag_name> with the branch or tag name needed
-git clone --depth 1 --branch <branch_or_tag_name> https://github.com/ModelEngine-Group/unified-cache-management.git
-cd unified-cache-management
-export PLATFORM=ascend
-pip install -v -e . --no-build-isolation
-cd ..
-```
-
-
-### Option 2: Install by pip
+### Option 1: Install by pip
 Install by pip or find the pre-build wheels on [Pypi](https://pypi.org/project/uc-manager/).
 ```
 export PLATFORM=ascend
 pip install uc-manager
 ```
+> **Note:** If installing via `pip install`, you need to manually add the `config.yaml` file, similar to `unified-cache-management/examples/ucm_config_example.yaml`, because PyPI packages do not include YAML files.
 
-### Option 3: Setup from docker
-Download the pre-built `vllm-ascend` docker image and build unified-cache-management docker image by commands below:
- ```bash
- # Build docker image using source code, replace <branch_or_tag_name> with the branch or tag name needed
- git clone --depth 1 --branch <branch_or_tag_name> https://github.com/ModelEngine-Group/unified-cache-management.git
- cd unified-cache-management
- docker build -t ucm-vllm:latest -f ./docker/Dockerfile-NPU ./
- ```
+### Enable UCM Integration
+
+UCM integrates with vLLM and vLLM-Ascend automatically at runtime — no manual patching of the source code is required.
+
+Simply enable the patch hook by setting the following environment variable before launching vLLM-Ascend:
+```bash
+export ENABLE_UCM_PATCH=1
+```
+
+UCM detects your vLLM and vLLM-Ascend versions and applies the required patches on the fly.
+
+>**Note:** To enable Sparse Attention (supported on v0.11.0), also set `export ENABLE_SPARSE=1`.
+
+### Option 2: Setup from docker
+
+#### Build image from source
+Check the `docker/` directory for available Dockerfile versions (e.g. `v0.20.2`, `v0.18.0`, `v0.17.0`, `v0.11.0`), then build with the desired version:
+```bash
+# Replace <vllm_ascend_version> with the version you need (e.g. v0.20.2)
+docker build -t ucm-vllm:latest -f ./docker/Dockerfile.ucm-vllm-ascend.a2-<vllm_ascend_version> ./
+```
+
+For vLLM-Ascend(v0.11.0) with sparse attention support:
+```bash
+docker build -t ucm-vllm-sparse:latest -f ./docker/Dockerfile.ucm-vllm-ascend.a2-v0.11.0 ./
+```
+
+The Dockerfile automatically invokes the build script (`scripts/build_ascend.sh`) to compile the wheel and installs from the built package.
+
+#### Build image from pre-built package
+
+If you have a pre-built tar package (e.g. from CI), extract it and build the image in `package` mode:
+```bash
+mkdir -p /tmp/ucm-pkg && tar xzf AI-Storage-Kit_*.tar.gz -C /tmp/ucm-pkg
+# Replace <vllm_ascend_version> with the version you need (e.g. v0.20.2)
+docker build --build-arg INSTALL_MODE=package \
+  -t ucm-vllm:latest -f /tmp/ucm-pkg/docker/Dockerfile.ucm-vllm-ascend.a2-<vllm_ascend_version> /tmp/ucm-pkg
+```
+
+vllm-ascend provides two variants: **Ubuntu** and **openEuler**.
+The Dockerfile uses the **Ubuntu** variant by default.
+
+If you want to use the **openEuler** variant, override the base image with `--build-arg IMAGE_NAME_VERSION`:
+
+```text
+quay.io/ascend/vllm-ascend:v0.11.0-openeuler
+```
 Then run your container using following command. You can add or remove Docker parameters as needed.
 ```bash
 # Update DEVICE according to your device (/dev/davinci[0-7])
@@ -73,13 +101,13 @@ For quick start, just follow the guide below to launch your own inference experi
 
 ### Feature 1:  Prefix Caching
 
-You may directly edit the example file at `unified-cache-management/examples/ucm_config_example.yaml`. For more please refer to [Prefix Cache with NFS Store](../user-guide/prefix-cache/nfs_store.md) document.
+You may directly edit the example file at `unified-cache-management/examples/ucm_config_example.yaml`. For more please refer to [Prefix Cache with Pipeline Store](../user-guide/prefix-cache/pipeline_store.md) document.
 
 ⚠️ Make sure to replace `/mnt/test` with your actual storage directory. 
 
 ### Feature 2:  Sparsity
 
-The sparse module was not compiled by default. To enable it, set the environment variable `export ENABLE_SPARSE=TRUE` and re-compile the code you built. And uncomment `ucm_sparse_config` code block in `unified-cache-management/examples/ucm_config_example.yaml`.
+The sparse module was not compiled by default. To enable it, set the environment variable `export ENABLE_SPARSE=TRUE` and build the package again (see [Building and Installing UCM from Source](../developer-guide/build_from_source.md)). And uncomment `ucm_sparse_config` code block in `unified-cache-management/examples/ucm_config_example.yaml`. Additionally, if you want to run GSA, you also need to set the environment variable `export VLLM_HASH_ATTENTION=1`.
 
 ## Step 3: Launching Inference
 
@@ -139,6 +167,8 @@ vllm serve Qwen/Qwen2.5-14B-Instruct \
 
 **⚠️ Make sure to replace `"/workspace/unified-cache-management/examples/ucm_config_example.yaml"` with your actual config file path.**
 
+**⚠️ The log files of UCM module will be put under `log` directory of the path you start vllm service. To use a custom log path, set `export UCM_LOG_PATH=my_log_dir`.**
+
 
 If you see log as below:
 
@@ -163,4 +193,8 @@ curl http://localhost:7800/v1/completions \
   }'
 
 ```
+
+### Running with Other Models
+
+To run UCM with other models, first check which models are supported in the [Support Matrix](../user-guide/support-matrix/support_matrix.md). Then refer to the official [vLLM Recipes](https://recipes.vllm.ai/) and [vLLM-Ascend Model Tutorials](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/index.html) for the specific model's serving command and parameters. You only need to add the `--kv-transfer-config` argument as shown in the example above to enable UCM integration.
 </details>

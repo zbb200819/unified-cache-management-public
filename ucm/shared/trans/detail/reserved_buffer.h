@@ -24,7 +24,10 @@
 #ifndef UNIFIEDCACHE_TRANS_RESERVED_BUFFER_H
 #define UNIFIEDCACHE_TRANS_RESERVED_BUFFER_H
 
+#include <cstddef>
+#include <cstdint>
 #include <fmt/format.h>
+#include <memory>
 #include "indexer.h"
 #include "trans/buffer.h"
 
@@ -51,6 +54,8 @@ class ReservedBuffer : public Buffer {
     }
 
 public:
+    std::shared_ptr<void> MakeDeviceMappedHostBuffer(size_t) override { return nullptr; }
+
     Status MakeDeviceBuffers(size_t size, size_t number) override
     {
         auto totalSize = size * number;
@@ -73,6 +78,17 @@ public:
         return this->MakeDeviceBuffer(size);
     }
 
+    std::shared_ptr<void> MakeHostBuffer4DirectIo(size_t size) override
+    {
+        return this->MakeHostBuffer(size);
+    }
+
+    std::shared_ptr<void> MakeHostMappedDeviceBuffer(size_t size, void** pDevice = nullptr) override
+    {
+        if (pDevice) { *pDevice = nullptr; }
+        return this->MakeHostBuffer(size);
+    }
+
     Status MakeHostBuffers(size_t size, size_t number) override
     {
         auto totalSize = size * number;
@@ -90,10 +106,13 @@ public:
             auto buffer = GetBufferFrom(this->hostBuffers_);
             if (buffer) { return buffer; }
         }
-        return this->MakeDeviceBuffer(size);
+        return this->MakeHostBuffer(size);
     }
 };
 
-} // namespace UC::Trans
+// Fills backend-managed memory with the low byte of value and completes before returning.
+Status Memset(void* ptr, std::size_t size, std::int32_t value);
+
+}  // namespace UC::Trans
 
 #endif

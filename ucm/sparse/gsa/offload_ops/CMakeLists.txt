@@ -41,7 +41,7 @@ set(LIBRARIES
 )
 
 # NPU特殊配置
-if(RUNTIME_ENVIRONMENT STREQUAL "ascend")
+if(UCM_RUNTIME_ASCEND_FAMILY)
     message(STATUS "Configuring for NPU/Ascend device")
 
     # 查找torch_npu路径
@@ -59,7 +59,7 @@ if(RUNTIME_ENVIRONMENT STREQUAL "ascend")
         list(INSERT LIBRARIES 0 torch_npu)
         set(CXX11_ABI "0")
     else()
-        message(WARNING "torch_npu not found, but RUNTIME_ENVIRONMENT is set to ascend")
+        message(WARNING "torch_npu not found, but RUNTIME_ENVIRONMENT is set to ${RUNTIME_ENVIRONMENT}")
     endif()
 endif()
 
@@ -96,16 +96,8 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(gsa_offload_ops PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
-# 设置输出路径
-set(OUTPUT_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR})
-set_target_properties(gsa_offload_ops PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${OUTPUT_LIB_DIR}
-    RUNTIME_OUTPUT_DIRECTORY ${OUTPUT_LIB_DIR}
+file(RELATIVE_PATH INSTALL_REL_PATH
+     ${UCM_ROOT_DIR}
+     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-
-# 编译后输出信息
-add_custom_command(TARGET gsa_offload_ops POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E echo "Built gsa_offload_ops successfully for ${RUNTIME_ENVIRONMENT}"
-    COMMAND ${CMAKE_COMMAND} -E echo "CXX11_ABI=${CXX11_ABI}"
-    COMMAND ${CMAKE_COMMAND} -E echo "Output location: ${OUTPUT_LIB_DIR}"
-)
+install(TARGETS gsa_offload_ops LIBRARY DESTINATION ${INSTALL_REL_PATH} COMPONENT ucm)

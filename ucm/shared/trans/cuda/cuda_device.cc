@@ -22,29 +22,34 @@
  * SOFTWARE.
  * */
 #include <cuda_runtime.h>
-#include <nvml.h>
 #include "cuda_buffer.h"
 #include "cuda_sm_stream.h"
 #include "cuda_stream.h"
 #include "trans/device.h"
 
+#if UCM_ENABLE_GDR_STREAM
+#include "gdr/gdr_stream.h"
+#endif
+
 namespace UC::Trans {
 
-static void SetCpuAffinity(int32_t deviceId)
-{
-    nvmlDevice_t device;
-    auto ret = nvmlDeviceGetHandleByIndex(deviceId, &device);
-    if (ret != NVML_SUCCESS) { return; }
-    nvmlDeviceSetCpuAffinity(device);
-}
+Status Device::Init() { return Status::OK(); }
 
 Status Device::Setup(int32_t deviceId)
 {
     auto ret = cudaSetDevice(deviceId);
     if (ret != cudaSuccess) { return Status{ret, cudaGetErrorString(ret)}; }
-    SetCpuAffinity(deviceId);
     return Status::OK();
 }
+
+Status Device::Reset(int32_t)
+{
+    const auto ret = cudaDeviceReset();
+    if (ret != cudaSuccess) { return Status{ret, cudaGetErrorString(ret)}; }
+    return Status::OK();
+}
+
+Status Device::Finalize() { return Status::OK(); }
 
 std::unique_ptr<Stream> Device::MakeStream()
 {
@@ -55,6 +60,36 @@ std::unique_ptr<Stream> Device::MakeStream()
         return nullptr;
     }
     if (stream->Setup().Success()) { return stream; }
+    return nullptr;
+}
+
+std::shared_ptr<Stream> Device::MakeSharedStream()
+{
+    std::shared_ptr<Stream> stream = nullptr;
+    try {
+        stream = std::make_shared<CudaStream>();
+    } catch (...) {
+        return nullptr;
+    }
+    if (stream->Setup().Success()) { return stream; }
+    return nullptr;
+}
+
+std::shared_ptr<Stream> Device::MakeIoAggregationStream() { return nullptr; }
+
+std::shared_ptr<Stream> Device::MakeSdmaDirectStream() { return nullptr; }
+
+std::unique_ptr<Stream> Device::MakeGdrStream()
+{
+#if UCM_ENABLE_GDR_STREAM
+    std::unique_ptr<Stream> stream = nullptr;
+    try {
+        stream = std::make_unique<GdrStream>();
+    } catch (...) {
+        return nullptr;
+    }
+    if (stream->Setup().Success()) { return stream; }
+#endif
     return nullptr;
 }
 
@@ -79,4 +114,4 @@ std::unique_ptr<Buffer> Device::MakeBuffer()
     }
 }
 
-} // namespace UC::Trans
+}  // namespace UC::Trans

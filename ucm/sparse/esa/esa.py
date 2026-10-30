@@ -4,7 +4,7 @@ import pickle
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import cache
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -12,11 +12,10 @@ from numpy.typing import NDArray
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.forward_context import ForwardContext
-from vllm.sequence import SequenceStage
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.request import Request, RequestStatus
 
-from ucm.integration.vllm.ucm_connector import RequestHasher
+from ucm.integration.vllm.ucm_connector import RequestHasher, build_kv_hash_meta
 from ucm.sparse.base import (
     INVALID_SLOT,
     UcmSparseBase,
@@ -26,7 +25,7 @@ from ucm.sparse.base import (
 from ucm.sparse.esa.retrieval import retrieval_backend
 from ucm.sparse.esa.retrieval.retrieval_worker import RetrievalWorker
 from ucm.sparse.kvstar.utils import get_bind_cpus_for_rank
-from ucm.store.ucmstore import Task, UcmKVStoreBase
+from ucm.store.ucmstore_v1 import Task, UcmKVStoreBaseV1
 from ucm.utils import Config
 
 ReqType = Union[str, int]
@@ -144,32 +143,6 @@ def get_sparse_range(init_window_sz, local_window_sz, prompt_len, block_size):
     return sparse_range
 
 
-@cache
-def compute_parent_block_hash(model_name, world_size, dtype, seed_rank=0) -> int:
-    meta = f"{model_name}:{world_size}:{dtype}:{seed_rank}"
-    meta_bytes = meta.encode("utf-8")
-    h_seed = hashlib.md5(meta_bytes + b"UCM_HASH_SEED").digest()
-    return int.from_bytes(h_seed, byteorder="big")
-
-
-@cache
-def compute_layer_offset(
-    block_data_size: int,
-    layer_id: int,
-    is_v: bool,
-    is_mla: bool,
-) -> int:
-    layer_data_size = block_data_size if is_mla else block_data_size * 2
-
-    k_offset = layer_data_size * layer_id
-
-    if is_mla:
-        return k_offset
-
-    v_offset = k_offset + block_data_size
-    return v_offset if is_v else k_offset
-
-
 def task_hash_func(block_ids, store_type, tensor_type):
     return hash((tuple(block_ids), store_type, tensor_type))
 
@@ -199,7 +172,8 @@ class ReqStatePerLayer:
         layer_name: str,
         rank: int,
         tp_size: int,
-        store_instance: UcmKVStoreBase,
+        store: UcmKVStoreBaseV1,
+        rope_store: UcmKVStoreBaseV1,
         vllm_config: VllmConfig,
         retrieval_worker: Optional[RetrievalWorker] = None,
         repre_pool: Optional[ReprePool] = None,
@@ -210,7 +184,8 @@ class ReqStatePerLayer:
         self.slots = []
         self.slots_to_relative_indexes = {}
         self.repre_pool: ReprePool | None = repre_pool
-        self.store_instance = store_instance
+        self.store = store
+        self.rope_store = rope_store
         self.retrieval_worker: Optional[RetrievalWorker] = retrieval_worker
         self.retrieval_task = None
         self.req_meta = None
@@ -221,6 +196,7 @@ class ReqStatePerLayer:
         self.rank = rank
         self.tp_size = tp_size
         self.tasks: Dict[str, Task] = {}
+        self.rope_tasks: Dict[str, Task] = {}
         self.esa_cfg = esa_cfg
         self.indexes: Optional[NDArray[np.int64]] = None
         self.block_hashes = None
@@ -229,7 +205,9 @@ class ReqStatePerLayer:
         self.init_static_flag = False
         self.init_window = None
         self.local_window = None
-
+        self.num_layers = vllm_config.model_config.get_num_layers(
+            vllm_config.parallel_config
+        )
         self.num_key_heads = vllm_config.model_config.get_num_kv_heads(
             vllm_config.parallel_config
         )
@@ -241,38 +219,47 @@ class ReqStatePerLayer:
         self.req_meta = req_meta
 
     def launch_transfer_task(self, transfer_type, block_hashes, vllm_block_ids):
-        fn = getattr(self.store_instance, transfer_type)
+        # fn = getattr(self.store, transfer_type)
         length = len(block_hashes)
         precision = self.vllm_config.model_config.dtype.itemsize
         block_data_size = self.k_cache[0].numel() * precision
 
-        offset_k = compute_layer_offset(
-            block_data_size,
-            self.layer_id,
-            is_v=False,
-            is_mla=self.is_mla,
-        )
-        offsets_k = [offset_k] * length
+        shard_indexs = [self.layer_id] * length
 
-        key_src_tensors = [self.k_cache[id_] for id_ in vllm_block_ids]
-        task_k = fn(block_hashes, offsets_k, key_src_tensors)
+        vllm_block_ids_np = np.array(vllm_block_ids, np.uint64)
+        k_block_ptrs = vllm_block_ids_np * block_data_size + self.k_base_ptrs
+        task_k = self.store.load_data(block_hashes, shard_indexs, k_block_ptrs[:, None])
         task_k_hash = task_hash_func(block_hashes, transfer_type, "key")
         self.tasks[task_k_hash] = task_k
 
         if not self.is_mla:
-            offset_v = compute_layer_offset(
-                block_data_size,
-                self.layer_id,
-                is_v=True,
-                is_mla=self.is_mla,
+            v_shard_indexs = [self.layer_id + self.num_layers] * length
+            v_block_ptrs = vllm_block_ids_np * block_data_size + self.v_base_ptrs
+
+            task_v = self.store.load_data(
+                block_hashes, v_shard_indexs, v_block_ptrs[:, None]
             )
-            offsets_v = [offset_v] * length
-            value_src_tensors = [self.v_cache[id_] for id_ in vllm_block_ids]
-            task_v = fn(block_hashes, offsets_v, value_src_tensors)
             task_v_hash = task_hash_func(block_hashes, transfer_type, "value")
             self.tasks[task_v_hash] = task_v
+        elif self.v_cache is not None:
+            # vllm-ascend MLA rope_cache
+            block_data_size = self.v_cache[0].numel() * precision
+            v_block_ptrs = vllm_block_ids_np * block_data_size + self.v_base_ptrs
+            task_rope = self.rope_store.load_data(
+                block_hashes, shard_indexs, v_block_ptrs[:, None]
+            )
+            task_rope_hash = task_hash_func(block_hashes, transfer_type, "value")
+            self.rope_tasks[task_rope_hash] = task_rope
 
     def extract_block_repre(self, vllm_block_ids):
+        if self.is_mla and self.v_cache is not None:
+            return torch.cat(
+                [
+                    self.k_cache[vllm_block_ids].mean(1),
+                    self.v_cache[vllm_block_ids].mean(1),
+                ],
+                dim=-1,
+            )
         return self.k_cache[vllm_block_ids].mean(1)
 
     def maybe_register_static_data(self, forward_context: ForwardContext):
@@ -280,21 +267,30 @@ class ReqStatePerLayer:
             return
         attn = forward_context.no_compile_layers[self.layer_name]
         kv_cache = attn.kv_cache[forward_context.virtual_engine]
-        # TODO not mla
-        if self.is_mla:
+        # Since vllm_ascend >= 0.10.0, the MLA model's tensor shape has changed to Tuple
+        # [(num_blocks, block_size, num_kv_heads, nope_dim/rope_dim)]
+        if self.is_mla and not isinstance(kv_cache, Tuple):
             self.k_cache = kv_cache
+            self.k_base_ptrs = np.array(self.k_cache.data_ptr(), dtype=np.uint64)
+            self.v_base_ptrs = None
         else:
             self.k_cache = kv_cache[0]
             self.v_cache = kv_cache[1]
+            self.k_base_ptrs = np.array(self.k_cache.data_ptr(), dtype=np.uint64)
+            self.v_base_ptrs = np.array(self.v_cache.data_ptr(), dtype=np.uint64)
         self.block_hashes = self.req_meta.ucm_block_hashes
         self.init_static_flag = True
 
     def wait_transfer_task_done(self):
         # assert len(self.tasks) > 0
-        for task_hash, task in self.tasks.items():
+        for _, task in self.tasks.items():
             # TODO: handle exceptions
-            ret = self.store_instance.wait(task)
-        self.tasks.clear()  # reset
+            _ = self.store.wait(task)
+        for _, rope_task in self.rope_tasks.items():
+            # TODO: handle exceptions
+            _ = self.rope_store.wait(rope_task)
+        self.tasks.clear()
+        self.rope_tasks.clear()
 
     def start_retrieval(self, batch_query, forward_context):
         query_start_loc = self.req_meta.query_start_loc
@@ -371,7 +367,7 @@ class ReqStatePerLayer:
         # NOTE: in Preemption, local_window_start != -self.esa_cfg['local_window_sz']
         local_window_start = self.esa_cfg["init_window_sz"] + self.sparse_range
 
-        if not self.is_mla:
+        if not self.is_mla or self.v_cache is not None:
             self.init_window = (
                 self.k_cache[vllm_block_ids[: self.esa_cfg["init_window_sz"]]].clone(),
                 self.v_cache[vllm_block_ids[: self.esa_cfg["init_window_sz"]]].clone(),
@@ -400,7 +396,7 @@ class ReqStatePerLayer:
             if self.step == 1:
                 vllm_block_ids = self.req_meta.vllm_block_ids
                 # NOTE: in Preemption, local_window_start != -self.esa_cfg['local_window_sz']
-                if not self.is_mla:
+                if not self.is_mla or self.v_cache is not None:
                     local_window_sz = self.local_window[0].shape[0]
                     self.k_cache[vllm_block_ids[: self.esa_cfg["init_window_sz"]]] = (
                         self.init_window[0]
@@ -453,7 +449,7 @@ class ESA(UcmSparseBase):
         self.rank = vllm_config.parallel_config.rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         if role == UcmSparseRole.WORKER:
-            self.connector = get_kv_transfer_group().connector.store
+            self.connector = get_kv_transfer_group().connector
         else:
             self.connector = None
         self.esa_cfg = (
@@ -469,9 +465,9 @@ class ESA(UcmSparseBase):
         self._sparse_metadata_prefill: ESASparseMetaData = ESASparseMetaData()
         self._sparse_metadata_decode: ESASparseMetaData = ESASparseMetaData()
         self._sparse_metadata: ESASparseMetaData = ESASparseMetaData()
-        self.request_hasher = RequestHasher(vllm_config, 0)
+        self.request_hasher = RequestHasher(build_kv_hash_meta(vllm_config, 0))
         self.block_size = vllm_config.cache_config.block_size
-        self.block_hashes: dict[int, dict[int, list[str]]] = {}
+        self.block_hashes: dict[str, dict[int, list[bytes]]] = {}
         global data
 
         if data is None:
@@ -532,7 +528,8 @@ class ESA(UcmSparseBase):
                 layer_name,
                 self.rank,
                 self.tp_size,
-                self.connector,
+                self.connector.store,
+                self.connector.rope_store,
                 self._vllm_config,
                 self.retrieval_workers[layer_id],
                 self.layer_pools[layer_id],
@@ -554,8 +551,12 @@ class ESA(UcmSparseBase):
         value: torch.Tensor,
         layer_name: str,
         forward_context: ForwardContext,
+        output: Optional[torch.Tensor] = None,
         phase: Optional[str] = None,
-    ) -> None:
+        k_hash: Optional[torch.Tensor] = None,
+        decode_ql_nope: Optional[torch.Tensor] = None,
+        decode_q_pe: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self.is_mla:
             for req_meta in self._sparse_metadata.requests:
                 self.create_req_state_attention_begin(
@@ -572,6 +573,8 @@ class ESA(UcmSparseBase):
                     self.create_req_state_attention_begin(
                         req_meta, layer_name, query, key, value, forward_context
                     )
+
+        return query, key, value, output
 
     def update_req_state_attention_end(
         self, req_meta, layer_name, query, key, value, attn_output, forward_context
@@ -641,13 +644,7 @@ class ESA(UcmSparseBase):
 
         self.block_hashes[req_id][self.rank] = []
 
-        parent_block_hash_value = compute_parent_block_hash(
-            self._vllm_config.model_config.model,
-            self._vllm_config.parallel_config.world_size,
-            self._vllm_config.model_config.dtype,
-            seed_rank=0,
-        )
-
+        parent_block_hash_value = self.request_hasher("UCM_HASH_SEED")
         num_total_blocks = math.ceil(len(token_ids) / self.block_size)
         for start in range(0, len(token_ids), self.block_size):
             end = start + self.block_size
@@ -661,16 +658,17 @@ class ESA(UcmSparseBase):
             hash_value = self.request_hasher(
                 (parent_block_hash_value, curr_block_token_ids_tuple)
             )
-            if block_idx >= self.esa_cfg["init_window_sz"]:
-                self.block_hashes[req_id][self.rank].append(str(hash_value))
-
             parent_block_hash_value = hash_value
+            if block_idx >= self.esa_cfg["init_window_sz"]:
+                self.block_hashes[req_id][self.rank].append(hash_value)
 
         if self.rank != 0 and not self.is_mla:
-            self.newqrequest_hasher = RequestHasher(self._vllm_config, self.rank)
+            self.newrequest_hasher = RequestHasher(
+                build_kv_hash_meta(self._vllm_config, self.rank)
+            )
             for i, ucm_block_id in enumerate(self.block_hashes[req_id][self.rank]):
-                self.block_hashes[req_id][self.rank][i] = str(
-                    self.newqrequest_hasher(ucm_block_id)
+                self.block_hashes[req_id][self.rank][i] = self.newrequest_hasher(
+                    ucm_block_id
                 )
 
     def build_sparse_meta(
@@ -699,7 +697,7 @@ class ESA(UcmSparseBase):
             req = requests[req_id]
             if not self.is_sparsed_request(req):
                 continue
-            self.set_block_hashes(int(req_id), req.prompt_token_ids)
+            self.set_block_hashes(req_id, req.prompt_token_ids)
             if isinstance(attn_metadata, dict):
                 attn_metadata = next(iter(attn_metadata.values()))
 
@@ -714,7 +712,7 @@ class ESA(UcmSparseBase):
                     req.prompt_token_ids,
                     req.output_token_ids,
                     req_id in preempt_reqs,
-                    self.block_hashes[int(req_id)][self.rank],
+                    self.block_hashes[req_id][self.rank],
                 )
 
             else:
@@ -735,7 +733,7 @@ class ESA(UcmSparseBase):
                             req.prompt_token_ids,
                             req.output_token_ids,
                             req_id in preempt_reqs,
-                            self.block_hashes[int(req_id)][self.rank],
+                            self.block_hashes[req_id][self.rank],
                         )
 
                 else:
@@ -752,7 +750,7 @@ class ESA(UcmSparseBase):
                         req.prompt_token_ids,
                         req.output_token_ids,
                         req_id in preempt_reqs,
-                        self.block_hashes[int(req_id)][self.rank],
+                        self.block_hashes[req_id][self.rank],
                     )
 
             # self._sparse_metadata = sparse_meta

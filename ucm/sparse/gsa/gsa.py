@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from functools import cache, wraps
 from itertools import accumulate
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from vllm.config import VllmConfig
@@ -22,7 +22,7 @@ from vllm.v1.core.kv_cache_utils import NONE_HASH
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import Request
 
-from ucm.integration.vllm.ucm_connector import RequestHasher
+from ucm.integration.vllm.ucm_connector import RequestHasher, build_kv_hash_meta
 from ucm.sparse.base import (
     INVALID_SLOT,
     UcmSparseBase,
@@ -71,7 +71,7 @@ class GSAReqStat:
         self._vllm_config = vllm_config
         self.rank = vllm_config.parallel_config.rank
         self.use_mla = vllm_config.model_config.use_mla
-        self.request_hasher = RequestHasher(vllm_config, 0)
+        self.request_hasher = RequestHasher(build_kv_hash_meta(vllm_config, 0))
 
     def step(self) -> int:
         return self.num_output_tokens
@@ -123,7 +123,9 @@ class GSAReqStat:
             parent_block_hash_value = hash_value
 
         if self.rank != 0 and not self.use_mla:
-            self.newqrequest_hasher = RequestHasher(self._vllm_config, self.rank)
+            self.newqrequest_hasher = RequestHasher(
+                build_kv_hash_meta(self._vllm_config, self.rank)
+            )
             for i, ucm_block_id in enumerate(self.block_hashes):
                 self.block_hashes[i] = str(self.newqrequest_hasher(ucm_block_id))
 
@@ -634,8 +636,12 @@ class GSA(UcmSparseBase):
         value: torch.Tensor,
         layer_name: str,
         forward_context: ForwardContext,
+        output: Optional[torch.Tensor] = None,
         phase: Optional[str] = None,
-    ) -> None:
+        k_hash: Optional[torch.Tensor] = None,
+        decode_ql_nope: Optional[torch.Tensor] = None,
+        decode_q_pe: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         current_layer_id = int(layer_name.split(".")[2])
         if self.prefetch_engine.atb_gsa_enable and self.prefetch_engine.is_topk_cal:
             if not self.use_mla:
@@ -683,6 +689,8 @@ class GSA(UcmSparseBase):
                                 self.decode_index
                             ]
                         )
+
+        return query, key, value, output
 
     def attention_finished(
         self,
@@ -902,7 +910,7 @@ class GSA(UcmSparseBase):
         self.gsa_stats = self.gsa_metadata.gsa_stats
         self._start_topk_cal()
 
-    def execute_finished(self):
+    def execute_finished(self, logits_indices: torch.Tensor):
         kv_caches = [None] * self.layer_num
         forward_context = get_forward_context()
         attn = forward_context.no_compile_layers
@@ -931,6 +939,7 @@ class GSA(UcmSparseBase):
             self.prefetch_engine.deal_async_prefetch(
                 False, self.gsa_metadata, kv_caches, None
             )
+        return logits_indices
 
     def launch_transfer_task(self, all_free_block_ids, all_miss_ids, kv_caches):
         if all_free_block_ids == None:

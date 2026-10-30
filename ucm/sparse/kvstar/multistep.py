@@ -1,7 +1,7 @@
 import enum
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from vllm.config import VllmConfig
@@ -10,7 +10,7 @@ from vllm.forward_context import ForwardContext
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.request import Request
 
-from ucm.integration.vllm.ucm_connector import RequestHasher
+from ucm.integration.vllm.ucm_connector import RequestHasher, build_kv_hash_meta
 from ucm.sparse.base import (
     INVALID_SLOT,
     UcmSparseBase,
@@ -656,7 +656,7 @@ class KVStarMultiStep(UcmSparseBase):
         self.block_hashes: dict[int, dict[int, list[str]]] = {}
         self.rank = vllm_config.parallel_config.rank
         self.is_mla = vllm_config.model_config.is_deepseek_mla
-        self.request_hasher = RequestHasher(vllm_config, 0)
+        self.request_hasher = RequestHasher(build_kv_hash_meta(vllm_config, 0))
         if self.role == UcmSparseRole.WORKER:
             ratio = 0.75
             bind_info_list, alloc_numa_ids = get_bind_cpus_for_rank(
@@ -731,8 +731,12 @@ class KVStarMultiStep(UcmSparseBase):
         value: torch.Tensor,
         layer_name: str,
         forward_context: ForwardContext,
+        output: Optional[torch.Tensor] = None,
         phase: Optional[str] = None,
-    ) -> None:
+        k_hash: Optional[torch.Tensor] = None,
+        decode_ql_nope: Optional[torch.Tensor] = None,
+        decode_q_pe: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         This is called at the beginning of "unified_attention".
         Sparse attention algorithm can modify forward_context.attn_metadata if necessary.
@@ -745,6 +749,8 @@ class KVStarMultiStep(UcmSparseBase):
             req_layerwise_state = self.create_layerwise_req_state(req_meta, layer_name)
             req_layerwise_state.update_meta(req_meta, forward_context)
             req_layerwise_state.attention_begin(query, key, value, forward_context)
+
+        return query, key, value, output
 
     def attention_finished(
         self,
@@ -798,7 +804,9 @@ class KVStarMultiStep(UcmSparseBase):
             parent_block_hash_value = hash_value
 
         if self.rank != 0 and not self.is_mla:
-            self.newqrequest_hasher = RequestHasher(self._vllm_config, self.rank)
+            self.newqrequest_hasher = RequestHasher(
+                build_kv_hash_meta(self._vllm_config, self.rank)
+            )
             for i, ucm_block_id in enumerate(self.block_hashes[req_id][self.rank]):
                 self.block_hashes[req_id][self.rank][i] = str(
                     self.newqrequest_hasher(ucm_block_id)

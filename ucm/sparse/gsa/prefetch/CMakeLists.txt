@@ -24,7 +24,7 @@ set(INCLUDE_DIRS
     ${PYTORCH_PATH}/include/torch/csrc/api/include
     ${PYTORCH_PATH}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/ucm/store
+    ${UCM_ROOT_DIR}/ucm/store
 )
 
 set(LIBRARY_DIRS
@@ -39,11 +39,11 @@ set(LIBRARIES
     torch_python
     gomp
     pthread
-    storetask
+    storeintf
 )
 
 # NPU特殊配置
-if(RUNTIME_ENVIRONMENT STREQUAL "ascend")
+if(UCM_RUNTIME_ASCEND_FAMILY)
     message(STATUS "Configuring for NPU/Ascend device")
 
     # 查找torch_npu路径
@@ -61,7 +61,7 @@ if(RUNTIME_ENVIRONMENT STREQUAL "ascend")
         list(INSERT LIBRARIES 0 torch_npu)
         set(CXX11_ABI "0")
     else()
-        message(WARNING "torch_npu not found, but RUNTIME_ENVIRONMENT is set to ascend")
+        message(WARNING "torch_npu not found, but RUNTIME_ENVIRONMENT is set to ${RUNTIME_ENVIRONMENT}")
     endif()
 endif()
 
@@ -79,7 +79,15 @@ set(SOURCES
 
 # 创建pybind11模块
 pybind11_add_module(gsa_prefetch ${SOURCES})
+get_target_property(SPDLOG_INCLUDE_DIRS spdlog INTERFACE_INCLUDE_DIRECTORIES)
+if(SPDLOG_INCLUDE_DIRS)
+    target_include_directories(gsa_prefetch BEFORE PRIVATE ${SPDLOG_INCLUDE_DIRS})
+endif()
 
+get_target_property(FMT_INCLUDE_DIRS fmt INTERFACE_INCLUDE_DIRECTORIES)
+if(FMT_INCLUDE_DIRS)
+    target_include_directories(gsa_prefetch BEFORE PRIVATE ${FMT_INCLUDE_DIRS})
+endif()
 # 设置头文件目录
 target_include_directories(gsa_prefetch PRIVATE ${INCLUDE_DIRS})
 
@@ -88,22 +96,16 @@ target_link_directories(gsa_prefetch PRIVATE ${LIBRARY_DIRS})
 
 # 链接库
 target_link_libraries(gsa_prefetch PRIVATE ${LIBRARIES})
+# Link spdlog and fmt (required by logger headers included via storeintf)
+target_link_libraries(gsa_prefetch PRIVATE spdlog::spdlog fmt::fmt)
 
 # 链接OpenMP
 if(OpenMP_CXX_FOUND)
     target_link_libraries(gsa_prefetch PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
-# 设置输出路径
-set(OUTPUT_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR})
-set_target_properties(gsa_prefetch PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${OUTPUT_LIB_DIR}
-    RUNTIME_OUTPUT_DIRECTORY ${OUTPUT_LIB_DIR}
+file(RELATIVE_PATH INSTALL_REL_PATH
+     ${UCM_ROOT_DIR}
+     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-
-# 编译后输出信息
-add_custom_command(TARGET gsa_prefetch POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E echo "Built gsa_prefetch successfully for ${RUNTIME_ENVIRONMENT}"
-    COMMAND ${CMAKE_COMMAND} -E echo "CXX11_ABI=${CXX11_ABI}"
-    COMMAND ${CMAKE_COMMAND} -E echo "Output location: ${OUTPUT_LIB_DIR}"
-)
+install(TARGETS gsa_prefetch LIBRARY DESTINATION ${INSTALL_REL_PATH} COMPONENT ucm)

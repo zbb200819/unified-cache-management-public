@@ -23,24 +23,58 @@
  * */
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include "stats_monitor.h"
+#include "metrics_api.h"
 
 namespace py = pybind11;
 namespace UC::Metrics {
 
 void bind_monitor(py::module_& m)
 {
-    py::class_<StatsMonitor>(m, "StatsMonitor")
-        .def_static("get_instance", &StatsMonitor::GetInstance, py::return_value_policy::reference)
-        .def("update_stats", &StatsMonitor::UpdateStats)
-        .def("reset_all", &StatsMonitor::ResetAllStats)
-        .def("get_stats", &StatsMonitor::GetStats)
-        .def("get_stats_and_clear", &StatsMonitor::GetStatsAndClear);
+    m.def("set_up", &SetUp, py::arg("max_vector_len") = 0);
+    m.def("create_stats", &CreateStats, py::arg("name"), py::arg("type"),
+          py::arg("buckets") = std::vector<double>{});
+    m.def("update_stats", py::overload_cast<const std::string&, double>(&UpdateStats));
+    m.def("update_stats",
+          py::overload_cast<const std::unordered_map<std::string, double>&>(&UpdateStats));
+    m.def("merge_histogram_stats", [](const py::dict& values) {
+        HistogramStatsMap batch;
+        for (const auto& item : values) {
+            const auto name = py::cast<std::string>(item.first);
+            const auto pair = py::cast<py::tuple>(item.second);
+            if (pair.size() != 2) { throw py::value_error("Expected (bucket_counts, sum)"); }
+            HistogramStat histogram;
+            for (const auto count : py::cast<py::list>(pair[0])) {
+                if (!py::isinstance<py::int_>(count) || py::isinstance<py::bool_>(count)) {
+                    throw py::value_error("Bucket counts must be nonnegative uint64 integers");
+                }
+                histogram.bucketCounts.push_back(py::cast<uint64_t>(count));
+            }
+            histogram.sum = py::cast<double>(pair[1]);
+            batch.emplace(name, std::move(histogram));
+        }
+        py::gil_scoped_release releaseGil;
+        MergeHistogramStats(batch);
+    });
+    m.def("get_all_stats_and_clear", []() {
+        decltype(GetAllStatsAndClear()) stats;
+        {
+            py::gil_scoped_release releaseGil;
+            stats = GetAllStatsAndClear();
+        }
+        auto& counters = std::get<0>(stats);
+        auto& gauges = std::get<1>(stats);
+        auto& histograms = std::get<2>(stats);
+        py::dict histogramDict;
+        for (const auto& [name, histogram] : histograms) {
+            histogramDict[py::str(name)] = py::make_tuple(histogram.bucketCounts, histogram.sum);
+        }
+        return py::make_tuple(counters, gauges, histogramDict);
+    });
 }
 
-} // namespace UC::Metrics
+}  // namespace UC::Metrics
 
-PYBIND11_MODULE(ucmmonitor, module)
+PYBIND11_MODULE(ucmmetrics, module)
 {
     module.attr("project") = UCM_PROJECT_NAME;
     module.attr("version") = UCM_PROJECT_VERSION;

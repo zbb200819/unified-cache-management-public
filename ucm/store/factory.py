@@ -53,19 +53,10 @@ class UcmConnectorFactory:
         else:
             raise ValueError(f"Unsupported connector type: {connector_name}")
         assert issubclass(connector_cls, UcmKVStoreBase)
-        logger.info("Creating connector with name: %s", connector_name)
+        logger.info(f"Creating connector with name: {connector_name}")
         return connector_cls(config)
 
 
-UcmConnectorFactory.register_connector(
-    "UcmDramStore", "ucm.store.dramstore.dramstore_connector", "UcmDramStore"
-)
-UcmConnectorFactory.register_connector(
-    "UcmNfsStore", "ucm.store.nfsstore.nfsstore_connector", "UcmNfsStore"
-)
-UcmConnectorFactory.register_connector(
-    "UcmPcStore", "ucm.store.pcstore.pcstore_connector", "UcmPcStore"
-)
 UcmConnectorFactory.register_connector(
     "UcmMooncakeStore",
     "ucm.store.mooncakestore.mooncake_connector",

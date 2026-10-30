@@ -1,0 +1,251 @@
+/**
+ * MIT License
+ *
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ * */
+#include "space_layout.h"
+#include <algorithm>
+#include <cstring>
+#include <dirent.h>
+#include <fmt/ranges.h>
+#include <memory>
+#include <random>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "posix_file.h"
+#include "template/topn_heap.h"
+
+namespace UC::PosixStore {
+
+static const std::string DATA_ROOT = "data";
+static const std::string ACTIVATED_FILE_EXTENSION = ".tmp";
+
+struct MtimeComparator {
+    bool operator()(const FileInfo& lhs, const FileInfo& rhs) const
+    {
+        return lhs.mtime > rhs.mtime;
+    }
+};
+
+inline std::string DataFileName(const Detail::BlockId& blockId)
+{
+    return fmt::format("{:02x}", fmt::join(blockId, ""));
+}
+
+std::vector<std::string> GenerateHexStrings(const size_t n)
+{
+    if (n == 0) [[unlikely]] { return {}; }
+    size_t nCombinations = 1ULL << (n * 4);
+    std::vector<std::string> result;
+    result.reserve(nCombinations);
+    constexpr char hexChars[] = "0123456789abcdef";
+    for (size_t i = 0; i < nCombinations; ++i) {
+        std::string s(n, '0');
+        auto temp = i;
+        for (int j = n - 1; j >= 0; --j) {
+            s[j] = hexChars[temp & 0xF];
+            temp >>= 4;
+        }
+        result.push_back(s);
+    }
+    return result;
+}
+
+Status SpaceLayout::Setup(const Config& config)
+{
+    dataDirShardBytes_ = config.dataDirShardBytes;
+    dataDirShard_ = dataDirShardBytes_ > 0;
+    shards_ = RelativeRoots();
+    return Status::OK();
+}
+
+Status SpaceLayout::InitBackend(const std::string& backend, bool create) const
+{
+    for (const auto& root : shards_) {
+        PosixFile dir{backend + root};
+        auto status = create
+                          ? dir.MkDir()
+                          : dir.Access(PosixFile::AccessMode::READ | PosixFile::AccessMode::WRITE);
+        if (create && status == Status::DuplicateKey()) { status = Status::OK(); }
+        if (status.Failure()) { return status; }
+    }
+    return Status::OK();
+}
+
+std::string SpaceLayout::ArchivedFilePath(const std::string& backend,
+                                          const Detail::BlockId& blockId) const
+{
+    const auto& file = DataFileName(blockId);
+    const auto& shard = dataDirShard_ ? FileShardName(file) : DATA_ROOT;
+    return fmt::format("{}{}/{}", backend, shard, file);
+}
+
+std::string SpaceLayout::ActivatedFilePath(const std::string& backend,
+                                           const Detail::BlockId& blockId) const
+{
+    return ArchivedFilePath(backend, blockId) + ACTIVATED_FILE_EXTENSION;
+}
+
+Status SpaceLayout::CommitFile(const std::string& backend, const Detail::BlockId& blockId,
+                               bool success) const
+{
+    const auto& activated = ActivatedFilePath(backend, blockId);
+    auto s = Status::OK();
+    if (success) {
+        const auto& archived = ArchivedFilePath(backend, blockId);
+        s = PosixFile{activated}.Rename(archived);
+    }
+    if (!success || s.Failure()) { PosixFile{activated}.Remove(); }
+    return s;
+}
+
+Status SpaceLayout::RemoveFile(const std::string& backend, const Detail::BlockId& blockId) const
+{
+    return PosixFile{ArchivedFilePath(backend, blockId)}.Remove();
+}
+
+std::vector<std::string> SpaceLayout::RelativeRoots() const
+{
+    if (dataDirShard_) { return GenerateHexStrings(dataDirShardBytes_); }
+    return {DATA_ROOT};
+}
+
+static Detail::BlockId HexToBlockId(const char* hexStr)
+{
+    Detail::BlockId blockId;
+    for (size_t i = 0; i < 16; ++i) {
+        uint8_t high = static_cast<uint8_t>(hexStr[i * 2]);
+        uint8_t low = static_cast<uint8_t>(hexStr[i * 2 + 1]);
+        high = (high <= '9') ? (high - '0') : (high - 'a' + 10);
+        low = (low <= '9') ? (low - '0') : (low - 'a' + 10);
+        blockId[i] = static_cast<std::byte>((high << 4) | low);
+    }
+    return blockId;
+}
+
+std::vector<std::string> SpaceLayout::SampleShards(double sampleRatio) const
+{
+    if (sampleRatio == 1.0) { return shards_; }
+    auto shards = shards_;
+    size_t sampleCount =
+        std::max(static_cast<size_t>(1), static_cast<size_t>(shards.size() * sampleRatio));
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::shuffle(shards.begin(), shards.end(), gen);
+    shards.resize(sampleCount);
+    return shards;
+}
+
+size_t SpaceLayout::CountFilesInShard(const std::string& backend, const std::string& shard) const
+{
+    std::string shardPath = backend;
+    shardPath += shard;
+    DIR* dir = opendir(shardPath.c_str());
+    if (!dir) { return 0; }
+    size_t count = 0;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_name[0] == '.') { continue; }
+        if (strstr(entry->d_name, ACTIVATED_FILE_EXTENSION.c_str()) != nullptr) { continue; }
+        if (strstr(entry->d_name, ".health_probe") != nullptr) { continue; }
+        ++count;
+    }
+    closedir(dir);
+    return count;
+}
+
+static size_t ScanFilesInShard(const std::string& shardPath,
+                               TopNHeap<FileInfo, MtimeComparator>& heap)
+{
+    DIR* dir = opendir(shardPath.c_str());
+    if (!dir) { return 0; }
+    size_t totalFiles = 0;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_name[0] == '.') { continue; }
+        if (strstr(entry->d_name, ACTIVATED_FILE_EXTENSION.c_str()) != nullptr) { continue; }
+        if (strstr(entry->d_name, ".health_probe") != nullptr) { continue; }
+        std::string filePath = shardPath + "/" + entry->d_name;
+        struct stat st;
+        if (stat(filePath.c_str(), &st) != 0) { continue; }
+        if (!S_ISREG(st.st_mode)) { continue; }
+        heap.Push({HexToBlockId(entry->d_name), st.st_mtime});
+        ++totalFiles;
+    }
+    closedir(dir);
+    return totalFiles;
+}
+
+std::vector<Detail::BlockId> SpaceLayout::GetOldestFiles(const std::string& backend,
+                                                         const std::string& shard,
+                                                         double recyclePercent,
+                                                         size_t maxRecycleCount) const
+{
+    std::string shardPath = backend;
+    shardPath += shard;
+    auto heap = std::make_unique<TopNHeap<FileInfo, MtimeComparator>>(maxRecycleCount);
+    size_t totalFiles = ScanFilesInShard(shardPath, *heap);
+    if (totalFiles == 0) { return {}; }
+    size_t recycleNum = static_cast<size_t>(totalFiles * recyclePercent);
+    if (recycleNum == 0) { return {}; }
+    recycleNum = std::min(recycleNum, maxRecycleCount);
+    size_t skipCount = heap->Size() - recycleNum;
+    for (size_t i = 0; i < skipCount; ++i) { heap->Pop(); }
+    std::vector<Detail::BlockId> result;
+    result.reserve(recycleNum);
+    while (!heap->Empty()) {
+        result.push_back(heap->Top().blockId);
+        heap->Pop();
+    }
+    return result;
+}
+
+std::string SpaceLayout::ShardOf(const Detail::BlockId& blockId) const
+{
+    if (!dataDirShard_) { return DATA_ROOT; }
+    return FileShardName(DataFileName(blockId));
+}
+
+std::vector<FileInfo> SpaceLayout::GetColdestCandidates(const std::string& backend,
+                                                        const std::string& shard,
+                                                        double candidatePercent,
+                                                        size_t maxCandidateCount) const
+{
+    std::string shardPath = backend;
+    shardPath += shard;
+    auto heap = std::make_unique<TopNHeap<FileInfo, MtimeComparator>>(maxCandidateCount);
+    size_t totalFiles = ScanFilesInShard(shardPath, *heap);
+    if (totalFiles == 0) { return {}; }
+    size_t candidateNum = static_cast<size_t>(totalFiles * candidatePercent);
+    if (candidateNum == 0) { return {}; }
+    candidateNum = std::min(candidateNum, maxCandidateCount);
+    size_t skipCount = heap->Size() - std::min<size_t>(candidateNum, heap->Size());
+    for (size_t i = 0; i < skipCount; ++i) { heap->Pop(); }
+    std::vector<FileInfo> result;
+    result.reserve(heap->Size());
+    while (!heap->Empty()) {
+        result.push_back(heap->Top());
+        heap->Pop();
+    }
+    return result;
+}
+
+}  // namespace UC::PosixStore

@@ -79,5 +79,8 @@ performance.
 
 :::{toctree}
 :maxdepth: 1
-nfs_store
+pipeline_store
+ds3fs_store
+mooncake_store
+compress_store
 :::

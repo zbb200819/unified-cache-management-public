@@ -1,4 +1,6 @@
 add_subdirectory(shared)
+add_subdirectory(transport)
+add_subdirectory(integration)
 if(BUILD_UCM_STORE)
     add_subdirectory(store)
 endif()
