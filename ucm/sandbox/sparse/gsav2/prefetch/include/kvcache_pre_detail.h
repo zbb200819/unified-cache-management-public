@@ -77,7 +77,7 @@ struct UCMMergeTimeStatus {
 };
 
 // address[i] 是 task[i] 对应 shard 的起始地址，布局仍为 [K block][V block]。
-// 对象不允许复制或移动；析构时释放对应的 HostBuffer task。
+// 对象不允许复制或移动；析构时通知 owner 释放资源。
 struct UCMMergeHostAddress {
     explicit UCMMergeHostAddress(GSAPrefetchEngineC& owner) : owner(owner) {}
     ~UCMMergeHostAddress();
@@ -86,9 +86,7 @@ struct UCMMergeHostAddress {
     UCMMergeHostAddress(UCMMergeHostAddress&&) = delete;
     UCMMergeHostAddress& operator=(UCMMergeHostAddress&&) = delete;
     GSAPrefetchEngineC& owner;
-    UC::Detail::TaskHandle taskId{};
     bool hasHostTask = false;
-    std::vector<UC::Detail::HostBufferView> views;
     std::vector<const std::byte*> addresses;
 };
 
