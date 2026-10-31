@@ -135,7 +135,7 @@ def _patch(mod):
             if not hasattr(mod, _name):
                 setattr(mod, _name, _val)
     except Exception as e:
-        logger.warning(f"GSA ,la_v1 injection failed {e}")
+        logger.warning(f"GSA mla_v1 injection failed {e}")
 
     if hasattr(mod.AscendMLAImpl, "forward"):
         _patched = FunctionType(

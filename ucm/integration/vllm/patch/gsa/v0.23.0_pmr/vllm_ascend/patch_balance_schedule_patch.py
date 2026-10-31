@@ -656,5 +656,7 @@ def _patch(mod):
         _patched.__annotations__ = run_engine_core.__annotations__
         _patched.__kwdefaults__ = run_engine_core.__kwdefaults__
         patch_or_inject(mod, "run_engine_core", _patched)
+        if hasattr(mod, "EngineCoreProc"):
+            mod.EngineCoreProc.run_engine_core = _patch
         logger.info("UCM GSA run_engine_core patch applied")
 

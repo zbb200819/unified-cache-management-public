@@ -936,11 +936,13 @@ def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
     # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
     elif np.all(num_scheduled_tokens == 1):
         attn_state = AscendAttentionState.DecodeOnly
+        if self.speculative_config and self.speculative_config.method == "mtp":
+            # SpecDecoding now supports seq_len=1 and seq_len=2
+            # In Prefilling Decoding Disaggregation scenario, SpecDecoding need to supports seq_len=1
+            attn_state = AscendAttentionState.SpecDecoding
     # Speculative decoding.
     elif np.all(num_valid_tokens == 1):
         if self.speculative_config:
-            attn_state = AscendAttentionState.SpecDecoding
-        elif self.pmr_tree_config:
             attn_state = AscendAttentionState.SpecDecoding
         else:
             attn_state = AscendAttentionState.ChunkedPrefill
