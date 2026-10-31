@@ -1330,7 +1330,7 @@ def _patch(mod):
         from transformers import AutoTokenizer
 
         if not hasattr(mod, "AutoTokenizer"):
-            setattr(mode, "AutoTokenizer", AutoTokenizer)
+            setattr(mod, "AutoTokenizer", AutoTokenizer)
     except Exception as e:
         logger.warning(f"GSA scheduler AutoTokenizer injection failed {e}")
 
