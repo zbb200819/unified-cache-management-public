@@ -23,24 +23,28 @@ def init_device(self):
     init_workspace_manager(self.device, num_ubatches)
     # Init ModelRunner here, so that we have access to self.device.
     if self.use_v2_model_runner:
-        logger.warning("npu model runner v2 is in developing, some features doesn't work for now.")
-        from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
+        logger.warning(
+            "npu model runner v2 is in developing, some features doesn't work for now."
+        )
+        from vllm_ascend.worker.v2.model_runner import (
+            NPUModelRunner as NPUModelRunnerV2,
+        )
 
         self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
     else:
         self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
     if (
-        hasattr(self.vllm_config.model_config, "hf_text_config") and
-        hasattr(self.vllm_config.model_config.hf_text_config, "index_topk") and
-        has_ucm_sparse() and PTOPK_PREFETCH_ENABLE
+        hasattr(self.vllm_config.model_config, "hf_text_config")
+        and hasattr(self.vllm_config.model_config.hf_text_config, "index_topk")
+        and has_ucm_sparse()
+        and PTOPK_PREFETCH_ENABLE
     ):
         self.maybe_init_ucm_sparse_dsa(self.model_runner)
 
     if self.rank == 0:
         # If usage stat is enabled, collect relevant info.
         report_usage_stats(self.vllm_config)
-
 
 
 def execute_model(
@@ -84,14 +88,19 @@ def execute_model(
     start_time = time.perf_counter()
     output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
     if self.is_driver_worker:
-        PerfCounters.get_inst().update("--- worker.execute_model", (time.perf_counter() - start_time))
+        PerfCounters.get_inst().update(
+            "--- worker.execute_model", (time.perf_counter() - start_time)
+        )
 
     if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
         return output
 
     assert isinstance(output, IntermediateTensors)
     parallel_config = self.vllm_config.parallel_config
-    assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
+    assert (
+        parallel_config.distributed_executor_backend != ("external_launcher")
+        and not get_pp_group().is_last_rank
+    )
     # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
     # it will conflict with the all-gather operation in flashcomm1.
     if enable_sp():
@@ -109,12 +118,14 @@ def execute_model(
 
     # In case of PP with kv transfer, we need to pass through the
     # kv_connector_output
-    if not kv_connector_output.finished_sending and not kv_connector_output.finished_recving:
+    if (
+        not kv_connector_output.finished_sending
+        and not kv_connector_output.finished_recving
+    ):
         return EMPTY_MODEL_RUNNER_OUTPUT
     output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
     output.kv_connector_output = kv_connector_output
     return output
-
 
 
 def _init_worker_distributed_environment(self) -> None:
@@ -123,7 +134,11 @@ def _init_worker_distributed_environment(self) -> None:
 
     init_batch_invariance()
     init_distributed_environment(
-        self.parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"
+        self.parallel_config.world_size,
+        self.rank,
+        self.distributed_init_method,
+        self.local_rank,
+        "hccl",
     )
     ensure_model_parallel_initialized(
         self.parallel_config.tensor_parallel_size,
@@ -136,7 +151,6 @@ def _init_worker_distributed_environment(self) -> None:
     ensure_ucm_sparse_initialized(self.vllm_config)
 
 
-
 def maybe_init_ucm_sparse_dsa(self, model_runner):
     from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
 
@@ -146,24 +160,27 @@ def maybe_init_ucm_sparse_dsa(self, model_runner):
     ucm_sparse.init_dsa_data(model_runner)
 
 
-
 @when_imported("vllm_ascend.worker.worker")
 def _patch(mod):
     try:
         import os as _os
         import time as _time
+
         if not hasattr(mod, "os"):
             setattr(mod, "os", _os)
         if not hasattr(mod, "time"):
             setattr(mod, "time", _time)
     except Exception as e:
         logger.warning(f"GSA worker os/time injection failed {e}")
-        
+
     if hasattr(mod.NPUWorker, "init_device"):
         _patched = FunctionType(
-            init_device.__code__, vars(mod),
-            name=init_device.__name__, argdefs=init_device.__defaults__,
-            closure=init_device.__closure__,)
+            init_device.__code__,
+            vars(mod),
+            name=init_device.__name__,
+            argdefs=init_device.__defaults__,
+            closure=init_device.__closure__,
+        )
         _patched.__annotations__ = init_device.__annotations__
         _patched.__kwdefaults__ = init_device.__kwdefaults__
         patch_or_inject(mod.NPUWorker, "init_device", _patched)
@@ -171,9 +188,12 @@ def _patch(mod):
 
     if hasattr(mod.NPUWorker, "execute_model"):
         _patched = FunctionType(
-            execute_model.__code__, vars(mod),
-            name=execute_model.__name__, argdefs=execute_model.__defaults__,
-            closure=execute_model.__closure__,)
+            execute_model.__code__,
+            vars(mod),
+            name=execute_model.__name__,
+            argdefs=execute_model.__defaults__,
+            closure=execute_model.__closure__,
+        )
         _patched.__annotations__ = execute_model.__annotations__
         _patched.__kwdefaults__ = execute_model.__kwdefaults__
         patch_or_inject(mod.NPUWorker, "execute_model", _patched)
@@ -181,21 +201,28 @@ def _patch(mod):
 
     if hasattr(mod.NPUWorker, "_init_worker_distributed_environment"):
         _patched = FunctionType(
-            _init_worker_distributed_environment.__code__, vars(mod),
-            name=_init_worker_distributed_environment.__name__, argdefs=_init_worker_distributed_environment.__defaults__,
-            closure=_init_worker_distributed_environment.__closure__,)
+            _init_worker_distributed_environment.__code__,
+            vars(mod),
+            name=_init_worker_distributed_environment.__name__,
+            argdefs=_init_worker_distributed_environment.__defaults__,
+            closure=_init_worker_distributed_environment.__closure__,
+        )
         _patched.__annotations__ = _init_worker_distributed_environment.__annotations__
         _patched.__kwdefaults__ = _init_worker_distributed_environment.__kwdefaults__
         patch_or_inject(mod.NPUWorker, "_init_worker_distributed_environment", _patched)
-        logger.info("UCM GSA NPUWorker._init_worker_distributed_environment patch applied")
+        logger.info(
+            "UCM GSA NPUWorker._init_worker_distributed_environment patch applied"
+        )
 
     if not hasattr(mod.NPUWorker, "maybe_init_ucm_sparse_dsa"):
         _patched = FunctionType(
-            maybe_init_ucm_sparse_dsa.__code__, vars(mod),
-            name=maybe_init_ucm_sparse_dsa.__name__, argdefs=maybe_init_ucm_sparse_dsa.__defaults__,
-            closure=maybe_init_ucm_sparse_dsa.__closure__,)
+            maybe_init_ucm_sparse_dsa.__code__,
+            vars(mod),
+            name=maybe_init_ucm_sparse_dsa.__name__,
+            argdefs=maybe_init_ucm_sparse_dsa.__defaults__,
+            closure=maybe_init_ucm_sparse_dsa.__closure__,
+        )
         _patched.__annotations__ = maybe_init_ucm_sparse_dsa.__annotations__
         _patched.__kwdefaults__ = maybe_init_ucm_sparse_dsa.__kwdefaults__
         patch_or_inject(mod.NPUWorker, "maybe_init_ucm_sparse_dsa", _patched)
         logger.info("UCM GSA NPUWorker.maybe_init_ucm_sparse_dsa injected")
-

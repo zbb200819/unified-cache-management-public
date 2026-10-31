@@ -34,11 +34,9 @@ def forward(
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert output is not None, "Output tensor must be provided."
-    is_pdmix = (
-        self.vllm_config.kv_transfer_config is None or (
-            self.vllm_config.kv_transfer_config.is_kv_producer and
-            self.vllm_config.kv_transfer_config.is_kv_consumer
-        )
+    is_pdmix = self.vllm_config.kv_transfer_config is None or (
+        self.vllm_config.kv_transfer_config.is_kv_producer
+        and self.vllm_config.kv_transfer_config.is_kv_consumer
     )
     if attn_metadata is None:
         # Profiling run.
@@ -339,9 +337,10 @@ def forward(
         attn_metadata.reshape_cache_event = torch.npu.Event()
 
     if (
-        (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer) and
-        has_ucm_sparse() and PTOPK_PREFETCH_ENABLE and
-        self.layer_id < self.layer_num
+        (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
+        and has_ucm_sparse()
+        and PTOPK_PREFETCH_ENABLE
+        and self.layer_id < self.layer_num
     ):
         if self.enable_sparse_sfa_c8:
             dsa_k_cache_idx = 1
@@ -353,9 +352,22 @@ def forward(
         v_cache = kv_cache[0] if self.enable_sparse_sfa_c8 else kv_cache[1]
         vllm_indexer_cache = kv_cache[dsa_k_cache_idx] if self.has_indexer else None
         dsa_k_cache = self.dsa_k_scale if self.enable_sparse_li_c8 else None
-        vllm_dsa_cache = kv_cache[dsa_k_scale_cache_idx] if self.enable_sparse_li_c8 else None
-        _, _, _, _ = maybe_execute_sparse_attention_begin(None, k_cache, v_cache, layer_name, forward_context, indexer_cache=self.dsa_k_cache, indexer_scale=dsa_k_cache, vllm_indexer_cache=vllm_indexer_cache, vllm_indexer_scale=vllm_dsa_cache, has_indexer=self.has_indexer, use_li_c8=self.enable_sparse_li_c8)
-
+        vllm_dsa_cache = (
+            kv_cache[dsa_k_scale_cache_idx] if self.enable_sparse_li_c8 else None
+        )
+        _, _, _, _ = maybe_execute_sparse_attention_begin(
+            None,
+            k_cache,
+            v_cache,
+            layer_name,
+            forward_context,
+            indexer_cache=self.dsa_k_cache,
+            indexer_scale=dsa_k_cache,
+            vllm_indexer_cache=vllm_indexer_cache,
+            vllm_indexer_scale=vllm_dsa_cache,
+            has_indexer=self.has_indexer,
+            use_li_c8=self.enable_sparse_li_c8,
+        )
 
     if kv_cache is not None and self.has_indexer:
         assert k_li is not None
@@ -367,14 +379,18 @@ def forward(
             dsa_k_scale_cache_idx = 3
 
         if (
-            (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer) and
-            has_ucm_sparse() and PTOPK_PREFETCH_ENABLE and
-            self.layer_id < self.layer_num
+            (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
+            and has_ucm_sparse()
+            and PTOPK_PREFETCH_ENABLE
+            and self.layer_id < self.layer_num
         ):
             torch_npu.npu_scatter_nd_update_(
                 self.dsa_k_cache.view(-1, k_li.shape[-1]),
-                attn_metadata.dsa_slot_mapping[:attn_metadata.gsa_slot_len].view(-1, 1),
-                k_li.view(-1, k_li.shape[-1]))  # b, s, n, d
+                attn_metadata.dsa_slot_mapping[: attn_metadata.gsa_slot_len].view(
+                    -1, 1
+                ),
+                k_li.view(-1, k_li.shape[-1]),
+            )  # b, s, n, d
         elif get_ascend_config().c8_enable_reshape_optim:
             torch.ops._C_ascend.store_kv_block(
                 k_li,
@@ -404,18 +420,26 @@ def forward(
                     )
                 else:
                     if (
-                        (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer) and
-                        has_ucm_sparse() and PTOPK_PREFETCH_ENABLE and
-                        self.layer_id < self.layer_num
+                        (
+                            is_pdmix
+                            or not self.vllm_config.kv_transfer_config.is_kv_producer
+                        )
+                        and has_ucm_sparse()
+                        and PTOPK_PREFETCH_ENABLE
+                        and self.layer_id < self.layer_num
                     ):
                         torch_npu.npu_scatter_nd_update_(
                             self.dsa_k_scale.view(-1, k_li_scale.shape[-1]),
-                            attn_metadata.dsa_slot_mapping[:attn_metadata.gsa_slot_len].view(-1, 1),
+                            attn_metadata.dsa_slot_mapping[
+                                : attn_metadata.gsa_slot_len
+                            ].view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
                     else:
                         torch_npu.npu_scatter_nd_update_(
-                            kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
+                            kv_cache[dsa_k_scale_cache_idx].view(
+                                -1, k_li_scale.shape[-1]
+                            ),
                             slot_mapping.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
@@ -452,19 +476,39 @@ def forward(
         if self.use_index_cache:
             self._update_indexcache_topk_indices(topk_indices)
 
-
     if (
-        (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer) and
-        has_ucm_sparse() and PTOPK_PREFETCH_ENABLE and
-        self.layer_id < self.layer_num
+        (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
+        and has_ucm_sparse()
+        and PTOPK_PREFETCH_ENABLE
+        and self.layer_id < self.layer_num
     ):
         if has_prefill:
             if attn_metadata.gsa_prefetch_len > 0 and self.has_indexer:
-                attn_metadata.gsa_prefetch_topk[self.cur_topk_index][:attn_metadata.gsa_prefetch_len].copy_(topk_indices[attn_metadata.gsa_prefetch_index[:attn_metadata.gsa_prefetch_len]])
+                attn_metadata.gsa_prefetch_topk[self.cur_topk_index][
+                    : attn_metadata.gsa_prefetch_len
+                ].copy_(
+                    topk_indices[
+                        attn_metadata.gsa_prefetch_index[
+                            : attn_metadata.gsa_prefetch_len
+                        ]
+                    ]
+                )
             if attn_metadata.gsa_warmup_len > 0 and self.has_indexer:
-                attn_metadata.gsa_warmup_topk[self.cur_topk_index][:attn_metadata.gsa_warmup_len].copy_(topk_indices[attn_metadata.gsa_warmup_index[:attn_metadata.gsa_warmup_len]])
+                attn_metadata.gsa_warmup_topk[self.cur_topk_index][
+                    : attn_metadata.gsa_warmup_len
+                ].copy_(
+                    topk_indices[
+                        attn_metadata.gsa_warmup_index[: attn_metadata.gsa_warmup_len]
+                    ]
+                )
             if attn_metadata.gsa_swap_len != 0:
-                topk_indices.index_copy_(0, attn_metadata.gsa_swap_index[:attn_metadata.gsa_swap_len], attn_metadata.gsa_swap_topk[self.cur_topk_index][:attn_metadata.gsa_swap_len, :, :DEFAULT_TOPK_LEN])
+                topk_indices.index_copy_(
+                    0,
+                    attn_metadata.gsa_swap_index[: attn_metadata.gsa_swap_len],
+                    attn_metadata.gsa_swap_topk[self.cur_topk_index][
+                        : attn_metadata.gsa_swap_len, :, :DEFAULT_TOPK_LEN
+                    ],
+                )
 
             attn_output = self._execute_sparse_flash_attention_process(
                 ql_nope,
@@ -478,50 +522,102 @@ def forward(
 
             if attn_metadata.gsa_swap_len != 0:
                 attn_output_gsa = self._execute_sparse_flash_attention_process(
-                    ql_nope[attn_metadata.gsa_swap_index[:attn_metadata.gsa_swap_len]],
-                    q_pe[attn_metadata.gsa_swap_index[:attn_metadata.gsa_swap_len]],
+                    ql_nope[attn_metadata.gsa_swap_index[: attn_metadata.gsa_swap_len]],
+                    q_pe[attn_metadata.gsa_swap_index[: attn_metadata.gsa_swap_len]],
                     kv_cache,
-                    attn_metadata.gsa_swap_topk[self.cur_topk_index][:attn_metadata.gsa_swap_len],
+                    attn_metadata.gsa_swap_topk[self.cur_topk_index][
+                        : attn_metadata.gsa_swap_len
+                    ],
                     attn_metadata,
-                    attn_metadata.gsa_prefill_query[:attn_metadata.gsa_swap_len//self.num_spec_tokens],
-                    actual_seq_lengths_key[attn_metadata.select_block_index[:attn_metadata.gsa_swap_len//self.num_spec_tokens]],
-                    attn_metadata.select_block_index[:attn_metadata.gsa_swap_len//self.num_spec_tokens],
+                    attn_metadata.gsa_prefill_query[
+                        : attn_metadata.gsa_swap_len // self.num_spec_tokens
+                    ],
+                    actual_seq_lengths_key[
+                        attn_metadata.select_block_index[
+                            : attn_metadata.gsa_swap_len // self.num_spec_tokens
+                        ]
+                    ],
+                    attn_metadata.select_block_index[
+                        : attn_metadata.gsa_swap_len // self.num_spec_tokens
+                    ],
                 )
-                attn_output.index_copy_(0, attn_metadata.gsa_swap_index[:attn_metadata.gsa_swap_len], attn_output_gsa)
+                attn_output.index_copy_(
+                    0,
+                    attn_metadata.gsa_swap_index[: attn_metadata.gsa_swap_len],
+                    attn_output_gsa,
+                )
         else:
             if attn_metadata.gsa_warmup_len > 0 and self.has_indexer:
-                torch.ops._C_ascend.gsa_gather_copy(attn_metadata.gsa_warmup_topk[self.cur_topk_index][:attn_metadata.gsa_warmup_len].view(-1, DEFAULT_TOPK_LEN),
-                                    topk_indices.view(-1, DEFAULT_TOPK_LEN),
-                                    attn_metadata.gsa_warmup_index[:attn_metadata.gsa_warmup_len].view(-1, 1).expand((-1, DEFAULT_TOPK_LEN)))
+                torch.ops._C_ascend.gsa_gather_copy(
+                    attn_metadata.gsa_warmup_topk[self.cur_topk_index][
+                        : attn_metadata.gsa_warmup_len
+                    ].view(-1, DEFAULT_TOPK_LEN),
+                    topk_indices.view(-1, DEFAULT_TOPK_LEN),
+                    attn_metadata.gsa_warmup_index[: attn_metadata.gsa_warmup_len]
+                    .view(-1, 1)
+                    .expand((-1, DEFAULT_TOPK_LEN)),
+                )
             if attn_metadata.gsa_prefetch_len != 0 and self.has_indexer:
-                torch.ops._C_ascend.gsa_gather_copy(attn_metadata.gsa_prefetch_topk[self.cur_topk_index][:attn_metadata.gsa_prefetch_len].view(-1, DEFAULT_TOPK_LEN),
-                                    topk_indices.view(-1, DEFAULT_TOPK_LEN),
-                                    attn_metadata.gsa_prefetch_index[:attn_metadata.gsa_prefetch_len].view(-1, 1).expand((-1, DEFAULT_TOPK_LEN)))
+                torch.ops._C_ascend.gsa_gather_copy(
+                    attn_metadata.gsa_prefetch_topk[self.cur_topk_index][
+                        : attn_metadata.gsa_prefetch_len
+                    ].view(-1, DEFAULT_TOPK_LEN),
+                    topk_indices.view(-1, DEFAULT_TOPK_LEN),
+                    attn_metadata.gsa_prefetch_index[: attn_metadata.gsa_prefetch_len]
+                    .view(-1, 1)
+                    .expand((-1, DEFAULT_TOPK_LEN)),
+                )
             topk_indices_out = torch.ops._C_ascend.gsa_topk_expand_tmp(
                 topk_indices.view(-1, DEFAULT_TOPK_LEN),
-                attn_metadata.gsa_swap_topk[self.cur_topk_index][:attn_metadata.gsa_swap_len].view(-1, SPA_TOKENS_LEN),
-                attn_metadata.gsa_swap_index[:attn_metadata.gsa_swap_len].view(-1, 1).expand((-1, SPA_TOKENS_LEN)),
+                attn_metadata.gsa_swap_topk[self.cur_topk_index][
+                    : attn_metadata.gsa_swap_len
+                ].view(-1, SPA_TOKENS_LEN),
+                attn_metadata.gsa_swap_index[: attn_metadata.gsa_swap_len]
+                .view(-1, 1)
+                .expand((-1, SPA_TOKENS_LEN)),
                 attn_metadata.gsa_topk_win_tmp,
                 [0, SPA_TOKENS_LEN - DEFAULT_TOPK_LEN, 0, 0],
                 -1,
-                SPA_TOKENS_LEN
+                SPA_TOKENS_LEN,
             )
             attn_output = self._execute_sparse_flash_attention_process(
-                ql_nope, q_pe, kv_cache, topk_indices_out, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+                ql_nope,
+                q_pe,
+                kv_cache,
+                topk_indices_out,
+                attn_metadata,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
             )
     else:
         attn_output = self._execute_sparse_flash_attention_process(
-            ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+            ql_nope,
+            q_pe,
+            kv_cache,
+            topk_indices,
+            attn_metadata,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
         )
 
     if (
-        (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer) and
-        has_ucm_sparse() and PTOPK_PREFETCH_ENABLE and
-        self.layer_id < self.layer_num
+        (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
+        and has_ucm_sparse()
+        and PTOPK_PREFETCH_ENABLE
+        and self.layer_id < self.layer_num
     ):
         k_cache = kv_cache[0]
         v_cache = kv_cache[0] if self.enable_sparse_sfa_c8 else kv_cache[1]
-        maybe_execute_sparse_attention_finished(ql_nope, k_cache, v_cache, attn_output, layer_name, forward_context, has_indexer=self.has_indexer, use_li_c8=self.enable_sparse_li_c8)
+        maybe_execute_sparse_attention_finished(
+            ql_nope,
+            k_cache,
+            v_cache,
+            attn_output,
+            layer_name,
+            forward_context,
+            has_indexer=self.has_indexer,
+            use_li_c8=self.enable_sparse_li_c8,
+        )
 
     attn_output = self._v_up_proj(attn_output)
     weight_prefetch_method = get_weight_prefetch_method()

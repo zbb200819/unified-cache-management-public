@@ -15,7 +15,7 @@ def __init__(
     vllm_config: VllmConfig,
     device: torch.device,
 ):
-    from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE, IS_OPEN_GSA, IS_INDEXER_OFFLOAD
+    from ucm.sparse.utils import IS_INDEXER_OFFLOAD, IS_OPEN_GSA, PTOPK_PREFETCH_ENABLE
 
     self.vllm_config = vllm_config
     self.model_config = vllm_config.model_config
@@ -83,9 +83,7 @@ def __init__(
     self.mm_registry = MULTIMODAL_REGISTRY
     self.uses_mrope = model_config.uses_mrope
     self.uses_xdrope_dim = model_config.uses_xdrope_dim
-    self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
-        model_config
-    )
+    self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(model_config)
 
     if self.model_config.is_encoder_decoder:
         # Maximum length of the encoder input, only for encoder-decoder
@@ -222,9 +220,7 @@ def __init__(
             self.effective_drafter_max_model_len = draft_config.max_model_len
         else:
             self.effective_drafter_max_model_len = self.max_model_len
-    self.use_async_spec_decode = (
-        self.use_async_scheduling and self.num_spec_tokens > 0
-    )
+    self.use_async_spec_decode = self.use_async_scheduling and self.num_spec_tokens > 0
 
     # Request states.
     self.requests: dict[str, CachedRequestState] = {}
@@ -318,9 +314,7 @@ def __init__(
     self.positions = torch.zeros(
         self.max_num_tokens, dtype=torch.int64, device=self.device
     )
-    self.query_start_loc = self._make_buffer(
-        self.max_num_reqs + 1, dtype=torch.int32
-    )
+    self.query_start_loc = self._make_buffer(self.max_num_reqs + 1, dtype=torch.int32)
     self.seq_lens = torch.zeros(
         self.max_num_reqs, dtype=torch.int32, device=self.device
     )
@@ -330,15 +324,11 @@ def __init__(
     self.num_computed_tokens = torch.zeros(
         self.max_num_reqs, dtype=torch.int32, device=self.device
     )
-    self.prev_num_draft_tokens = self._make_buffer(
-        self.max_num_reqs, dtype=torch.int32
-    )
+    self.prev_num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
     self.req_indices = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
     # Maps current batch position -> previous batch position (-1 for new reqs)
     self.prev_positions = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
-    self.num_scheduled_tokens = self._make_buffer(
-        self.max_num_reqs, dtype=torch.int32
-    )
+    self.num_scheduled_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
 
     self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
     if self.dcp_world_size > 1:
@@ -352,15 +342,11 @@ def __init__(
         self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
     )
     self.is_token_ids = self._make_buffer(self.max_num_tokens, dtype=torch.bool)
-    self.discard_request_mask = self._make_buffer(
-        self.max_num_reqs, dtype=torch.bool
-    )
+    self.discard_request_mask = self._make_buffer(self.max_num_reqs, dtype=torch.bool)
     self.num_decode_draft_tokens = self._make_buffer(
         self.max_num_reqs, dtype=torch.int32
     )
-    self.num_accepted_tokens = self._make_buffer(
-        self.max_num_reqs, dtype=torch.int32
-    )
+    self.num_accepted_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
 
     ######[GSA] add attention metadata info
     if PTOPK_PREFETCH_ENABLE and IS_OPEN_GSA:
@@ -461,10 +447,7 @@ def __init__(
     self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
     self._num_valid_draft_tokens_event: torch.cuda.Event | None = None
     self._num_valid_draft_tokens_copy_stream: torch.cuda.Stream | None = None
-    if (
-        self.speculative_config is not None
-        and self.speculative_config.use_ngram_gpu()
-    ):
+    if self.speculative_config is not None and self.speculative_config.use_ngram_gpu():
         self._num_valid_draft_tokens_cpu = torch.empty(
             self.max_num_reqs, dtype=torch.int32, pin_memory=self.pin_memory
         )
@@ -530,7 +513,6 @@ def __init__(
     self.layerwise_nvtx_hooks_registered = False
 
 
-
 def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
     """Update the cached states and the persistent batch with the scheduler
     output.
@@ -548,9 +530,7 @@ def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None
         self.ucm_sparse_request_finished_in_worker(req_id)
         self.requests.pop(req_id, None)
         self.num_prompt_logprobs.pop(req_id, None)
-    self.late_interaction_runner.on_requests_finished(
-        scheduler_output.finished_req_ids
-    )
+    self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
     # Remove the finished requests from the persistent batch.
     # NOTE(woosuk): There could be an edge case where finished_req_ids and
     # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -592,8 +572,7 @@ def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None
         self.input_batch.remove_request(req_id)
 
     is_ngram_gpu = (
-        self.speculative_config is not None
-        and self.speculative_config.use_ngram_gpu()
+        self.speculative_config is not None and self.speculative_config.use_ngram_gpu()
     )
     if is_ngram_gpu:
         ngram_gpu_new_reqs: list[CachedRequestState] = []
@@ -676,10 +655,7 @@ def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None
     # Save scheduler-allocated spec lengths before trimming so
     # prev_num_draft_len keeps the optimistic count for rejection correction.
     original_num_spec_per_req: dict[str, int] = {}
-    if (
-        self.speculative_config is not None
-        and self.speculative_config.use_ngram_gpu()
-    ):
+    if self.speculative_config is not None and self.speculative_config.use_ngram_gpu():
         for req_id, toks in scheduled_spec_tokens.items():
             original_num_spec_per_req[req_id] = len(toks)
         update_scheduler_for_invalid_drafts(
@@ -739,9 +715,9 @@ def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None
                     )
 
                 if is_ngram_gpu and optimistic_num_accepted > 0:
-                    self.input_batch.num_tokens_no_spec[req_index] += (
-                        optimistic_num_accepted
-                    )
+                    self.input_batch.num_tokens_no_spec[
+                        req_index
+                    ] += optimistic_num_accepted
 
         # Update the cached states.
         req_state.num_computed_tokens = num_computed_tokens
@@ -764,9 +740,7 @@ def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None
                     # Avoid slicing list in most common case.
                     req_state.output_token_ids.append(new_token_ids[-1])
                 elif num_new_tokens > 0:
-                    req_state.output_token_ids.extend(
-                        new_token_ids[-num_new_tokens:]
-                    )
+                    req_state.output_token_ids.extend(new_token_ids[-num_new_tokens:])
         elif num_output_tokens < len(req_state.output_token_ids):
             # Some output tokens were discarded due to a sync-KV-load
             # failure, or output_token_ids was inflated by the optimistic
@@ -774,8 +748,7 @@ def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None
             del req_state.output_token_ids[num_output_tokens:]
             if req_index is not None:
                 end_idx = (
-                    self.input_batch.num_prompt_tokens[req_index]
-                    + num_output_tokens
+                    self.input_batch.num_prompt_tokens[req_index] + num_output_tokens
                 )
                 self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
@@ -898,9 +871,7 @@ def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None
                 cur_req_index = self.input_batch.req_id_to_index.get(req_id)
                 if cur_req_index is None:
                     continue
-                self.input_batch.num_computed_tokens_cpu[cur_req_index] -= (
-                    correction
-                )
+                self.input_batch.num_computed_tokens_cpu[cur_req_index] -= correction
                 if is_ngram_gpu and correction > 0:
                     self.input_batch.num_tokens_no_spec[cur_req_index] -= correction
                     self.num_tokens_no_spec_gpu[cur_req_index] -= correction
@@ -908,7 +879,6 @@ def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None
         return correct_spec_decode_token_counts
     else:
         return None
-
 
 
 def _prepare_inputs(
@@ -940,9 +910,7 @@ def _prepare_inputs(
 
     # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
     # self.query_pos.np[:10]: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-    cu_num_tokens = self._get_cumsum_and_arange(
-        num_scheduled_tokens, self.query_pos.np
-    )
+    cu_num_tokens = self._get_cumsum_and_arange(num_scheduled_tokens, self.query_pos.np)
 
     # Get positions.
     positions_np = (
@@ -964,9 +932,7 @@ def _prepare_inputs(
     # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
     # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
     # where M is the max_model_len.
-    token_indices = (
-        positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
-    )
+    token_indices = positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
     token_indices_tensor = torch.from_numpy(token_indices)
 
     # NOTE(woosuk): We use torch.index_select instead of np.take here
@@ -1134,10 +1100,16 @@ def _prepare_inputs(
     for req_id in self.input_batch.req_id_to_index:
         is_sparsed_request = req_sparsed_slots[req_id] != INVALID_SLOT
         req_index = self.input_batch.req_id_to_index[req_id]
-        offset = 0 if req_index == 0 else cu_num_tokens[req_index - 1] # TODO: support MTP
+        offset = (
+            0 if req_index == 0 else cu_num_tokens[req_index - 1]
+        )  # TODO: support MTP
         end = cu_num_tokens[req_index]
         if is_sparsed_request:
-            self.sparse_query_pos.np[offset:end] = list(range(req_sparsed_slots[req_id] - end + offset, req_sparsed_slots[req_id]))
+            self.sparse_query_pos.np[offset:end] = list(
+                range(
+                    req_sparsed_slots[req_id] - end + offset, req_sparsed_slots[req_id]
+                )
+            )
 
     self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
     self.sparse_query_pos.copy_to_gpu(total_num_scheduled_tokens)
@@ -1253,7 +1225,6 @@ def _prepare_inputs(
     )
 
 
-
 def execute_model(
     self,
     scheduler_output: "SchedulerOutput",
@@ -1271,14 +1242,9 @@ def execute_model(
     # If ngram_gpu is used, we need to copy the scheduler_output to avoid
     # the modification has influence on the scheduler_output in engine core process.
     # The replace is much faster than deepcopy.
-    if (
-        self.speculative_config is not None
-        and self.speculative_config.use_ngram_gpu()
-    ):
+    if self.speculative_config is not None and self.speculative_config.use_ngram_gpu():
         num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()
-        spec_decode_tokens_copy = (
-            scheduler_output.scheduled_spec_decode_tokens.copy()
-        )
+        spec_decode_tokens_copy = scheduler_output.scheduled_spec_decode_tokens.copy()
         scheduler_output = replace(
             scheduler_output,
             num_scheduled_tokens=num_scheduled_tokens_copy,
@@ -1308,8 +1274,7 @@ def execute_model(
 
         if not num_scheduled_tokens:
             if (
-                self.parallel_config.distributed_executor_backend
-                == "external_launcher"
+                self.parallel_config.distributed_executor_backend == "external_launcher"
                 and self.parallel_config.data_parallel_size > 1
             ):
                 # this is a corner case when both external launcher
@@ -1400,8 +1365,7 @@ def execute_model(
         # slot_mappings must use padded dimensions to match the key/value tensors.
         has_separate_kv_update = not all(
             all(
-                g.backend.forward_includes_kv_cache_update
-                for g in self.attn_groups[id]
+                g.backend.forward_includes_kv_cache_update for g in self.attn_groups[id]
             )
             for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)
             if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
@@ -1455,9 +1419,11 @@ def execute_model(
         ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-            num_tokens_padded=num_tokens_padded
-            if pad_attn or has_separate_kv_update
-            else num_tokens_unpadded,
+            num_tokens_padded=(
+                num_tokens_padded
+                if pad_attn or has_separate_kv_update
+                else num_tokens_unpadded
+            ),
             num_reqs_padded=(
                 num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
             ),
@@ -1488,9 +1454,7 @@ def execute_model(
             intermediate_tensors,
             model_kwargs,
             ec_connector_output,
-        ) = self._preprocess(
-            scheduler_output, num_tokens_padded, intermediate_tensors
-        )
+        ) = self._preprocess(scheduler_output, num_tokens_padded, intermediate_tensors)
 
     # Set cudagraph mode to none if calc_kv_scales is true.
     # KV scales calculation involves dynamic operations that are incompatible
@@ -1503,9 +1467,7 @@ def execute_model(
     # Encoder-decoder models can only compile the pure decode steps where no
     # encoder inputs are present. Use eager for the first pass.
     num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
-    has_encoder_input = (
-        self.model_config.is_encoder_decoder and num_encoder_reqs > 0
-    )
+    has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
     # Run the model.
     # Use persistent buffers for CUDA graphs.
@@ -1623,8 +1585,9 @@ def execute_model(
     return None
 
 
-
-def maybe_execute_ucm_sparse_begin(self, scheduler_output: "SchedulerOutput", attn_metadata: CommonAttentionMetadata):
+def maybe_execute_ucm_sparse_begin(
+    self, scheduler_output: "SchedulerOutput", attn_metadata: CommonAttentionMetadata
+):
     from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
 
     if not has_ucm_sparse():
@@ -1635,9 +1598,10 @@ def maybe_execute_ucm_sparse_begin(self, scheduler_output: "SchedulerOutput", at
         if callable(uc_setup_model):
             uc_setup_model(self.model)
     ucm_sparse = get_ucm_sparse()
-    ucm_sparse.build_sparse_meta(scheduler_output, self.requests, self.input_batch, attn_metadata)
+    ucm_sparse.build_sparse_meta(
+        scheduler_output, self.requests, self.input_batch, attn_metadata
+    )
     ucm_sparse.execute_begin(scheduler_output, attn_metadata)
-
 
 
 def maybe_execute_ucm_sparse_finished(self):
@@ -1649,7 +1613,6 @@ def maybe_execute_ucm_sparse_finished(self):
     ucm_sparse.execute_finished()
 
 
-
 def ucm_sparse_request_finished_in_worker(self, request_id: str | int):
     from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
 
@@ -1659,14 +1622,16 @@ def ucm_sparse_request_finished_in_worker(self, request_id: str | int):
     ucm_sparse.request_finished_in_worker(request_id)
 
 
-
 @when_imported("vllm.v1.worker.gpu_model_runner")
 def _patch(mod):
     if hasattr(mod.GPUModelRunner, "__init__"):
         _patched = FunctionType(
-            __init__.__code__, vars(mod),
-            name=__init__.__name__, argdefs=__init__.__defaults__,
-            closure=__init__.__closure__,)
+            __init__.__code__,
+            vars(mod),
+            name=__init__.__name__,
+            argdefs=__init__.__defaults__,
+            closure=__init__.__closure__,
+        )
         _patched.__annotations__ = __init__.__annotations__
         _patched.__kwdefaults__ = __init__.__kwdefaults__
         patch_or_inject(mod.GPUModelRunner, "__init__", _patched)
@@ -1674,9 +1639,12 @@ def _patch(mod):
 
     if hasattr(mod.GPUModelRunner, "_update_states"):
         _patched = FunctionType(
-            _update_states.__code__, vars(mod),
-            name=_update_states.__name__, argdefs=_update_states.__defaults__,
-            closure=_update_states.__closure__,)
+            _update_states.__code__,
+            vars(mod),
+            name=_update_states.__name__,
+            argdefs=_update_states.__defaults__,
+            closure=_update_states.__closure__,
+        )
         _patched.__annotations__ = _update_states.__annotations__
         _patched.__kwdefaults__ = _update_states.__kwdefaults__
         patch_or_inject(mod.GPUModelRunner, "_update_states", _patched)
@@ -1684,9 +1652,12 @@ def _patch(mod):
 
     if hasattr(mod.GPUModelRunner, "_prepare_inputs"):
         _patched = FunctionType(
-            _prepare_inputs.__code__, vars(mod),
-            name=_prepare_inputs.__name__, argdefs=_prepare_inputs.__defaults__,
-            closure=_prepare_inputs.__closure__,)
+            _prepare_inputs.__code__,
+            vars(mod),
+            name=_prepare_inputs.__name__,
+            argdefs=_prepare_inputs.__defaults__,
+            closure=_prepare_inputs.__closure__,
+        )
         _patched.__annotations__ = _prepare_inputs.__annotations__
         _patched.__kwdefaults__ = _prepare_inputs.__kwdefaults__
         patch_or_inject(mod.GPUModelRunner, "_prepare_inputs", _patched)
@@ -1694,9 +1665,12 @@ def _patch(mod):
 
     if hasattr(mod.GPUModelRunner, "execute_model"):
         _patched = FunctionType(
-            execute_model.__code__, vars(mod),
-            name=execute_model.__name__, argdefs=execute_model.__defaults__,
-            closure=execute_model.__closure__,)
+            execute_model.__code__,
+            vars(mod),
+            name=execute_model.__name__,
+            argdefs=execute_model.__defaults__,
+            closure=execute_model.__closure__,
+        )
         _patched.__annotations__ = execute_model.__annotations__
         _patched.__kwdefaults__ = execute_model.__kwdefaults__
         patch_or_inject(mod.GPUModelRunner, "execute_model", _patched)
@@ -1704,9 +1678,12 @@ def _patch(mod):
 
     if not hasattr(mod.GPUModelRunner, "maybe_execute_ucm_sparse_begin"):
         _patched = FunctionType(
-            maybe_execute_ucm_sparse_begin.__code__, vars(mod),
-            name=maybe_execute_ucm_sparse_begin.__name__, argdefs=maybe_execute_ucm_sparse_begin.__defaults__,
-            closure=maybe_execute_ucm_sparse_begin.__closure__,)
+            maybe_execute_ucm_sparse_begin.__code__,
+            vars(mod),
+            name=maybe_execute_ucm_sparse_begin.__name__,
+            argdefs=maybe_execute_ucm_sparse_begin.__defaults__,
+            closure=maybe_execute_ucm_sparse_begin.__closure__,
+        )
         _patched.__annotations__ = maybe_execute_ucm_sparse_begin.__annotations__
         _patched.__kwdefaults__ = maybe_execute_ucm_sparse_begin.__kwdefaults__
         patch_or_inject(mod.GPUModelRunner, "maybe_execute_ucm_sparse_begin", _patched)
@@ -1714,21 +1691,32 @@ def _patch(mod):
 
     if not hasattr(mod.GPUModelRunner, "maybe_execute_ucm_sparse_finished"):
         _patched = FunctionType(
-            maybe_execute_ucm_sparse_finished.__code__, vars(mod),
-            name=maybe_execute_ucm_sparse_finished.__name__, argdefs=maybe_execute_ucm_sparse_finished.__defaults__,
-            closure=maybe_execute_ucm_sparse_finished.__closure__,)
+            maybe_execute_ucm_sparse_finished.__code__,
+            vars(mod),
+            name=maybe_execute_ucm_sparse_finished.__name__,
+            argdefs=maybe_execute_ucm_sparse_finished.__defaults__,
+            closure=maybe_execute_ucm_sparse_finished.__closure__,
+        )
         _patched.__annotations__ = maybe_execute_ucm_sparse_finished.__annotations__
         _patched.__kwdefaults__ = maybe_execute_ucm_sparse_finished.__kwdefaults__
-        patch_or_inject(mod.GPUModelRunner, "maybe_execute_ucm_sparse_finished", _patched)
+        patch_or_inject(
+            mod.GPUModelRunner, "maybe_execute_ucm_sparse_finished", _patched
+        )
         logger.info("UCM GSA GPUModelRunner.maybe_execute_ucm_sparse_finished injected")
 
     if not hasattr(mod.GPUModelRunner, "ucm_sparse_request_finished_in_worker"):
         _patched = FunctionType(
-            ucm_sparse_request_finished_in_worker.__code__, vars(mod),
-            name=ucm_sparse_request_finished_in_worker.__name__, argdefs=ucm_sparse_request_finished_in_worker.__defaults__,
-            closure=ucm_sparse_request_finished_in_worker.__closure__,)
+            ucm_sparse_request_finished_in_worker.__code__,
+            vars(mod),
+            name=ucm_sparse_request_finished_in_worker.__name__,
+            argdefs=ucm_sparse_request_finished_in_worker.__defaults__,
+            closure=ucm_sparse_request_finished_in_worker.__closure__,
+        )
         _patched.__annotations__ = ucm_sparse_request_finished_in_worker.__annotations__
         _patched.__kwdefaults__ = ucm_sparse_request_finished_in_worker.__kwdefaults__
-        patch_or_inject(mod.GPUModelRunner, "ucm_sparse_request_finished_in_worker", _patched)
-        logger.info("UCM GSA GPUModelRunner.ucm_sparse_request_finished_in_worker injected")
-
+        patch_or_inject(
+            mod.GPUModelRunner, "ucm_sparse_request_finished_in_worker", _patched
+        )
+        logger.info(
+            "UCM GSA GPUModelRunner.ucm_sparse_request_finished_in_worker injected"
+        )

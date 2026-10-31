@@ -18,10 +18,10 @@ def __init__(
     executor_fail_callback: Callable | None = None,
     include_finished_set: bool = False,
 ):
-    from ucm.sparse.utils import IS_OPEN_GSA, rm_shared_memory
-
     # plugins need to be loaded at the engine/scheduler level too
     from vllm.plugins import load_general_plugins
+
+    from ucm.sparse.utils import IS_OPEN_GSA, rm_shared_memory
 
     load_general_plugins()
 
@@ -80,9 +80,7 @@ def __init__(
         self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
     mm_registry = MULTIMODAL_REGISTRY
-    self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(
-        vllm_config
-    )
+    self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(vllm_config)
 
     # If a KV connector is initialized for scheduler, we want to collect
     # handshake metadata from all workers so the connector in the scheduler
@@ -134,9 +132,7 @@ def __init__(
             hash_block_size, caching_hash_fn
         )
 
-    self.step_fn = (
-        self.step if self.batch_queue is None else self.step_with_batch_queue
-    )
+    self.step_fn = self.step if self.batch_queue is None else self.step_with_batch_queue
     self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
     self.aborts_queue = queue.Queue[list[str]]()
@@ -153,15 +149,17 @@ def __init__(
     enable_envs_cache()
 
 
-
 @when_imported("vllm.v1.engine.core")
 def _patch(mod):
     # Inject module-level constants needed by dump_and_spawn / long_task_sub.
     if hasattr(mod.EngineCore, "__init__"):
         _patched = FunctionType(
-            __init__.__code__, vars(mod),
-            name=__init__.__name__, argdefs=__init__.__defaults__,
-            closure=__init__.__closure__,)
+            __init__.__code__,
+            vars(mod),
+            name=__init__.__name__,
+            argdefs=__init__.__defaults__,
+            closure=__init__.__closure__,
+        )
         _patched.__annotations__ = __init__.__annotations__
         _patched.__kwdefaults__ = __init__.__kwdefaults__
         patch_or_inject(mod.EngineCore, "__init__", _patched)

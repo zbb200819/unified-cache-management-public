@@ -26,8 +26,7 @@ def _name(prefix):
 class TestSharedBlockTable:
     def test_creator_init(self):
         name = _name("sbt")
-        sbt = shm_mod.SharedBlockTable(name, is_create=True, max_bs=4,
-                                       max_block_len=8)
+        sbt = shm_mod.SharedBlockTable(name, is_create=True, max_bs=4, max_block_len=8)
         try:
             assert sbt.version == 0
             assert struct.unpack_from("<I", sbt.shm.buf, 0)[0] == 0
@@ -65,13 +64,15 @@ class TestSharedBlockTable:
 
     def test_write_read_roundtrip(self):
         name = _name("sbt")
-        writer = shm_mod.SharedBlockTable(name, is_create=True, max_bs=4,
-                                          max_block_len=8)
+        writer = shm_mod.SharedBlockTable(
+            name, is_create=True, max_bs=4, max_block_len=8
+        )
         reader = None
         try:
             writer.write_add_block([[10, 11], [], [12]])
-            reader = shm_mod.SharedBlockTable(name, is_create=False, max_bs=4,
-                                              max_block_len=8, timeout=5)
+            reader = shm_mod.SharedBlockTable(
+                name, is_create=False, max_bs=4, max_block_len=8, timeout=5
+            )
             got = reader.read_add_block([2, 0, 1])
             assert got == [[10, 11], [], [12]]
             # 连续读写：版本号同步推进，不超时
@@ -84,8 +85,9 @@ class TestSharedBlockTable:
             writer.unlink()
 
     def test_write_index_exceeds_max_bs(self):
-        sbt = shm_mod.SharedBlockTable(_name("sbt"), is_create=True, max_bs=2,
-                                       max_block_len=4)
+        sbt = shm_mod.SharedBlockTable(
+            _name("sbt"), is_create=True, max_bs=2, max_block_len=4
+        )
         try:
             with pytest.raises(IndexError):
                 sbt.write_add_block([[], [], [1]])  # index 2 >= max_bs
@@ -94,8 +96,9 @@ class TestSharedBlockTable:
             sbt.unlink()
 
     def test_write_len_exceeds_max_block_len(self):
-        sbt = shm_mod.SharedBlockTable(_name("sbt"), is_create=True, max_bs=2,
-                                       max_block_len=4)
+        sbt = shm_mod.SharedBlockTable(
+            _name("sbt"), is_create=True, max_bs=2, max_block_len=4
+        )
         try:
             with pytest.raises(ValueError):
                 sbt.write_add_block([list(range(5))])
@@ -119,19 +122,21 @@ class TestSharedBlockTable:
 
     def test_read_index_and_len_errors(self):
         name = _name("sbt")
-        writer = shm_mod.SharedBlockTable(name, is_create=True, max_bs=2,
-                                          max_block_len=4)
+        writer = shm_mod.SharedBlockTable(
+            name, is_create=True, max_bs=2, max_block_len=4
+        )
         reader = None
         try:
             writer.write_add_block([[1]])
-            reader = shm_mod.SharedBlockTable(name, is_create=False, max_bs=2,
-                                              max_block_len=4, timeout=5)
+            reader = shm_mod.SharedBlockTable(
+                name, is_create=False, max_bs=2, max_block_len=4, timeout=5
+            )
             with pytest.raises(IndexError):
                 # 非零长度 + index 2 >= max_bs（全零长度会先走 continue 分支）
                 reader.read_add_block([0, 0, 1])
             writer.write_add_block([[1]])
             with pytest.raises(ValueError):
-                reader.read_add_block([5])        # len 5 > max_block_len
+                reader.read_add_block([5])  # len 5 > max_block_len
         finally:
             if reader is not None:
                 reader.close()
@@ -227,8 +232,9 @@ class TestSharedBlockTable:
 # ---------------------------------------------------------------------------
 class TestSharedTensorManager:
     def test_creator_init_and_read(self):
-        stm = shm_mod.SharedTensorManager(_name("stm"), is_create=True,
-                                          i_num=11, k_num=22)
+        stm = shm_mod.SharedTensorManager(
+            _name("stm"), is_create=True, i_num=11, k_num=22
+        )
         try:
             assert stm.read_num() == (11, 22)
             stm.update_num(33, 44)
@@ -239,12 +245,10 @@ class TestSharedTensorManager:
 
     def test_attach_and_read(self):
         name = _name("stm")
-        writer = shm_mod.SharedTensorManager(name, is_create=True, i_num=5,
-                                             k_num=6)
+        writer = shm_mod.SharedTensorManager(name, is_create=True, i_num=5, k_num=6)
         reader = None
         try:
-            reader = shm_mod.SharedTensorManager(name, is_create=False,
-                                                 timeout=5)
+            reader = shm_mod.SharedTensorManager(name, is_create=False, timeout=5)
             assert reader.read_num() == (5, 6)
         finally:
             if reader is not None:
@@ -254,8 +258,7 @@ class TestSharedTensorManager:
 
     def test_attach_timeout(self):
         with pytest.raises(TimeoutError):
-            shm_mod.SharedTensorManager(_name("stm"), is_create=False,
-                                        timeout=0.2)
+            shm_mod.SharedTensorManager(_name("stm"), is_create=False, timeout=0.2)
 
     def test_creator_file_exists_error(self):
         name = _name("stm")
@@ -284,8 +287,7 @@ class TestSharedTensorManager:
         # 显式 unlink 销毁段；Windows 上最后句柄关闭即销毁（unlink 为 no-op），
         # 两种平台下 creator 重挂都会命中 except 分支。
         name = _name("stm")
-        stm = shm_mod.SharedTensorManager(name, is_create=True, i_num=1,
-                                          k_num=2)
+        stm = shm_mod.SharedTensorManager(name, is_create=True, i_num=1, k_num=2)
         holder = shared_memory.SharedMemory(name=name, create=False)
         stm.close()
         holder.close()
@@ -299,12 +301,10 @@ class TestSharedTensorManager:
 
     def test_unlink_non_creator_noop(self):
         name = _name("stm")
-        writer = shm_mod.SharedTensorManager(name, is_create=True, i_num=1,
-                                             k_num=2)
+        writer = shm_mod.SharedTensorManager(name, is_create=True, i_num=1, k_num=2)
         reader = None
         try:
-            reader = shm_mod.SharedTensorManager(name, is_create=False,
-                                                 timeout=5)
+            reader = shm_mod.SharedTensorManager(name, is_create=False, timeout=5)
             reader.unlink()  # 非创建者：直接返回
             assert writer.read_num() == (1, 2)  # 段仍存活
         finally:
@@ -315,8 +315,7 @@ class TestSharedTensorManager:
 
     def test_unlink_with_alive_shm(self):
         name = _name("stm")
-        stm = shm_mod.SharedTensorManager(name, is_create=True, i_num=1,
-                                          k_num=2)
+        stm = shm_mod.SharedTensorManager(name, is_create=True, i_num=1, k_num=2)
         try:
             stm.unlink()  # creator 直接销毁（未先 close）
             with pytest.raises(FileNotFoundError):
@@ -356,9 +355,7 @@ class TestSharedTensorVersion:
         stv = self._creator(tp_size=2)
         try:
             for i in range(2):
-                struct.pack_into(
-                    "<Q", stv.shm.buf, stv.elements_size * 2 + i * 8, 7
-                )
+                struct.pack_into("<Q", stv.shm.buf, stv.elements_size * 2 + i * 8, 7)
             assert stv._wait_ranks_version(7, timeout=0.2) is True
         finally:
             stv.close()
@@ -382,10 +379,8 @@ class TestSharedTensorVersion:
                 struct.pack_into("<Q", stv.shm.buf, i * 8, 1)
                 struct.pack_into("<Q", stv.shm.buf, 16 + i * 8, 5)
             stv.update_version(5)
-            assert struct.unpack_from("<Q", stv.shm.buf,
-                                      stv.version_offset)[0] == 5
-            assert struct.unpack_from("<Q", stv.shm.buf,
-                                      stv.is_done_offset)[0] == 1
+            assert struct.unpack_from("<Q", stv.shm.buf, stv.version_offset)[0] == 5
+            assert struct.unpack_from("<Q", stv.shm.buf, stv.is_done_offset)[0] == 1
         finally:
             stv.close()
             stv.unlink()
@@ -398,10 +393,8 @@ class TestSharedTensorVersion:
             for i in range(2):
                 struct.pack_into("<Q", stv.shm.buf, 16 + i * 8, 6)
             stv.update_version(6)
-            assert struct.unpack_from("<Q", stv.shm.buf,
-                                      stv.version_offset)[0] == 6
-            assert struct.unpack_from("<Q", stv.shm.buf,
-                                      stv.is_done_offset)[0] == 0
+            assert struct.unpack_from("<Q", stv.shm.buf, stv.version_offset)[0] == 6
+            assert struct.unpack_from("<Q", stv.shm.buf, stv.is_done_offset)[0] == 0
         finally:
             stv.close()
             stv.unlink()
@@ -413,18 +406,18 @@ class TestSharedTensorVersion:
         creator = self._creator(tp_size=2, name=name)
         follower = None
         try:
-            follower = shm_mod.SharedTensorVersion(name, rank=1, tp_size=2,
-                                                   is_create_version=False,
-                                                   timeout=5)
+            follower = shm_mod.SharedTensorVersion(
+                name, rank=1, tp_size=2, is_create_version=False, timeout=5
+            )
             follower.update_version(8)
-            assert struct.unpack_from("<Q", follower.shm.buf,
-                                      follower.version_offset)[0] == 0
+            assert (
+                struct.unpack_from("<Q", follower.shm.buf, follower.version_offset)[0]
+                == 0
+            )
             # follower 的正式职责：写自己的 is_done / version 槽位
             follower.update_prefetch_status(1, 8)
-            assert struct.unpack_from("<Q", follower.shm.buf,
-                                      follower.i_offset)[0] == 1
-            assert struct.unpack_from("<Q", follower.shm.buf,
-                                      follower.v_offset)[0] == 8
+            assert struct.unpack_from("<Q", follower.shm.buf, follower.i_offset)[0] == 1
+            assert struct.unpack_from("<Q", follower.shm.buf, follower.v_offset)[0] == 8
         finally:
             if follower is not None:
                 follower.close()
@@ -434,8 +427,9 @@ class TestSharedTensorVersion:
     def test_update_version_creator_wait_timeout(self, monkeypatch):
         stv = self._creator(tp_size=2)
         try:
-            monkeypatch.setattr(stv, "_wait_ranks_version",
-                                lambda version, timeout=30.0: False)
+            monkeypatch.setattr(
+                stv, "_wait_ranks_version", lambda version, timeout=30.0: False
+            )
             with pytest.raises(TimeoutError):
                 stv.update_version(9)
         finally:
@@ -448,9 +442,7 @@ class TestSharedTensorVersion:
             # 手动就绪：各 rank version 槽对齐 + is_done 槽全 1
             for i in range(stv.tp_size):
                 struct.pack_into("<Q", stv.shm.buf, i * 8, 1)
-                struct.pack_into(
-                    "<Q", stv.shm.buf, 8 * stv.tp_size + i * 8, 3
-                )
+                struct.pack_into("<Q", stv.shm.buf, 8 * stv.tp_size + i * 8, 3)
             stv.update_version(3)
             assert stv.is_version_same(3) == 1  # is_done 槽为 1
         finally:
@@ -462,8 +454,7 @@ class TestSharedTensorVersion:
         try:
             # 假时钟：起始 0s → 两次循环 0s → 之后 31s（>30s 超时）
             values = iter([0.0, 0.0, 0.0, 31.0])
-            monkeypatch.setattr(time, "time",
-                                lambda: next(values, 31.0))
+            monkeypatch.setattr(time, "time", lambda: next(values, 31.0))
             monkeypatch.setattr(time, "sleep", lambda s: None)
             assert stv.is_version_same(12345) is False  # version_offset 处为 0
         finally:
@@ -482,8 +473,9 @@ class TestSharedTensorVersion:
 
     def test_attach_timeout(self):
         with pytest.raises(TimeoutError):
-            shm_mod.SharedTensorVersion(_name("stv"), rank=1, tp_size=2,
-                                        is_create_version=False, timeout=0.2)
+            shm_mod.SharedTensorVersion(
+                _name("stv"), rank=1, tp_size=2, is_create_version=False, timeout=0.2
+            )
 
     def test_attach_retry_after_file_not_found(self, monkeypatch):
         # 第一次 attach 抛 FileNotFoundError → sleep 后重试成功
@@ -501,7 +493,8 @@ class TestSharedTensorVersion:
         monkeypatch.setattr(shm_mod.shared_memory, "SharedMemory", _flaky)
         try:
             follower = shm_mod.SharedTensorVersion(
-                name, rank=1, tp_size=2, is_create_version=False, timeout=5)
+                name, rank=1, tp_size=2, is_create_version=False, timeout=5
+            )
         finally:
             monkeypatch.undo()
             follower.close()
@@ -521,9 +514,9 @@ class TestSharedTensorVersion:
         creator = self._creator(name=name)
         follower = None
         try:
-            follower = shm_mod.SharedTensorVersion(name, rank=1, tp_size=2,
-                                                   is_create_version=False,
-                                                   timeout=5)
+            follower = shm_mod.SharedTensorVersion(
+                name, rank=1, tp_size=2, is_create_version=False, timeout=5
+            )
             follower.unlink()  # 非创建者：直接返回
             # 段仍存活：creator 仍可更新
             follower.update_prefetch_status(1, 5)
@@ -576,7 +569,10 @@ class TestSharedTensorVersion:
 class TestSharedTensorPool:
     def _pool(self, name=None):
         return shm_mod.SharedTensorPool(
-            name or _name("stp"), shape=(4,), num=2, dtype=torch.int32,
+            name or _name("stp"),
+            shape=(4,),
+            num=2,
+            dtype=torch.int32,
             create=True,
         )
 
@@ -598,11 +594,10 @@ class TestSharedTensorPool:
         writer = self._pool(name)
         reader = None
         try:
-            writer.write([torch.tensor([1, 2, 3, 4]),
-                          torch.tensor([5, 6, 7, 8])])
-            reader = shm_mod.SharedTensorPool(name, shape=(4,), num=2,
-                                              dtype=torch.int32, create=False,
-                                              timeout=5)
+            writer.write([torch.tensor([1, 2, 3, 4]), torch.tensor([5, 6, 7, 8])])
+            reader = shm_mod.SharedTensorPool(
+                name, shape=(4,), num=2, dtype=torch.int32, create=False, timeout=5
+            )
             views = reader.read()
             assert views[0].tolist() == [1, 2, 3, 4]
             assert views[1].tolist() == [5, 6, 7, 8]
@@ -623,9 +618,14 @@ class TestSharedTensorPool:
 
     def test_attach_timeout(self):
         with pytest.raises(TimeoutError):
-            shm_mod.SharedTensorPool(_name("stp"), shape=(4,), num=2,
-                                     dtype=torch.int32, create=False,
-                                     timeout=0.2)
+            shm_mod.SharedTensorPool(
+                _name("stp"),
+                shape=(4,),
+                num=2,
+                dtype=torch.int32,
+                create=False,
+                timeout=0.2,
+            )
 
     def test_creator_file_exists_error(self):
         name = _name("stp")
@@ -642,9 +642,9 @@ class TestSharedTensorPool:
         writer = self._pool(name)
         reader = None
         try:
-            reader = shm_mod.SharedTensorPool(name, shape=(4,), num=2,
-                                              dtype=torch.int32, create=False,
-                                              timeout=5)
+            reader = shm_mod.SharedTensorPool(
+                name, shape=(4,), num=2, dtype=torch.int32, create=False, timeout=5
+            )
             reader.unlink()  # 非创建者：无操作
             writer.write([torch.ones(4), torch.zeros(4)])
         finally:

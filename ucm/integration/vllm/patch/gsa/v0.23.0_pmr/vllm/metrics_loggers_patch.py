@@ -19,12 +19,9 @@ def record(
 ):
     """Log to prometheus."""
     if scheduler_stats is not None:
-        self.gauge_scheduler_running[engine_idx].set(
-            scheduler_stats.num_running_reqs
-        )
+        self.gauge_scheduler_running[engine_idx].set(scheduler_stats.num_running_reqs)
         total_waiting = (
-            scheduler_stats.num_waiting_reqs
-            + scheduler_stats.num_skipped_waiting_reqs
+            scheduler_stats.num_waiting_reqs + scheduler_stats.num_skipped_waiting_reqs
         )
         self.gauge_scheduler_waiting[engine_idx].set(total_waiting)
         self.gauge_waiting_by_reason[WAITING_REASON_CAPACITY][engine_idx].set(
@@ -63,10 +60,7 @@ def record(
         if scheduler_stats.perf_stats is not None:
             self.perf_metrics_prom.observe(scheduler_stats.perf_stats, engine_idx)
 
-        if (
-            self.kv_cache_metrics_enabled
-            and scheduler_stats.kv_cache_eviction_events
-        ):
+        if self.kv_cache_metrics_enabled and scheduler_stats.kv_cache_eviction_events:
             lifetime_hist = self.histogram_kv_block_lifetime[engine_idx]
             idle_hist = self.histogram_kv_block_idle_before_evict[engine_idx]
             reuse_hist = self.histogram_kv_block_reuse_gap[engine_idx]
@@ -101,9 +95,7 @@ def record(
         self.counter_corrupted_requests[engine_idx].inc(
             iteration_stats.num_corrupted_reqs
         )
-    self.counter_num_preempted_reqs[engine_idx].inc(
-        iteration_stats.num_preempted_reqs
-    )
+    self.counter_num_preempted_reqs[engine_idx].inc(iteration_stats.num_preempted_reqs)
     self.counter_prompt_tokens[engine_idx].inc(iteration_stats.num_prompt_tokens)
     # Labeled prompt token counters by source
     pts = iteration_stats.prompt_token_stats
@@ -133,9 +125,7 @@ def record(
         self.histogram_inter_token_latency[engine_idx].observe(itl)
 
     for finished_request in iteration_stats.finished_requests:
-        self.counter_request_success[finished_request.finish_reason][
-            engine_idx
-        ].inc()
+        self.counter_request_success[finished_request.finish_reason][engine_idx].inc()
         self.histogram_e2e_time_request[engine_idx].observe(
             finished_request.e2e_latency
         )
@@ -173,16 +163,17 @@ def record(
             )
 
 
-
 @when_imported("vllm.v1.metrics.loggers")
 def _patch(mod):
     if hasattr(mod.PrometheusStatLogger, "record"):
         _patched = FunctionType(
-            record.__code__, vars(mod),
-            name=record.__name__, argdefs=record.__defaults__,
-            closure=record.__closure__,)
+            record.__code__,
+            vars(mod),
+            name=record.__name__,
+            argdefs=record.__defaults__,
+            closure=record.__closure__,
+        )
         _patched.__annotations__ = record.__annotations__
         _patched.__kwdefaults__ = record.__kwdefaults__
         patch_or_inject(mod.PrometheusStatLogger, "record", _patched)
         logger.info("UCM GSA PrometheusStatLogger.record patch applied")
-

@@ -58,7 +58,7 @@ private:
     UC::StoreV1* mStoreV1_{nullptr};
     uint32_t mLayerNum = 78;
 
-    enum class PrefetchStatus: int32_t{
+    enum class PrefetchStatus : int32_t {
         GSA_PREFETCH_DONE = 0,
         GSA_STORE_EMPTY,
         GSA_BLOCKID_EMPTY,
@@ -80,13 +80,9 @@ public:
 
     int32_t UCMLoadSSD(const std::vector<UC::Detail::BlockId>& blockIds)
     {
-        if (mStoreV1_ == nullptr) {
-            return static_cast<int32_t>(PrefetchStatus::GSA_STORE_EMPTY);
-        }
+        if (mStoreV1_ == nullptr) { return static_cast<int32_t>(PrefetchStatus::GSA_STORE_EMPTY); }
 
-        if (blockIds.empty()) {
-            return static_cast<int32_t>(PrefetchStatus::GSA_BLOCKID_EMPTY);
-        }
+        if (blockIds.empty()) { return static_cast<int32_t>(PrefetchStatus::GSA_BLOCKID_EMPTY); }
         UC::Detail::TaskDesc task;
         task.reserve(blockIds.size() * mLayerNum);
 
@@ -96,9 +92,7 @@ public:
             }
         }
         auto loadHandle = mStoreV1_->Load(std::move(task));
-        if (!loadHandle) {
-            return static_cast<int32_t>(PrefetchStatus::GSA_HANDLE_ERROR);
-        }
+        if (!loadHandle) { return static_cast<int32_t>(PrefetchStatus::GSA_HANDLE_ERROR); }
         return static_cast<int32_t>(PrefetchStatus::GSA_PREFETCH_DONE);
     }
 
@@ -112,9 +106,7 @@ public:
         if (!lookupResult) { return {}; }
 
         auto result = lookupResult.Value();
-        if (result.size() != blockIds.size()) {
-            return {};
-        }
+        if (result.size() != blockIds.size()) { return {}; }
         return result;
     }
 };

@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import FunctionType
 
 from vllm.multimodal import MULTIMODAL_REGISTRY
+
 from ucm.integration.vllm.patch.utils import patch_or_inject, when_imported
 from ucm.logger import init_logger
 
@@ -22,8 +23,12 @@ def __init__(
     include_finished_set: bool = False,
     log_stats: bool = False,
 ) -> None:
-    from ucm.sparse.state import ensure_ucm_sparse_initialized, get_ucm_sparse, has_ucm_sparse
     from ucm.sparse.base import UcmSparseRole
+    from ucm.sparse.state import (
+        ensure_ucm_sparse_initialized,
+        get_ucm_sparse,
+        has_ucm_sparse,
+    )
     from ucm.sparse.utils import IS_OPEN_GSA
 
     self.vllm_config = vllm_config
@@ -81,14 +86,16 @@ def __init__(
         ensure_ucm_sparse_initialized(vllm_config, role=UcmSparseRole.SCHEDULER)
         if has_ucm_sparse():
             self.ucm_sparse = get_ucm_sparse()
-            logger.info("UCM Sparse initialized successfully: {}".format(self.ucm_sparse))
+            logger.info(
+                "UCM Sparse initialized successfully: {}".format(self.ucm_sparse)
+            )
 
     self.connector_prefix_cache_stats: PrefixCacheStats | None = None
     self.recompute_kv_load_failures = True
     if self.vllm_config.kv_transfer_config is not None:
-        assert not self.is_encoder_decoder, (
-            "Encoder-decoder models are not currently supported with KV connectors"
-        )
+        assert (
+            not self.is_encoder_decoder
+        ), "Encoder-decoder models are not currently supported with KV connectors"
         self.connector = KVConnectorFactory.create_connector(
             config=self.vllm_config,
             role=KVConnectorRole.SCHEDULER,
@@ -218,9 +225,7 @@ def __init__(
     # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
     # cadence (`next_decode_eligible_step`).
     self.current_step = 0
-    self.scheduler_reserve_full_isl = (
-        self.scheduler_config.scheduler_reserve_full_isl
-    )
+    self.scheduler_reserve_full_isl = self.scheduler_config.scheduler_reserve_full_isl
 
     self.has_mamba_layers = kv_cache_config.has_mamba_layers
     self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
@@ -257,10 +262,9 @@ def __init__(
     self._inflight_prefills: set[Request] = set()
 
 
-
 def schedule(self) -> SchedulerOutput:
-    from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
     from ucm.sparse.base import INVALID_SLOT
+    from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
     from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE
 
     self.current_step += 1
@@ -309,7 +313,9 @@ def schedule(self) -> SchedulerOutput:
 
         num_slots_sparsed = INVALID_SLOT
         if self.ucm_sparse:
-            num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(request, self.num_lookahead_tokens)
+            num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(
+                request, self.num_lookahead_tokens
+            )
         req_sparsed_slots.update({request.request_id: num_slots_sparsed})
 
         if (
@@ -368,9 +374,7 @@ def schedule(self) -> SchedulerOutput:
             )
 
         if self.need_mamba_block_aligned_split:
-            num_new_tokens = self._mamba_block_aligned_split(
-                request, num_new_tokens
-            )
+            num_new_tokens = self._mamba_block_aligned_split(request, num_new_tokens)
 
         if num_new_tokens == 0:
             # The request cannot be scheduled because one of the following
@@ -507,9 +511,11 @@ def schedule(self) -> SchedulerOutput:
 
             request = request_queue.peek_request()
 
-            num_slots_sparsed = INVALID_SLOT   ####  suit for skipped
+            num_slots_sparsed = INVALID_SLOT  ####  suit for skipped
             if self.ucm_sparse:
-                num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(request, self.num_lookahead_tokens)
+                num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(
+                    request, self.num_lookahead_tokens
+                )
             req_sparsed_slots.update({request.request_id: num_slots_sparsed})
 
             request_id = request.request_id
@@ -767,9 +773,7 @@ def schedule(self) -> SchedulerOutput:
 
             self.running.append(request)
             if self.log_stats:
-                request.record_event(
-                    EngineCoreEventType.SCHEDULED, scheduled_timestamp
-                )
+                request.record_event(EngineCoreEventType.SCHEDULED, scheduled_timestamp)
             if request.status == RequestStatus.WAITING:
                 scheduled_new_reqs.append(request)
             elif request.status == RequestStatus.PREEMPTED:
@@ -779,9 +783,7 @@ def schedule(self) -> SchedulerOutput:
 
             if self.lora_config and request.lora_request:
                 scheduled_loras.add(request.lora_request.lora_int_id)
-            req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
-                request_id
-            )
+            req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(request_id)
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             request.status = RequestStatus.RUNNING
@@ -887,7 +889,7 @@ def schedule(self) -> SchedulerOutput:
         # the previous and the current steps.
         finished_req_ids=self.finished_req_ids,
         free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
-        new_block_ids_to_zero=new_block_ids_to_zero
+        new_block_ids_to_zero=new_block_ids_to_zero,
     )
 
     # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -910,7 +912,6 @@ def schedule(self) -> SchedulerOutput:
     return scheduler_output
 
 
-
 def _preempt_request(self, request: Request, timestamp: float) -> None:
     """Preempt a request and put it back to the waiting queue.
 
@@ -920,11 +921,13 @@ def _preempt_request(self, request: Request, timestamp: float) -> None:
     from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
     from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE
 
-    assert request.status == RequestStatus.RUNNING, (
-        "Only running requests can be preempted"
-    )
+    assert (
+        request.status == RequestStatus.RUNNING
+    ), "Only running requests can be preempted"
     if has_ucm_sparse() and PTOPK_PREFETCH_ENABLE:
-        get_ucm_sparse().update_scheduler_free_slot(-1 * len(request._all_token_ids) // self.cache_config.block_size)
+        get_ucm_sparse().update_scheduler_free_slot(
+            -1 * len(request._all_token_ids) // self.cache_config.block_size
+        )
     self.kv_cache_manager.free(request)
     self.encoder_cache_manager.free(request)
     self._inflight_prefills.discard(request)
@@ -938,7 +941,6 @@ def _preempt_request(self, request: Request, timestamp: float) -> None:
 
     # Put the request back to the waiting queue.
     self.waiting.prepend_request(request)
-
 
 
 def update_from_output(
@@ -1022,12 +1024,10 @@ def update_from_output(
             continue
 
         req_index = model_runner_output.req_id_to_index[req_id]
-        generated_token_ids = (
-            sampled_token_ids[req_index] if sampled_token_ids else []
-        )
+        generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
 
-        scheduled_spec_token_ids = (
-            scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+        scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(
+            req_id
         )
         if scheduled_spec_token_ids and generated_token_ids:
             num_draft_tokens = len(scheduled_spec_token_ids)
@@ -1106,12 +1106,9 @@ def update_from_output(
                 # schedule time (immune to async preemption).
                 if (
                     request.sampling_params is not None
-                    and request.sampling_params.routed_experts_prompt_start
-                    is not None
+                    and request.sampling_params.routed_experts_prompt_start is not None
                 ):
-                    prompt_start = (
-                        request.sampling_params.routed_experts_prompt_start
-                    )
+                    prompt_start = request.sampling_params.routed_experts_prompt_start
                     assert prompt_start < request.num_prompt_tokens
                 else:
                     prompt_start = 0
@@ -1158,12 +1155,7 @@ def update_from_output(
 
         # Get prompt logprobs for this request.
         prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-        if (
-            new_token_ids
-            or pooler_output is not None
-            or kv_transfer_params
-            or stopped
-        ):
+        if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
             # Add EngineCoreOutput for this Request.
             outputs[request.client_index].append(
                 EngineCoreOutput(
@@ -1264,7 +1256,6 @@ def update_from_output(
     return engine_core_outputs
 
 
-
 def add_request(self, request: Request) -> None:
     existing = self.requests.get(request.request_id)
 
@@ -1294,16 +1285,27 @@ def add_request(self, request: Request) -> None:
             request.record_event(EngineCoreEventType.QUEUED)
 
 
-
 def _free_request(
     self, request: Request, delay_free_blocks: bool = False
 ) -> dict[str, Any] | None:
     assert request.is_finished()
 
-    print("------------------------------------------------------------------------------------------------", flush=True)
-    print(f"[GSA] out tokens for req_id {request.request_id} and prompt len {len(request.prompt_token_ids)} out_put len {len(request._output_token_ids)}", flush=True)
-    print(f"{self.tokenizer.decode(request._output_token_ids, skip_special_tokens=False)}", flush=True)
-    print("------------------------------------------------------------------------------------------------", flush=True)
+    print(
+        "------------------------------------------------------------------------------------------------",
+        flush=True,
+    )
+    print(
+        f"[GSA] out tokens for req_id {request.request_id} and prompt len {len(request.prompt_token_ids)} out_put len {len(request._output_token_ids)}",
+        flush=True,
+    )
+    print(
+        f"{self.tokenizer.decode(request._output_token_ids, skip_special_tokens=False)}",
+        flush=True,
+    )
+    print(
+        "------------------------------------------------------------------------------------------------",
+        flush=True,
+    )
     if self.ucm_sparse:
         self.ucm_sparse.request_finished_in_scheduler(request.request_id)
 
@@ -1322,11 +1324,11 @@ def _free_request(
     return kv_xfer_params
 
 
-
 @when_imported("vllm.v1.core.sched.scheduler")
 def _patch(mod):
     try:
         from transformers import AutoTokenizer
+
         if not hasattr(mod, "AutoTokenizer"):
             setattr(mode, "AutoTokenizer", AutoTokenizer)
     except Exception as e:
@@ -1334,9 +1336,12 @@ def _patch(mod):
 
     if hasattr(mod.Scheduler, "__init__"):
         _patched = FunctionType(
-            __init__.__code__, vars(mod),
-            name=__init__.__name__, argdefs=__init__.__defaults__,
-            closure=__init__.__closure__,)
+            __init__.__code__,
+            vars(mod),
+            name=__init__.__name__,
+            argdefs=__init__.__defaults__,
+            closure=__init__.__closure__,
+        )
         _patched.__annotations__ = __init__.__annotations__
         _patched.__kwdefaults__ = __init__.__kwdefaults__
         patch_or_inject(mod.Scheduler, "__init__", _patched)
@@ -1344,9 +1349,12 @@ def _patch(mod):
 
     if hasattr(mod.Scheduler, "schedule"):
         _patched = FunctionType(
-            schedule.__code__, vars(mod),
-            name=schedule.__name__, argdefs=schedule.__defaults__,
-            closure=schedule.__closure__,)
+            schedule.__code__,
+            vars(mod),
+            name=schedule.__name__,
+            argdefs=schedule.__defaults__,
+            closure=schedule.__closure__,
+        )
         _patched.__annotations__ = schedule.__annotations__
         _patched.__kwdefaults__ = schedule.__kwdefaults__
         patch_or_inject(mod.Scheduler, "schedule", _patched)
@@ -1354,9 +1362,12 @@ def _patch(mod):
 
     if hasattr(mod.Scheduler, "_preempt_request"):
         _patched = FunctionType(
-            _preempt_request.__code__, vars(mod),
-            name=_preempt_request.__name__, argdefs=_preempt_request.__defaults__,
-            closure=_preempt_request.__closure__,)
+            _preempt_request.__code__,
+            vars(mod),
+            name=_preempt_request.__name__,
+            argdefs=_preempt_request.__defaults__,
+            closure=_preempt_request.__closure__,
+        )
         _patched.__annotations__ = _preempt_request.__annotations__
         _patched.__kwdefaults__ = _preempt_request.__kwdefaults__
         patch_or_inject(mod.Scheduler, "_preempt_request", _patched)
@@ -1364,9 +1375,12 @@ def _patch(mod):
 
     if hasattr(mod.Scheduler, "update_from_output"):
         _patched = FunctionType(
-            update_from_output.__code__, vars(mod),
-            name=update_from_output.__name__, argdefs=update_from_output.__defaults__,
-            closure=update_from_output.__closure__,)
+            update_from_output.__code__,
+            vars(mod),
+            name=update_from_output.__name__,
+            argdefs=update_from_output.__defaults__,
+            closure=update_from_output.__closure__,
+        )
         _patched.__annotations__ = update_from_output.__annotations__
         _patched.__kwdefaults__ = update_from_output.__kwdefaults__
         patch_or_inject(mod.Scheduler, "update_from_output", _patched)
@@ -1374,9 +1388,12 @@ def _patch(mod):
 
     if hasattr(mod.Scheduler, "add_request"):
         _patched = FunctionType(
-            add_request.__code__, vars(mod),
-            name=add_request.__name__, argdefs=add_request.__defaults__,
-            closure=add_request.__closure__,)
+            add_request.__code__,
+            vars(mod),
+            name=add_request.__name__,
+            argdefs=add_request.__defaults__,
+            closure=add_request.__closure__,
+        )
         _patched.__annotations__ = add_request.__annotations__
         _patched.__kwdefaults__ = add_request.__kwdefaults__
         patch_or_inject(mod.Scheduler, "add_request", _patched)
@@ -1384,11 +1401,13 @@ def _patch(mod):
 
     if hasattr(mod.Scheduler, "_free_request"):
         _patched = FunctionType(
-            _free_request.__code__, vars(mod),
-            name=_free_request.__name__, argdefs=_free_request.__defaults__,
-            closure=_free_request.__closure__,)
+            _free_request.__code__,
+            vars(mod),
+            name=_free_request.__name__,
+            argdefs=_free_request.__defaults__,
+            closure=_free_request.__closure__,
+        )
         _patched.__annotations__ = _free_request.__annotations__
         _patched.__kwdefaults__ = _free_request.__kwdefaults__
         patch_or_inject(mod.Scheduler, "_free_request", _patched)
         logger.info("UCM GSA Scheduler._free_request patch applied")
-

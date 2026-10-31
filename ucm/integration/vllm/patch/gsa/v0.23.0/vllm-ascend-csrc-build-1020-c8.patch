@@ -187,7 +187,7 @@ index 0f9c80ac3..805c00065 100644
 +    TORCH_CHECK(swap_index.dim() == 2, "swap_index must be 2D");
 +
 +    TORCH_CHECK(topk_indices.size(1) == prefetch_topk.size(1), "the second dimension of topk_indices and prefetch_topk must be equal");
-+    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must small than expand_len");
 +    constexpr int32_t SIZE = 8;
 +    constexpr int32_t DIM_0 = 0;
 +    constexpr int32_t DIM_1 = 1;
@@ -246,7 +246,7 @@ index 0f9c80ac3..805c00065 100644
 +    TORCH_CHECK(swap_index.dim() == 2, "swap_index must be 2D");
 +
 +    TORCH_CHECK(topk_indices.size(1) == prefetch_topk.size(1), "the second dimension of topk_indices and prefetch_topk must be equal");
-+    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must small than expand_len");
 +    constexpr int32_t SIZE = 8;
 +    constexpr int32_t DIM_0 = 0;
 +    constexpr int32_t DIM_1 = 1;
@@ -297,7 +297,7 @@ index 0f9c80ac3..805c00065 100644
 +    TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be 2D");
 +    TORCH_CHECK(swap_topk.dim() == 2, "swap_topk must be 2D");
 +    TORCH_CHECK(swap_index.dim() == 2, "swap_index must be 2D");
-+    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must small than expand_len");
 +    constexpr int32_t SIZE = 8;
 +    constexpr int32_t DIM_0 = 0;
 +    constexpr int32_t DIM_1 = 1;
@@ -345,7 +345,7 @@ index 0f9c80ac3..805c00065 100644
 +    TORCH_CHECK(tmp_tensor.is_contiguous(), "tmp_tensor must be contiguous");
 +    TORCH_CHECK(tmp_tensor.dtype() == topk_indices.dtype(), "tmp_tensor dtype must match topk_indices");
 +
-+    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must small than expand_len");
 +    TORCH_CHECK(tmp_tensor.size(0) >= topk_indices.size(0) + 2, "tmp_tensor rows must be no less than topk_indices rows + 2");
 +    TORCH_CHECK(tmp_tensor.size(1) == expand_len, "tmp_tensor cols must equal expand_len");
 +
@@ -614,7 +614,7 @@ index bfd579307..3df99096f 100644
 +    TORCH_CHECK(swap_index.dim() == 2, "swap_index must be 2D");
 +
 +    TORCH_CHECK(topk_indices.size(1) == prefetch_topk.size(1), "the second dimension of topk_indices and prefetch_topk must be equal");
-+    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must small than expand_len");
 +    constexpr int32_t SIZE = 8;
 +    constexpr int32_t DIM_0 = 0;
 +    constexpr int32_t DIM_1 = 1;
@@ -637,7 +637,7 @@ index bfd579307..3df99096f 100644
 +    TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be 2D");
 +    TORCH_CHECK(swap_topk.dim() == 2, "swap_topk must be 2D");
 +    TORCH_CHECK(swap_index.dim() == 2, "swap_index must be 2D");
-+    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must small than expand_len");
 +    constexpr int32_t SIZE = 8;
 +    constexpr int32_t DIM_0 = 0;
 +    constexpr int32_t DIM_1 = 1;
@@ -666,7 +666,7 @@ index bfd579307..3df99096f 100644
 +    TORCH_CHECK(tmp_tensor.is_contiguous(), "tmp_tensor must be contiguous");
 +    TORCH_CHECK(tmp_tensor.dtype() == topk_indices.dtype(), "tmp_tensor dtype must match topk_indices");
 +
-+    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must small than expand_len");
 +    TORCH_CHECK(tmp_tensor.size(0) >= topk_indices.size(0) + 2, "tmp_tensor rows must be no less than topk_indices rows + 2");
 +    TORCH_CHECK(tmp_tensor.size(1) == expand_len, "tmp_tensor cols must equal expand_len");
 +    constexpr int32_t SIZE = 8;

@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import FunctionType
 
 from vllm.v1.attention.backend import AttentionType
+
 from ucm.integration.vllm.patch.utils import patch_or_inject, when_imported
 from ucm.logger import init_logger
 
@@ -52,8 +53,9 @@ def unified_attention_with_output(
     )
 
     if not self.use_mla:
-        maybe_execute_sparse_attention_finished(query, key, value, output, layer_name, forward_context)
-
+        maybe_execute_sparse_attention_finished(
+            query, key, value, output, layer_name, forward_context
+        )
 
 
 def __init__(
@@ -114,8 +116,7 @@ def __init__(
 
     # Check if per-head quant scales are required based on kv_cache_scheme
     use_per_head_quant_scales = (
-        kv_cache_scheme is not None
-        and kv_cache_scheme.get("strategy") == "attn_head"
+        kv_cache_scheme is not None and kv_cache_scheme.get("strategy") == "attn_head"
     )
     self.use_mla = vllm_config.model_config.use_mla
 
@@ -151,9 +152,9 @@ def __init__(
     self.calculate_kv_scales = calculate_kv_scales
     if num_kv_heads is None:
         num_kv_heads = num_heads
-    assert num_heads % num_kv_heads == 0, (
-        f"num_heads ({num_heads}) is not divisible by num_kv_heads ({num_kv_heads})"
-    )
+    assert (
+        num_heads % num_kv_heads == 0
+    ), f"num_heads ({num_heads}) is not divisible by num_kv_heads ({num_kv_heads})"
     self.quant_config = quant_config
     self.layer_name = prefix
 
@@ -289,9 +290,7 @@ def __init__(
     self.query_quant = None
     if (
         self.impl.supports_quant_query_input
-        and (
-            self.kv_cache_dtype.startswith("fp8") or self.kv_cache_dtype == "nvfp4"
-        )
+        and (self.kv_cache_dtype.startswith("fp8") or self.kv_cache_dtype == "nvfp4")
         and not self.kv_cache_dtype.endswith("per_token_head")
     ):
         is_per_head = (
@@ -300,30 +299,29 @@ def __init__(
         block_size = self.head_size * self.num_heads // self.num_kv_heads
         self.query_quant = QuantFP8(
             static=True,
-            group_shape=GroupShape(-1, block_size)
-            if is_per_head
-            else GroupShape.PER_TENSOR,
+            group_shape=(
+                GroupShape(-1, block_size) if is_per_head else GroupShape.PER_TENSOR
+            ),
         )
 
 
-
 def maybe_execute_sparse_attention_begin(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        layer_name: str,
-        forward_context: ForwardContext,
-        output: Optional[torch.Tensor] = None,
-        indexer_cache: Optional[torch.Tensor] = None,
-        indexer_scale: Optional[torch.Tensor] = None,
-        vllm_indexer_cache: Optional[torch.Tensor] = None,
-        vllm_indexer_scale: Optional[torch.Tensor] = None,
-        phase: Optional[str] = None,
-        k_hash: Optional[torch.Tensor] = None,
-        decode_ql_nope: Optional[torch.Tensor] = None,
-        decode_q_pe: Optional[torch.Tensor] = None,
-        has_indexer: Optional[bool] = True,
-        use_li_c8: Optional[bool] = False,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: str,
+    forward_context: ForwardContext,
+    output: Optional[torch.Tensor] = None,
+    indexer_cache: Optional[torch.Tensor] = None,
+    indexer_scale: Optional[torch.Tensor] = None,
+    vllm_indexer_cache: Optional[torch.Tensor] = None,
+    vllm_indexer_scale: Optional[torch.Tensor] = None,
+    phase: Optional[str] = None,
+    k_hash: Optional[torch.Tensor] = None,
+    decode_ql_nope: Optional[torch.Tensor] = None,
+    decode_q_pe: Optional[torch.Tensor] = None,
+    has_indexer: Optional[bool] = True,
+    use_li_c8: Optional[bool] = False,
 ):
     from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
 
@@ -337,21 +335,35 @@ def maybe_execute_sparse_attention_begin(
         return query, key, value, output
 
     return ucm_sparse.attention_begin(
-        query, key, value, layer_name, forward_context, indexer_cache, indexer_scale, vllm_indexer_cache, vllm_indexer_scale, output, phase, k_hash,decode_ql_nope, decode_q_pe, has_indexer, use_li_c8
+        query,
+        key,
+        value,
+        layer_name,
+        forward_context,
+        indexer_cache,
+        indexer_scale,
+        vllm_indexer_cache,
+        vllm_indexer_scale,
+        output,
+        phase,
+        k_hash,
+        decode_ql_nope,
+        decode_q_pe,
+        has_indexer,
+        use_li_c8,
     )
 
 
-
 def maybe_execute_sparse_attention_finished(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_output: torch.Tensor,
-        layer_name: str,
-        forward_context: ForwardContext,
-        phase: Optional[str] = None,
-        has_indexer: Optional[bool] = True,
-        use_li_c8: Optional[bool] = False,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_output: torch.Tensor,
+    layer_name: str,
+    forward_context: ForwardContext,
+    phase: Optional[str] = None,
+    has_indexer: Optional[bool] = True,
+    use_li_c8: Optional[bool] = False,
 ):
     from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
 
@@ -364,14 +376,24 @@ def maybe_execute_sparse_attention_finished(
     if attn_metadata is None:
         return
 
-    ucm_sparse.attention_finished(query, key, value, attn_output, layer_name, forward_context, phase, has_indexer, use_li_c8)
-
+    ucm_sparse.attention_finished(
+        query,
+        key,
+        value,
+        attn_output,
+        layer_name,
+        forward_context,
+        phase,
+        has_indexer,
+        use_li_c8,
+    )
 
 
 @when_imported("vllm.model_executor.layers.attention.attention")
 def _patch(mod):
     try:
         import os as _os
+
         if not hasattr(mod, "os"):
             setattr(mod, "os", _os)
     except Exception as e:
@@ -379,9 +401,12 @@ def _patch(mod):
 
     if hasattr(mod, "unified_attention_with_output"):
         _patched = FunctionType(
-            unified_attention_with_output.__code__, vars(mod),
-            name=unified_attention_with_output.__name__, argdefs=unified_attention_with_output.__defaults__,
-            closure=unified_attention_with_output.__closure__,)
+            unified_attention_with_output.__code__,
+            vars(mod),
+            name=unified_attention_with_output.__name__,
+            argdefs=unified_attention_with_output.__defaults__,
+            closure=unified_attention_with_output.__closure__,
+        )
         _patched.__annotations__ = unified_attention_with_output.__annotations__
         _patched.__kwdefaults__ = unified_attention_with_output.__kwdefaults__
         patch_or_inject(mod, "unified_attention_with_output", _patched)
@@ -389,9 +414,12 @@ def _patch(mod):
 
     if hasattr(mod.Attention, "__init__"):
         _patched = FunctionType(
-            __init__.__code__, vars(mod),
-            name=__init__.__name__, argdefs=__init__.__defaults__,
-            closure=__init__.__closure__,)
+            __init__.__code__,
+            vars(mod),
+            name=__init__.__name__,
+            argdefs=__init__.__defaults__,
+            closure=__init__.__closure__,
+        )
         _patched.__annotations__ = __init__.__annotations__
         _patched.__kwdefaults__ = __init__.__kwdefaults__
         patch_or_inject(mod.Attention, "__init__", _patched)
@@ -399,9 +427,12 @@ def _patch(mod):
 
     if not hasattr(mod, "maybe_execute_sparse_attention_begin"):
         _patched = FunctionType(
-            maybe_execute_sparse_attention_begin.__code__, vars(mod),
-            name=maybe_execute_sparse_attention_begin.__name__, argdefs=maybe_execute_sparse_attention_begin.__defaults__,
-            closure=maybe_execute_sparse_attention_begin.__closure__,)
+            maybe_execute_sparse_attention_begin.__code__,
+            vars(mod),
+            name=maybe_execute_sparse_attention_begin.__name__,
+            argdefs=maybe_execute_sparse_attention_begin.__defaults__,
+            closure=maybe_execute_sparse_attention_begin.__closure__,
+        )
         _patched.__annotations__ = maybe_execute_sparse_attention_begin.__annotations__
         _patched.__kwdefaults__ = maybe_execute_sparse_attention_begin.__kwdefaults__
         mod.maybe_execute_sparse_attention_begin = _patched
@@ -409,11 +440,15 @@ def _patch(mod):
 
     if not hasattr(mod, "maybe_execute_sparse_attention_finished"):
         _patched = FunctionType(
-            maybe_execute_sparse_attention_finished.__code__, vars(mod),
-            name=maybe_execute_sparse_attention_finished.__name__, argdefs=maybe_execute_sparse_attention_finished.__defaults__,
-            closure=maybe_execute_sparse_attention_finished.__closure__,)
-        _patched.__annotations__ = maybe_execute_sparse_attention_finished.__annotations__
+            maybe_execute_sparse_attention_finished.__code__,
+            vars(mod),
+            name=maybe_execute_sparse_attention_finished.__name__,
+            argdefs=maybe_execute_sparse_attention_finished.__defaults__,
+            closure=maybe_execute_sparse_attention_finished.__closure__,
+        )
+        _patched.__annotations__ = (
+            maybe_execute_sparse_attention_finished.__annotations__
+        )
         _patched.__kwdefaults__ = maybe_execute_sparse_attention_finished.__kwdefaults__
         mod.maybe_execute_sparse_attention_finished = _patched
         logger.info("UCM GSA maybe_execute_sparse_attention_finished injected")
-

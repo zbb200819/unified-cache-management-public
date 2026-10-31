@@ -54,7 +54,9 @@ def _build(
         local_end = min(local_end_with_pad, num_actual_tokens)
 
         pad_size = num_tokens_pad - cos.shape[0]
-        assert cos.shape == sin.shape, f"cos.shape must be equal to sin.shape, got {cos.shape} and {sin.shape}"
+        assert (
+            cos.shape == sin.shape
+        ), f"cos.shape must be equal to sin.shape, got {cos.shape} and {sin.shape}"
 
         if pad_size > 0:
             cos = nn.functional.pad(cos, (0, 0, 0, 0, 0, 0, 0, pad_size))
@@ -70,25 +72,27 @@ def _build(
         cos = cos[local_start:local_end_with_pad]
         sin = sin[local_start:local_end_with_pad]
 
-        assert cos.shape[0] == num_tokens_per_device, (
-            f"cos.shape[0] must be equal to num_tokens_per_device, \
+        assert (
+            cos.shape[0] == num_tokens_per_device
+        ), f"cos.shape[0] must be equal to num_tokens_per_device, \
                 got {cos.shape[0]} and {num_tokens_per_device}"
-        )
-        assert slot_mapping_cp.shape[0] == num_tokens_per_device, (
-            f"slot_mapping_cp.shape[0] must be equal to num_tokens_per_device, \
+        assert (
+            slot_mapping_cp.shape[0] == num_tokens_per_device
+        ), f"slot_mapping_cp.shape[0] must be equal to num_tokens_per_device, \
                 got {slot_mapping_cp.shape[0]} and {num_tokens_per_device}"
-        )
-        assert slot_mapping.shape[0] == num_tokens_pad, (
-            f"slot_mapping.shape[0] must be equal to num_tokens_pad, \
+        assert (
+            slot_mapping.shape[0] == num_tokens_pad
+        ), f"slot_mapping.shape[0] must be equal to num_tokens_pad, \
                 got {slot_mapping.shape[0]} and {num_tokens_pad}"
-        )
 
         if draft_index is not None:
             assert self.spec_actual_seq_lengths_query is not None
             assert self.spec_actual_seq_lengths_key is not None
             # Per-draft-step buffers: independent, graph-stable storage so
             # later draft steps don't clobber earlier ones' metadata.
-            actual_seq_lengths_query = self.spec_actual_seq_lengths_query[draft_index - 1]
+            actual_seq_lengths_query = self.spec_actual_seq_lengths_query[
+                draft_index - 1
+            ]
             actual_seq_lengths_key = self.spec_actual_seq_lengths_key[draft_index - 1]
         else:
             actual_seq_lengths_query = self.actual_seq_lengths_query
@@ -172,7 +176,9 @@ def _build(
         seq_lens_cpu=seq_lens_cpu,
         slot_mapping=slot_mapping,
         head_dim=self.model_config.get_head_size(),
-        attn_mask=self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config),
+        attn_mask=self.attn_mask_builder.get_attention_mask(
+            common_attn_metadata.causal, self.model_config
+        ),
         attn_state=common_attn_metadata.attn_state,
         block_table=block_table,
         sin=sin[:num_input_tokens],
@@ -183,7 +189,6 @@ def _build(
         group_key_idx=actual_group_key_idx,
         group_key_cache_idx=actual_group_key_cache_idx,
     )
-
 
 
 def __init__(
@@ -201,7 +206,11 @@ def __init__(
     **kwargs,
 ) -> None:
     from ucm.sparse.state import has_ucm_sparse
-    from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE, init_indexer_layer_map, MAX_INDEXER_BLOCK_NUM
+    from ucm.sparse.utils import (
+        MAX_INDEXER_BLOCK_NUM,
+        PTOPK_PREFETCH_ENABLE,
+        init_indexer_layer_map,
+    )
 
     self.num_heads = num_heads
     self.head_size = head_size
@@ -238,8 +247,12 @@ def __init__(
     ascend_config = get_ascend_config()
     self.vllm_config = get_current_vllm_config()
     kv_transfer_config = self.vllm_config.kv_transfer_config
-    self.is_kv_producer = kv_transfer_config is not None and kv_transfer_config.is_kv_producer
-    self.is_kv_consumer = kv_transfer_config is not None and kv_transfer_config.is_kv_consumer
+    self.is_kv_producer = (
+        kv_transfer_config is not None and kv_transfer_config.is_kv_producer
+    )
+    self.is_kv_consumer = (
+        kv_transfer_config is not None and kv_transfer_config.is_kv_consumer
+    )
 
     self.sfa_qsfa_tile_size = SFA_QSFA_TILE_SIZE
     self.sfa_qsfa_packed_kv_head_dim = 0
@@ -249,17 +262,15 @@ def __init__(
     self.local_num_heads = self.num_heads
 
     self.num_spec_tokens = 1
-    speculative_config =self.vllm_config.speculative_config
+    speculative_config = self.vllm_config.speculative_config
     if speculative_config:
         self.num_spec_tokens += speculative_config.num_speculative_tokens
     self.layer_num = self.vllm_config.model_config.get_num_layers(
         self.vllm_config.parallel_config
     )
-    self.is_pdmix = (
-        self.vllm_config.kv_transfer_config is None or (
-            self.vllm_config.kv_transfer_config.is_kv_producer and
-            self.vllm_config.kv_transfer_config.is_kv_consumer
-        )
+    self.is_pdmix = self.vllm_config.kv_transfer_config is None or (
+        self.vllm_config.kv_transfer_config.is_kv_producer
+        and self.vllm_config.kv_transfer_config.is_kv_consumer
     )
     self.layer_name = kwargs.get("layer_name")
     hf_config = self.vllm_config.model_config.hf_config
@@ -308,7 +319,9 @@ def __init__(
     # The user-facing switches control these layouts independently, and
     # layers without an indexer only apply the SFA setting.
     self.enable_sparse_sfa_c8 = ascend_config.enable_sparse_sfa_c8
-    self.enable_sparse_li_c8 = self.has_indexer and ascend_config.is_sparse_li_c8_layer(self.layer_name)
+    self.enable_sparse_li_c8 = self.has_indexer and ascend_config.is_sparse_li_c8_layer(
+        self.layer_name
+    )
     if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
         if get_ascend_device_type() == AscendDeviceType.A5:
             self.c8_k_cache_dtype = torch.float8_e4m3fn
@@ -340,7 +353,11 @@ def __init__(
         and get_ascend_device_type() != AscendDeviceType.A5
     )
     self.enable_mlapo = ascend_config.enable_mlapo and not (
-        self.enable_sfa_prolog_v3 or (self.enable_sparse_sfa_c8 and get_ascend_device_type() != AscendDeviceType.A5)
+        self.enable_sfa_prolog_v3
+        or (
+            self.enable_sparse_sfa_c8
+            and get_ascend_device_type() != AscendDeviceType.A5
+        )
     )
 
     # Effective in SFA when FlashComm is enabled.
@@ -348,7 +365,9 @@ def __init__(
     self.enable_sp = enable_sp()
 
     if has_ucm_sparse() and PTOPK_PREFETCH_ENABLE:
-        if self.has_indexer and (self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer):
+        if self.has_indexer and (
+            self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer
+        ):
             # gsa param
             num_slots = MAX_INDEXER_BLOCK_NUM
             if self.enable_sparse_li_c8:
@@ -371,7 +390,9 @@ def __init__(
                 )
         else:
             self.dsa_k_cache = None
-    self.topk_layer_info, self.topk_layer_map, self.indexr_num = init_indexer_layer_map(self.vllm_config)
+    self.topk_layer_info, self.topk_layer_map, self.indexr_num = init_indexer_layer_map(
+        self.vllm_config
+    )
     if self.layer_id < self.layer_num:
         self.cur_topk_index = self.topk_layer_map[self.layer_id]
     else:
@@ -402,7 +423,6 @@ def __init__(
             register_all_layers_to_shard_weight_series(self.layer_sharding_kwargs)
 
 
-
 def indexer_select_post_process(
     self,
     x: torch.Tensor,
@@ -415,7 +435,7 @@ def indexer_select_post_process(
     actual_seq_lengths_key: torch.Tensor,
 ):
     from ucm.sparse.state import has_ucm_sparse
-    from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE, IS_INDEXER_OFFLOAD
+    from ucm.sparse.utils import IS_INDEXER_OFFLOAD, PTOPK_PREFETCH_ENABLE
 
     if not self.has_indexer:
         raise RuntimeError(
@@ -440,7 +460,11 @@ def indexer_select_post_process(
             quant_matmul_kwargs.update(
                 scale_dtype=FLOAT8_E8M0FNU_DTYPE,
                 pertoken_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
-                group_sizes=[1, 1, getattr(self.wq_b.quant_method.quant_method, "group_size", 32)],
+                group_sizes=[
+                    1,
+                    1,
+                    getattr(self.wq_b.quant_method.quant_method, "group_size", 32),
+                ],
             )
         elif q_c_scale.dim() > 1 and q_c_scale.shape[-1] == 1:
             q_c_scale = q_c_scale.squeeze(dim=-1)
@@ -456,7 +480,11 @@ def indexer_select_post_process(
     q_li = q_li.view(-1, self.n_head, self.head_dim)
     if HAS_TRITON:
         q_li = rope_forward_triton_siso(
-            q_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
+            q_li,
+            cos,
+            sin,
+            rope_dim=self.qk_rope_head_dim,
+            is_neox_style=self.is_rope_neox_style,
         )
     else:
         q_li_pe, q_li_nope = torch.split(
@@ -473,23 +501,38 @@ def indexer_select_post_process(
     if self.enable_sparse_li_c8:
         q_li_shape_ori = q_li.shape
         q_li = q_li @ AscendSFAImpl.q_hadamard
-        q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
+        q_li, q_li_scale = torch_npu.npu_dynamic_quant(
+            q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype
+        )
         q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
 
     if (
-        has_ucm_sparse() and PTOPK_PREFETCH_ENABLE and
-        self.layer_id < self.layer_num and
-        (self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
+        has_ucm_sparse()
+        and PTOPK_PREFETCH_ENABLE
+        and self.layer_id < self.layer_num
+        and (self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
     ):
         actual_seq_lengths_key = attn_metadata.dsa_seq_len
         if IS_INDEXER_OFFLOAD and self.has_indexer:
             torch.ops._C_ascend.indexer_gather_qw(
                 q_li.view(-1, self.n_head * self.head_dim),
                 weights.view(-1, self.n_head),
-                attn_metadata.indexer_last_query[self.layer_id][:attn_metadata.indexer_last_query_len].view(-1, self.n_head * self.head_dim),
-                attn_metadata.indexer_last_weight[self.layer_id][:attn_metadata.indexer_last_query_len].view(-1, self.n_head),
-                attn_metadata.indexer_last_q_index[:attn_metadata.indexer_last_query_len].view(-1, 1).expand((-1, self.n_head * self.head_dim)),
-                attn_metadata.indexer_last_q_index[:attn_metadata.indexer_last_query_len].view(-1, 1).expand((-1, self.n_head)),
+                attn_metadata.indexer_last_query[self.layer_id][
+                    : attn_metadata.indexer_last_query_len
+                ].view(-1, self.n_head * self.head_dim),
+                attn_metadata.indexer_last_weight[self.layer_id][
+                    : attn_metadata.indexer_last_query_len
+                ].view(-1, self.n_head),
+                attn_metadata.indexer_last_q_index[
+                    : attn_metadata.indexer_last_query_len
+                ]
+                .view(-1, 1)
+                .expand((-1, self.n_head * self.head_dim)),
+                attn_metadata.indexer_last_q_index[
+                    : attn_metadata.indexer_last_query_len
+                ]
+                .view(-1, 1)
+                .expand((-1, self.n_head)),
             )
 
     record_attention_compute_start()
@@ -508,9 +551,16 @@ def indexer_select_post_process(
     )
 
 
-
 def _execute_sparse_flash_attention_process(
-    self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key, swap_len: torch.Tensor = None
+    self,
+    ql_nope,
+    q_pe,
+    kv_cache,
+    topk_indices,
+    attn_metadata,
+    actual_seq_lengths_query,
+    actual_seq_lengths_key,
+    swap_len: torch.Tensor = None,
 ):
     return DeviceOperator.execute_sparse_flash_attention_process(
         self,
@@ -521,9 +571,8 @@ def _execute_sparse_flash_attention_process(
         attn_metadata,
         actual_seq_lengths_query,
         actual_seq_lengths_key,
-        swap_len
+        swap_len,
     )
-
 
 
 @when_imported("vllm_ascend.attention.sfa_v1")
@@ -533,16 +582,22 @@ def _patch(mod):
     # can resolve them through vars(mod).
     try:
         from vllm.forward_context import ForwardContext, get_forward_context
+
         from ucm.sparse.state import (
+            has_ucm_sparse,
             maybe_execute_sparse_attention_begin,
             maybe_execute_sparse_attention_finished,
         )
-        from ucm.sparse.state import has_ucm_sparse
         from ucm.sparse.utils import (
-            DEFAULT_TOPK_LEN, IS_INDEXER_OFFLOAD, IS_OPEN_GSA,
-            MAX_INDEXER_BLOCK_NUM, PTOPK_PREFETCH_ENABLE, SPA_TOKENS_LEN,
+            DEFAULT_TOPK_LEN,
+            IS_INDEXER_OFFLOAD,
+            IS_OPEN_GSA,
+            MAX_INDEXER_BLOCK_NUM,
+            PTOPK_PREFETCH_ENABLE,
+            SPA_TOKENS_LEN,
             init_indexer_layer_map,
         )
+
         for _name, _val in {
             "ForwardContext": ForwardContext,
             "get_forward_context": get_forward_context,
@@ -567,34 +622,51 @@ def _patch(mod):
         _cls = mod.AscendSFAMetadata
         _cls.__annotations__["has_prefill"] = bool
         for _fname, _fdefault in {
-            "is_graph_dummy": False, "topk_indices_global": None,
-            "dsa_block_table": None, "dsa_slot_mapping": None, "dsa_seq_len": None,
-            "gsa_prefetch_index": None, "gsa_prefetch_topk": None,
-            "gsa_swap_index": None, "gsa_swap_topk": None,
-            "gsa_warmup_index": None, "gsa_warmup_topk": None,
-            "gsa_prefetch_len": 0, "gsa_swap_len": 0, "gsa_warmup_len": 0,
-            "gsa_slot_len": 0, "indexer_last_query": None,
-            "indexer_last_q_index": None, "indexer_last_weight": None,
-            "indexer_last_query_len": 0, "num_padding_reqs": 1,
-            "gsa_prefill_query": None, "select_block_index": None,
+            "is_graph_dummy": False,
+            "topk_indices_global": None,
+            "dsa_block_table": None,
+            "dsa_slot_mapping": None,
+            "dsa_seq_len": None,
+            "gsa_prefetch_index": None,
+            "gsa_prefetch_topk": None,
+            "gsa_swap_index": None,
+            "gsa_swap_topk": None,
+            "gsa_warmup_index": None,
+            "gsa_warmup_topk": None,
+            "gsa_prefetch_len": 0,
+            "gsa_swap_len": 0,
+            "gsa_warmup_len": 0,
+            "gsa_slot_len": 0,
+            "indexer_last_query": None,
+            "indexer_last_q_index": None,
+            "indexer_last_weight": None,
+            "indexer_last_query_len": 0,
+            "num_padding_reqs": 1,
+            "gsa_prefill_query": None,
+            "select_block_index": None,
             "gsa_topk_win_tmp": None,
         }.items():
             _cls.__annotations__.setdefault(_fname, object)
             if not hasattr(_cls, _fname):
                 setattr(_cls, _fname, _fdefault)
         _orig_init = _cls.__init__
+
         def _patched_metadata_init(self, *args, **kwargs):
             _has_prefill = kwargs.pop("has_prefill", False)
             _orig_init(self, *args, **kwargs)
             self.has_prefill = _has_prefill
+
         patch_or_inject(_cls, "__init__", _patched_metadata_init)
         logger.info("UCM GSA AscendSFAMetadata has_prefill/gsa fields patch applied")
 
     if hasattr(mod.AscendSFAMetadataBuilder, "_build"):
         _patched = FunctionType(
-            _build.__code__, vars(mod),
-            name=_build.__name__, argdefs=_build.__defaults__,
-            closure=_build.__closure__,)
+            _build.__code__,
+            vars(mod),
+            name=_build.__name__,
+            argdefs=_build.__defaults__,
+            closure=_build.__closure__,
+        )
         _patched.__annotations__ = _build.__annotations__
         _patched.__kwdefaults__ = _build.__kwdefaults__
         patch_or_inject(mod.AscendSFAMetadataBuilder, "_build", _patched)
@@ -602,9 +674,12 @@ def _patch(mod):
 
     if hasattr(mod.AscendSFAImpl, "__init__"):
         _patched = FunctionType(
-            __init__.__code__, vars(mod),
-            name=__init__.__name__, argdefs=__init__.__defaults__,
-            closure=__init__.__closure__,)
+            __init__.__code__,
+            vars(mod),
+            name=__init__.__name__,
+            argdefs=__init__.__defaults__,
+            closure=__init__.__closure__,
+        )
         _patched.__annotations__ = __init__.__annotations__
         _patched.__kwdefaults__ = __init__.__kwdefaults__
         patch_or_inject(mod.AscendSFAImpl, "__init__", _patched)
@@ -612,9 +687,12 @@ def _patch(mod):
 
     if hasattr(mod.AscendSFAImpl, "indexer_select_post_process"):
         _patched = FunctionType(
-            indexer_select_post_process.__code__, vars(mod),
-            name=indexer_select_post_process.__name__, argdefs=indexer_select_post_process.__defaults__,
-            closure=indexer_select_post_process.__closure__,)
+            indexer_select_post_process.__code__,
+            vars(mod),
+            name=indexer_select_post_process.__name__,
+            argdefs=indexer_select_post_process.__defaults__,
+            closure=indexer_select_post_process.__closure__,
+        )
         _patched.__annotations__ = indexer_select_post_process.__annotations__
         _patched.__kwdefaults__ = indexer_select_post_process.__kwdefaults__
         patch_or_inject(mod.AscendSFAImpl, "indexer_select_post_process", _patched)
@@ -622,11 +700,19 @@ def _patch(mod):
 
     if hasattr(mod.AscendSFAImpl, "_execute_sparse_flash_attention_process"):
         _patched = FunctionType(
-            _execute_sparse_flash_attention_process.__code__, vars(mod),
-            name=_execute_sparse_flash_attention_process.__name__, argdefs=_execute_sparse_flash_attention_process.__defaults__,
-            closure=_execute_sparse_flash_attention_process.__closure__,)
-        _patched.__annotations__ = _execute_sparse_flash_attention_process.__annotations__
+            _execute_sparse_flash_attention_process.__code__,
+            vars(mod),
+            name=_execute_sparse_flash_attention_process.__name__,
+            argdefs=_execute_sparse_flash_attention_process.__defaults__,
+            closure=_execute_sparse_flash_attention_process.__closure__,
+        )
+        _patched.__annotations__ = (
+            _execute_sparse_flash_attention_process.__annotations__
+        )
         _patched.__kwdefaults__ = _execute_sparse_flash_attention_process.__kwdefaults__
-        patch_or_inject(mod.AscendSFAImpl, "_execute_sparse_flash_attention_process", _patched)
-        logger.info("UCM GSA AscendSFAImpl._execute_sparse_flash_attention_process patch applied")
-
+        patch_or_inject(
+            mod.AscendSFAImpl, "_execute_sparse_flash_attention_process", _patched
+        )
+        logger.info(
+            "UCM GSA AscendSFAImpl._execute_sparse_flash_attention_process patch applied"
+        )

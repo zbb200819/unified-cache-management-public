@@ -14,7 +14,10 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
     from vllm_ascend.quantization.utils import maybe_auto_detect_quantization
 
     device_config = getattr(vllm_config, "device_config", None)
-    if device_config is not None and getattr(device_config, "device_type", cls.device_type) != cls.device_type:
+    if (
+        device_config is not None
+        and getattr(device_config, "device_type", cls.device_type) != cls.device_type
+    ):
         logger.debug(
             "Skipping Ascend-specific config updates for device type %s.",
             device_config.device_type,
@@ -22,7 +25,9 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         return
 
     if vllm_config.model_config is None:
-        logger.warning("Model config is missing. Skipping Ascend-specific config updates.")
+        logger.warning(
+            "Model config is missing. Skipping Ascend-specific config updates."
+        )
         return
 
     maybe_auto_detect_quantization(vllm_config)
@@ -37,8 +42,10 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
 
     ascend_config = init_ascend_config(vllm_config)
 
-    from vllm_ascend.logger import configure_ascend_file_logging
-    from vllm_ascend.logger import configure_ascend_logging
+    from vllm_ascend.logger import (
+        configure_ascend_file_logging,
+        configure_ascend_logging,
+    )
 
     configure_ascend_file_logging()
     configure_ascend_logging()
@@ -46,7 +53,9 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
     if vllm_config.kv_transfer_config is not None:
         check_kv_extra_config(vllm_config)
         if not getattr(vllm_config.kv_transfer_config, "_engine_id_patched", False):
-            vllm_config.kv_transfer_config.engine_id = f"{vllm_config.kv_transfer_config.engine_id}-{uuid4().hex}"
+            vllm_config.kv_transfer_config.engine_id = (
+                f"{vllm_config.kv_transfer_config.engine_id}-{uuid4().hex}"
+            )
             vllm_config.kv_transfer_config._engine_id_patched = True
     from vllm.config import CompilationMode  # noqa: E402
 
@@ -56,7 +65,9 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
     cache_config = vllm_config.cache_config
     ascend_compilation_config = ascend_config.ascend_compilation_config
     if ascend_compilation_config:
-        vllm_config.additional_config.setdefault("ascend_compilation_config", {}).update(
+        vllm_config.additional_config.setdefault(
+            "ascend_compilation_config", {}
+        ).update(
             vars(ascend_compilation_config)
             if not isinstance(ascend_compilation_config, dict)
             else ascend_compilation_config
@@ -65,12 +76,16 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
     ascend_config.update_compile_ranges_split_points()
 
     if model_config and hasattr(model_config.hf_text_config, "index_topk"):
-        vllm_config.cache_config.cache_dtype = str(model_config.dtype).replace("torch.", "")
+        vllm_config.cache_config.cache_dtype = str(model_config.dtype).replace(
+            "torch.", ""
+        )
 
     ascend_fusion_config = ascend_config.ascend_fusion_config
     if ascend_fusion_config:
         vllm_config.additional_config.setdefault("ascend_fusion_config", {}).update(
-            vars(ascend_fusion_config) if not isinstance(ascend_fusion_config, dict) else ascend_fusion_config
+            vars(ascend_fusion_config)
+            if not isinstance(ascend_fusion_config, dict)
+            else ascend_fusion_config
         )
 
     enforce_eager = getattr(model_config, "enforce_eager", False)
@@ -78,8 +93,13 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
     from vllm.config.compilation import CUDAGraphMode
 
     if ascend_config.xlite_graph_config.enabled:
-        if ascend_config.xlite_graph_config.full_mode and vllm_config.speculative_config is None:
-            logger.info("ACLGraph has been disabled when speculation is disabled in xlite full mode")
+        if (
+            ascend_config.xlite_graph_config.full_mode
+            and vllm_config.speculative_config is None
+        ):
+            logger.info(
+                "ACLGraph has been disabled when speculation is disabled in xlite full mode"
+            )
             enforce_eager = True
             model_config.enforce_eager = True
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
@@ -95,7 +115,10 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
 
     compilation_config.cudagraph_num_of_warmups = 1
 
-    if compilation_config.mode not in [CompilationMode.NONE, CompilationMode.VLLM_COMPILE]:
+    if compilation_config.mode not in [
+        CompilationMode.NONE,
+        CompilationMode.VLLM_COMPILE,
+    ]:
         logger.warning(
             "NPU does not support compilation mode. mode=%s, action: setting CUDAGraphMode to NONE.",
             compilation_config.mode,
@@ -116,7 +139,9 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         and enable_sp(vllm_config)
     ):
         original_sizes = compilation_config.cudagraph_capture_sizes
-        sp_aclgraph_sizes = vllm_config.update_sizes_for_sequence_parallelism(original_sizes)
+        sp_aclgraph_sizes = vllm_config.update_sizes_for_sequence_parallelism(
+            original_sizes
+        )
         assert sp_aclgraph_sizes, (
             f"cudagraph_capture_sizes {original_sizes} does not contain"
             f"values that are multiples of tp_size "
@@ -135,7 +160,8 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
     if (
         model_config
         and model_config.is_encoder_decoder
-        and compilation_config.cudagraph_mode not in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE)
+        and compilation_config.cudagraph_mode
+        not in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE)
     ):
         cudagraph_mode = (
             CUDAGraphMode.PIECEWISE
@@ -157,8 +183,12 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         compilation_config.mode = CompilationMode.NONE
         ascend_config.ascend_compilation_config.enable_npugraph_ex = False
         ascend_config.ascend_compilation_config.enable_static_kernel = False
-        vllm_config.additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = False
-        vllm_config.additional_config["ascend_compilation_config"]["enable_static_kernel"] = False
+        vllm_config.additional_config["ascend_compilation_config"][
+            "enable_npugraph_ex"
+        ] = False
+        vllm_config.additional_config["ascend_compilation_config"][
+            "enable_static_kernel"
+        ] = False
     elif compilation_config.cudagraph_mode.requires_piecewise_compilation():
         # Our is_cuda_alike is False so we cannot reuse the assertion of upstream
         assert compilation_config.mode == CompilationMode.VLLM_COMPILE, (
@@ -188,24 +218,35 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
             prune_capture_sizes_for_950(vllm_config)
         ascend_config.ascend_compilation_config.enable_npugraph_ex = False
         ascend_config.ascend_compilation_config.enable_static_kernel = False
-        vllm_config.additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = False
-        vllm_config.additional_config["ascend_compilation_config"]["enable_static_kernel"] = False
+        vllm_config.additional_config["ascend_compilation_config"][
+            "enable_npugraph_ex"
+        ] = False
+        vllm_config.additional_config["ascend_compilation_config"][
+            "enable_static_kernel"
+        ] = False
     elif compilation_config.cudagraph_mode.has_full_cudagraphs():
         # We don't want to have our FX graph split for the sake of static kernel feature,
         # because it will compile multiple times, so we set splitting_ops to empty manually.
         compilation_config.splitting_ops = []
     else:
         logger.info(
-            "%s cudagraph_mode is not support on NPU. falling back to NONE", compilation_config.cudagraph_mode
+            "%s cudagraph_mode is not support on NPU. falling back to NONE",
+            compilation_config.cudagraph_mode,
         )
         compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         compilation_config.mode = CompilationMode.NONE
         ascend_config.ascend_compilation_config.enable_npugraph_ex = False
         ascend_config.ascend_compilation_config.enable_static_kernel = False
-        vllm_config.additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = False
-        vllm_config.additional_config["ascend_compilation_config"]["enable_static_kernel"] = False
+        vllm_config.additional_config["ascend_compilation_config"][
+            "enable_npugraph_ex"
+        ] = False
+        vllm_config.additional_config["ascend_compilation_config"][
+            "enable_static_kernel"
+        ] = False
 
-    print(f"[GSA] graph cudagraph_capture_sizes {compilation_config.cudagraph_capture_sizes} {compilation_config.cudagraph_mode}")
+    print(
+        f"[GSA] graph cudagraph_capture_sizes {compilation_config.cudagraph_capture_sizes} {compilation_config.cudagraph_mode}"
+    )
 
     # TODO: Remove this check when ACL Graph supports ASCEND_LAUNCH_BLOCKING=1
     # Then, we will have to discuss the error handling strategy and user experience
@@ -228,7 +269,9 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         if is_310p():
             parallel_config.worker_cls = "vllm_ascend._310p.worker_310p.NPUWorker310"
         elif ascend_config.xlite_graph_config.enabled:
-            logger.info("openEuler Xlite enabled. See: https://atomgit.com/openeuler/GVirt/tree/master/xlite")
+            logger.info(
+                "openEuler Xlite enabled. See: https://atomgit.com/openeuler/GVirt/tree/master/xlite"
+            )
             parallel_config.worker_cls = "vllm_ascend.xlite.xlite_worker.XliteWorker"
         else:
             parallel_config.worker_cls = "vllm_ascend.worker.worker.NPUWorker"
@@ -271,7 +314,9 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         else:
             from vllm_ascend.core.recompute_scheduler import RecomputeSchedulerConfig
 
-            recompute_scheduler_config = RecomputeSchedulerConfig.initialize_from_config(vllm_config)
+            recompute_scheduler_config = (
+                RecomputeSchedulerConfig.initialize_from_config(vllm_config)
+            )
             vllm_config.scheduler_config = recompute_scheduler_config
 
     # Extend original scheduler_config to use SchedulerDynamicBatch.
@@ -280,7 +325,9 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
             "vllm_ascend.core.scheduler_dynamic_batch.SchedulerDynamicBatch"
         )
         vllm_config.scheduler_config.enable_chunked_prefill = True
-        vllm_config.scheduler_config.SLO_limits_for_dynamic_batch = ascend_config.SLO_limits_for_dynamic_batch
+        vllm_config.scheduler_config.SLO_limits_for_dynamic_batch = (
+            ascend_config.SLO_limits_for_dynamic_batch
+        )
 
     # Use ProfilingChunkScheduler when profiling-based chunk sizing is on.
     if ascend_config.profiling_chunk_config.enabled:
@@ -289,16 +336,24 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         )
         import vllm_ascend.patch.platform.patch_profiling_chunk  # noqa
 
-    cp_size = parallel_config.decode_context_parallel_size * parallel_config.prefill_context_parallel_size
+    cp_size = (
+        parallel_config.decode_context_parallel_size
+        * parallel_config.prefill_context_parallel_size
+    )
     use_sparse = model_uses_sfa_sparse(model_config)
     sfa_dcp_replicated_indexer = enable_sfa_dcp_replicated_indexer(vllm_config)
     if sfa_dcp_replicated_indexer:
-        if parallel_config.decode_context_parallel_size != parallel_config.tensor_parallel_size:
+        if (
+            parallel_config.decode_context_parallel_size
+            != parallel_config.tensor_parallel_size
+        ):
             raise AssertionError(
                 f"DCP for SFA is only supported when dcp_size({parallel_config.decode_context_parallel_size}) "
                 f"== tp_size({parallel_config.tensor_parallel_size})."
             )
-        enable_sparse_c8 = (ascend_config.enable_sparse_sfa_c8 or ascend_config.enable_sparse_li_c8) and use_sparse
+        enable_sparse_c8 = (
+            ascend_config.enable_sparse_sfa_c8 or ascend_config.enable_sparse_li_c8
+        ) and use_sparse
         if enable_sparse_c8 and get_ascend_device_type() == AscendDeviceType.A5:
             raise NotImplementedError(
                 "SFA DCP with sparse C8 cache is not supported on A5 yet. "
@@ -316,30 +371,39 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
             "needs to be equal if use pcp or dcp > 1 in P/D disaggregate and kv pool scenario."
         )
 
-    if use_sparse and cp_size > 1 and parallel_config.cp_kv_cache_interleave_size != cache_config.block_size:
+    if (
+        use_sparse
+        and cp_size > 1
+        and parallel_config.cp_kv_cache_interleave_size != cache_config.block_size
+    ):
         logger.warning_once(
             "The current SFA CP implementation requires "
             f"cp_kv_cache_interleave_size({parallel_config.cp_kv_cache_interleave_size})"
             f" == block_size({cache_config.block_size}). "
             f"Override cp_kv_cache_interleave_size to {cache_config.block_size}."
         )
-        vllm_config.parallel_config.cp_kv_cache_interleave_size = cache_config.block_size
+        vllm_config.parallel_config.cp_kv_cache_interleave_size = (
+            cache_config.block_size
+        )
 
     if enable_sp(vllm_config):
-        assert vllm_config.parallel_config.tensor_parallel_size > 1, (
-            "Flash Comm v1 is only supported when tp_size > 1."
-        )
+        assert (
+            vllm_config.parallel_config.tensor_parallel_size > 1
+        ), "Flash Comm v1 is only supported when tp_size > 1."
 
-        assert not is_moe_model(vllm_config) or vllm_config.parallel_config.enable_expert_parallel, (
-            "Flash Comm v1 requires enable_expert_parallel=True for MoE models."
-        )
+        assert (
+            not is_moe_model(vllm_config)
+            or vllm_config.parallel_config.enable_expert_parallel
+        ), "Flash Comm v1 requires enable_expert_parallel=True for MoE models."
 
     # Set "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True" by default to optimize NPU memory management.
     # Find more details at https://docs.vllm.ai/projects/ascend/en/latest/faqs.html#how-to-handle-the-out-of-memory-issue
     # NOTE: We should not set this environment variable in RL (sleep mode) scenarios.
     # Find more details about how to configure this environment variable at https://www.hiascend.com/document/detail/zh/Pytorch/720/comref/Envvariables/Envir_012.html
     if model_config and not model_config.enable_sleep_mode:
-        npu_alloc_configs = os.getenv("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
+        npu_alloc_configs = os.getenv(
+            "PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True"
+        )
         # This environment variable may have more than one key-value pairs.
         # We should append ",expandable_segments:True" to the current configs.
         # For example: "page_size:1g" + ",expandable_segments:True".
@@ -361,16 +425,17 @@ def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         )
 
 
-
 @when_imported("vllm_ascend.platform")
 def _patch(mod):
     if hasattr(mod.NPUPlatform, "check_and_update_config"):
         _patched = FunctionType(
-            check_and_update_config.__code__, vars(mod),
-            name=check_and_update_config.__name__, argdefs=check_and_update_config.__defaults__,
-            closure=check_and_update_config.__closure__,)
+            check_and_update_config.__code__,
+            vars(mod),
+            name=check_and_update_config.__name__,
+            argdefs=check_and_update_config.__defaults__,
+            closure=check_and_update_config.__closure__,
+        )
         _patched.__annotations__ = check_and_update_config.__annotations__
         _patched.__kwdefaults__ = check_and_update_config.__kwdefaults__
         patch_or_inject(mod.NPUPlatform, "check_and_update_config", _patched)
         logger.info("UCM GSA NPUPlatform.check_and_update_config patch applied")
-

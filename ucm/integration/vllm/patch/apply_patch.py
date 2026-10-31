@@ -304,6 +304,7 @@ def apply_all_patches() -> None:
                 )
                 import ucm.integration.vllm.patch.v0230.vllm_ascend.ascend_hybrid_cache_patch
                 import ucm.integration.vllm.patch.v0230.vllm_ascend.cpu_binding_patch
+
                 if ENABLE_GSA_PATCH:
                     # GSA-aware SFA forward (drives
                     # maybe_execute_sparse_attention_begin/finished and the
@@ -313,7 +314,6 @@ def apply_all_patches() -> None:
                         "UCM patching vllm-ascend 0.23.0 SFA with the GSA "
                         "forward (ENABLE_GSA_PATCH is set)..."
                     )
-                    import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.sfa_kv_transfer_patch
                     # GSA runtime monkey-patches (Python portions of
                     # vllm-ascend-adapt-1020-c8.patch). The C++ ops registered
                     # in csrc/torch_binding*.cpp still require the build-time
@@ -323,6 +323,7 @@ def apply_all_patches() -> None:
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.block_table_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.device_op_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.model_runner_v1_patch
+                    import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.sfa_kv_transfer_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.sfa_v1_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.worker_patch
                 else:

@@ -409,7 +409,7 @@ void GSAPrefetchEngineC::MergeAndCopyPrefetchLayer(const TaskInfo& taskInfo, Thr
     timing.memcpy +=
         std::chrono::duration_cast<std::chrono::microseconds>(memcpyEnd - cpuEnd).count();
     if (Synchronize(threadInfo.context_, static_cast<aclrtStream*>(threadInfo.stream_) + streamIdx,
-                     1, mLogger) != 0) {
+                    1, mLogger) != 0) {
         KVPackAbort(mKVPackControl);
     }
     auto syncEnd = std::chrono::high_resolution_clock::now();

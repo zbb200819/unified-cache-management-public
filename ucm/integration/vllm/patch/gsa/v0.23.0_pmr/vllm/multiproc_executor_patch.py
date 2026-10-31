@@ -25,9 +25,7 @@ def __init__(
     self.rank = rank
     wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
     # TODO: move `init_worker` to executor level as a collective rpc call
-    all_kwargs: list[dict] = [
-        {} for _ in range(vllm_config.parallel_config.world_size)
-    ]
+    all_kwargs: list[dict] = [{} for _ in range(vllm_config.parallel_config.world_size)]
     all_kwargs[local_rank] = {
         "vllm_config": vllm_config,
         "local_rank": local_rank,
@@ -80,7 +78,6 @@ def __init__(
     enable_envs_cache()
 
 
-
 def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event):
     from ucm.pmr.perf_counter import PerfCounters
 
@@ -93,6 +90,7 @@ def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event):
             death_pipe.recv()
         except EOFError:
             import pickle
+
             with open("/tmp/worker.pkl", "wb") as f:
                 pickle.dump(PerfCounters.get_inst(), f)
             PerfCounters.get_inst().print()
@@ -113,14 +111,16 @@ def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event):
     ).start()
 
 
-
 @when_imported("vllm.v1.executor.multiproc_executor")
 def _patch(mod):
     if hasattr(mod.WorkerProc, "__init__"):
         _patched = FunctionType(
-            __init__.__code__, vars(mod),
-            name=__init__.__name__, argdefs=__init__.__defaults__,
-            closure=__init__.__closure__,)
+            __init__.__code__,
+            vars(mod),
+            name=__init__.__name__,
+            argdefs=__init__.__defaults__,
+            closure=__init__.__closure__,
+        )
         _patched.__annotations__ = __init__.__annotations__
         _patched.__kwdefaults__ = __init__.__kwdefaults__
         patch_or_inject(mod.WorkerProc, "__init__", _patched)
@@ -128,11 +128,13 @@ def _patch(mod):
 
     if hasattr(mod.WorkerProc, "monitor_death_pipe"):
         _patched = FunctionType(
-            monitor_death_pipe.__code__, vars(mod),
-            name=monitor_death_pipe.__name__, argdefs=monitor_death_pipe.__defaults__,
-            closure=monitor_death_pipe.__closure__,)
+            monitor_death_pipe.__code__,
+            vars(mod),
+            name=monitor_death_pipe.__name__,
+            argdefs=monitor_death_pipe.__defaults__,
+            closure=monitor_death_pipe.__closure__,
+        )
         _patched.__annotations__ = monitor_death_pipe.__annotations__
         _patched.__kwdefaults__ = monitor_death_pipe.__kwdefaults__
         patch_or_inject(mod.WorkerProc, "monitor_death_pipe", _patched)
         logger.info("UCM GSA WorkerProc.monitor_death_pipe patch applied")
-

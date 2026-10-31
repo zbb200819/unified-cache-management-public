@@ -13,11 +13,11 @@ import math
 import types
 from types import SimpleNamespace
 
+import fakes
 import numpy as np
 import pytest
 import torch
 
-import fakes
 import ucm.sandbox.sparse.gsav2.gsa as gsa_mod
 from ucm.sparse.base import UcmSparseRole
 
@@ -154,8 +154,12 @@ class TestGSAReqStat:
         assert stat.stage() == gsa_mod.SequenceStage.DECODE
 
     def test_indexer_sparse_len(self):
-        stat = self._stat(num_computed_tokens=100, num_scheduled_tokens=28,
-                          prompt_block_len=4, prompt_sparse_len=2)
+        stat = self._stat(
+            num_computed_tokens=100,
+            num_scheduled_tokens=28,
+            prompt_block_len=4,
+            prompt_sparse_len=2,
+        )
         assert stat.get_seq_len() == 128
         assert stat.indexer_sparse_len() == 2 + 1 - 4  # 2+ceil(128/128)-4
 
@@ -182,8 +186,9 @@ class TestGSAReqStat:
 
     def test_is_last_chunk_pd_mix(self):
         cfg = fakes.FakeVllmConfig(producer=True, consumer=True)
-        stat = self._stat(cfg, num_prompt_tokens=100, num_computed_tokens=90,
-                          num_scheduled_tokens=10)
+        stat = self._stat(
+            cfg, num_prompt_tokens=100, num_computed_tokens=90, num_scheduled_tokens=10
+        )
         assert stat.is_last_chunk() is True  # 90+10 == 100
         stat.num_scheduled_tokens = 5
         assert stat.is_last_chunk() is False
@@ -201,8 +206,11 @@ class TestGSAReqStat:
         stat.num_output_tokens = 0
         assert stat.is_decode_only() is False
         # PD 混合：stage == DECODE
-        stat = self._stat(fakes.FakeVllmConfig(producer=True, consumer=True),
-                          num_prompt_tokens=100, num_computed_tokens=100)
+        stat = self._stat(
+            fakes.FakeVllmConfig(producer=True, consumer=True),
+            num_prompt_tokens=100,
+            num_computed_tokens=100,
+        )
         assert stat.is_decode_only() is True
         stat.num_computed_tokens = 50
         assert stat.is_decode_only() is False
@@ -218,8 +226,9 @@ class TestGSAReqStat:
 
     def test_get_spase_len(self, monkeypatch):
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 64)
-        stat = self._stat(num_prompt_tokens=100, num_computed_tokens=100,
-                          num_output_tokens=5)
+        stat = self._stat(
+            num_prompt_tokens=100, num_computed_tokens=100, num_output_tokens=5
+        )
         assert stat.get_spase_len() == 5 + gsa_mod.GSA_SPARSE_LEN
         stat.num_prompt_tokens = 10  # 非 GSA → num_computed_tokens
         assert stat.get_spase_len() == 100
@@ -227,8 +236,10 @@ class TestGSAReqStat:
     def test_add_req_new_normal(self):
         stat = self._stat()
         add = fakes.FakeAddReqState(
-            block_ids=[[5, 6]], prompt_token_ids=list(range(200)),
-            output_token_ids=[1], num_computed_tokens=200,
+            block_ids=[[5, 6]],
+            prompt_token_ids=list(range(200)),
+            output_token_ids=[1],
+            num_computed_tokens=200,
         )
         stat.add_req_new(1, add, 0, {})
         assert stat.blocks == [5, 6]
@@ -242,8 +253,10 @@ class TestGSAReqStat:
     def test_add_req_new_preempt(self):
         stat = self._stat()
         add = fakes.FakeAddReqState(
-            block_ids=[[5, 6]], prompt_token_ids=list(range(200)),
-            output_token_ids=[1, 2, 3, 4], num_computed_tokens=200,
+            block_ids=[[5, 6]],
+            prompt_token_ids=list(range(200)),
+            output_token_ids=[1, 2, 3, 4],
+            num_computed_tokens=200,
         )
         stat.add_req_new(1, add, 0, {"r1": 3})
         assert stat.num_prompt_tokens == 203
@@ -285,7 +298,9 @@ class TestGSAReqStat:
     def test_update_req_state(self):
         stat = self._stat()
         add = fakes.FakeAddReqState(
-            block_ids=[[7, 8]], output_token_ids=[1, 2], num_computed_tokens=9,
+            block_ids=[[7, 8]],
+            output_token_ids=[1, 2],
+            num_computed_tokens=9,
         )
         stat.update_req_state(2, add, 3, {})
         assert stat.num_computed_tokens == 9
@@ -299,9 +314,13 @@ class TestGSAReqStat:
     def test_get_indexer_sparse_len(self, monkeypatch):
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         monkeypatch.setattr(gsa_mod, "INDEXER_PREFETCH_TOKENS", 64)
-        stat = self._stat(num_prompt_tokens=2000, num_computed_tokens=1920,
-                          num_scheduled_tokens=128, prompt_block_len=15,
-                          prompt_sparse_len=8)
+        stat = self._stat(
+            num_prompt_tokens=2000,
+            num_computed_tokens=1920,
+            num_scheduled_tokens=128,
+            prompt_block_len=15,
+            prompt_sparse_len=8,
+        )
         # sparse_len = (15-8)*128 = 896；seq = 2048 → 2048-896
         assert stat.get_indexer_sparse_len() == 2048 - 7 * 128
         monkeypatch.setattr(gsa_mod, "INDEXER_PREFETCH_TOKENS", 32768)
@@ -313,9 +332,13 @@ class TestGSAReqStat:
     def test_get_indexer_remain_len(self, monkeypatch):
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         monkeypatch.setattr(gsa_mod, "INDEXER_PREFETCH_TOKENS", 64)
-        stat = self._stat(num_prompt_tokens=100, num_computed_tokens=100,
-                          num_scheduled_tokens=28, prompt_block_len=4,
-                          prompt_sparse_len=2)
+        stat = self._stat(
+            num_prompt_tokens=100,
+            num_computed_tokens=100,
+            num_scheduled_tokens=28,
+            prompt_block_len=4,
+            prompt_sparse_len=2,
+        )
         # sparse_len = (4 - ceil(2*1.5)) * 128 = 128；seq = 128 → 0
         assert stat.get_indexer_remain_len() == 0
         monkeypatch.setattr(gsa_mod, "INDEXER_PREFETCH_TOKENS", 32768)
@@ -340,7 +363,8 @@ class TestGSAMetaData:
 
     def _state(self, req_id="r1", prompt=200, output=1, computed=200):
         return fakes.FakeAddReqState(
-            req_id=req_id, block_ids=[[5, 6]],
+            req_id=req_id,
+            block_ids=[[5, 6]],
             prompt_token_ids=list(range(prompt)),
             output_token_ids=list(range(output)),
             num_computed_tokens=computed,
@@ -353,8 +377,12 @@ class TestGSAMetaData:
             new_reqs=[SimpleNamespace(req_id="r1")],
         )
         model_input = md.get_model_input(
-            so, 2048, {"r1": self._state()}, fakes.FakeInputBatch({"r1": 0}),
-            None, {},
+            so,
+            2048,
+            {"r1": self._state()},
+            fakes.FakeInputBatch({"r1": 0}),
+            None,
+            {},
         )
         assert "r1" in md.gsa_stats
         assert model_input["query_locals"] == [0, 2]
@@ -366,27 +394,38 @@ class TestGSAMetaData:
             cached_req_ids=["r1", "r2"],
             resumed_req_ids=["r1", "r2"],
         )
-        md.get_model_input(so, 2048, {"r1": self._state(), "r2": self._state()},
-                           fakes.FakeInputBatch({"r1": 0, "r2": 1}), None, {})
+        md.get_model_input(
+            so,
+            2048,
+            {"r1": self._state(), "r2": self._state()},
+            fakes.FakeInputBatch({"r1": 0, "r2": 1}),
+            None,
+            {},
+        )
         assert set(md.gsa_stats) == {"r1", "r2"}
         # 再次调度（else 分支：update_req_state）
         so2 = fakes.FakeSchedulerOutput(
-            num_scheduled_tokens={"r1": 1}, cached_req_ids=["r1"],
+            num_scheduled_tokens={"r1": 1},
+            cached_req_ids=["r1"],
         )
-        mi = md.get_model_input(so2, 2048, {"r1": self._state()},
-                                fakes.FakeInputBatch({"r1": 0}), None, {})
+        mi = md.get_model_input(
+            so2, 2048, {"r1": self._state()}, fakes.FakeInputBatch({"r1": 0}), None, {}
+        )
         assert mi["query_locals"][0] == 0
 
     def test_get_model_input_re_add_deletes_old(self):
         md = self._meta()
         so = fakes.FakeSchedulerOutput(
-            num_scheduled_tokens={"r1": 2}, new_reqs=[SimpleNamespace(req_id="r1")],
+            num_scheduled_tokens={"r1": 2},
+            new_reqs=[SimpleNamespace(req_id="r1")],
         )
-        md.get_model_input(so, 2048, {"r1": self._state()},
-                           fakes.FakeInputBatch({"r1": 0}), None, {})
+        md.get_model_input(
+            so, 2048, {"r1": self._state()}, fakes.FakeInputBatch({"r1": 0}), None, {}
+        )
         old = md.gsa_stats["r1"]
-        md.get_model_input(so, 2048, {"r1": self._state()},
-                           fakes.FakeInputBatch({"r1": 0}), None, {})
+        md.get_model_input(
+            so, 2048, {"r1": self._state()}, fakes.FakeInputBatch({"r1": 0}), None, {}
+        )
         assert md.gsa_stats["r1"] is not old
 
     def test_trans_input_tensor(self):
@@ -531,13 +570,15 @@ class TestStoreInjection:
         assert gsa_worker._find_store_connector(conn) is conn
 
     def test_find_store_connector_plain_with_inner(self, gsa_worker):
-        conn = fakes.make_plain_connector(with_store=False, with_inner=True,
-                                          inner_with_store=True)
+        conn = fakes.make_plain_connector(
+            with_store=False, with_inner=True, inner_with_store=True
+        )
         assert gsa_worker._find_store_connector(conn) is conn.connector
 
     def test_find_store_connector_plain_with_inner_no_store(self, gsa_worker):
-        conn = fakes.make_plain_connector(with_store=False, with_inner=True,
-                                          inner_with_store=False)
+        conn = fakes.make_plain_connector(
+            with_store=False, with_inner=True, inner_with_store=False
+        )
         assert gsa_worker._find_store_connector(conn) is conn.connector
 
     def test_find_store_connector_multi_no_connectors(self, gsa_worker):
@@ -546,20 +587,28 @@ class TestStoreInjection:
 
     def test_find_store_connector_multi_direct_store(self, gsa_worker):
         conn = fakes.AscendMultiConnector(
-            connectors=[fakes.make_plain_connector(with_store=True)])
+            connectors=[fakes.make_plain_connector(with_store=True)]
+        )
         assert gsa_worker._find_store_connector(conn) is conn._connectors[0]
 
     def test_find_store_connector_multi_inner_store(self, gsa_worker):
         conn = fakes.AscendMultiConnector(
-            connectors=[fakes.make_plain_connector(
-                with_store=False, with_inner=True, inner_with_store=True)])
-        assert gsa_worker._find_store_connector(conn) is \
-            conn._connectors[0].connector
+            connectors=[
+                fakes.make_plain_connector(
+                    with_store=False, with_inner=True, inner_with_store=True
+                )
+            ]
+        )
+        assert gsa_worker._find_store_connector(conn) is conn._connectors[0].connector
 
     def test_find_store_connector_multi_inner_no_store(self, gsa_worker):
         conn = fakes.AscendMultiConnector(
-            connectors=[fakes.make_plain_connector(
-                with_store=False, with_inner=True, inner_with_store=False)])
+            connectors=[
+                fakes.make_plain_connector(
+                    with_store=False, with_inner=True, inner_with_store=False
+                )
+            ]
+        )
         assert gsa_worker._find_store_connector(conn) is None
 
     def test_inject_store_v1_null_ptr(self, gsa_worker):
@@ -596,16 +645,14 @@ class TestStoreInjection:
     def test_ensure_store_injected_already(self, gsa_worker, monkeypatch):
         gsa_worker._store_injected = True
         called = []
-        self._patch_group(
-            monkeypatch, lambda: called.append(1))  # 不应被调用
+        self._patch_group(monkeypatch, lambda: called.append(1))  # 不应被调用
         gsa_worker._ensure_store_injected()
         assert not called
 
     def test_ensure_store_injected_happy_path(self, gsa_worker, monkeypatch):
         g = gsa_worker
         g.prefetch_engine.prefetch_engine_c.store_v1_ptr = 4096
-        self._patch_group(monkeypatch,
-                          fakes.make_plain_connector(store_ptr=4096))
+        self._patch_group(monkeypatch, fakes.make_plain_connector(store_ptr=4096))
         g._ensure_store_injected()
         assert g._store_injected is True
         assert g._store_inject_retries == 1
@@ -634,8 +681,7 @@ class TestStoreInjection:
         g._ensure_store_injected()
         assert g._store_injected is False
 
-    def test_ensure_store_injected_mismatch_swallowed(
-            self, gsa_worker, monkeypatch):
+    def test_ensure_store_injected_mismatch_swallowed(self, gsa_worker, monkeypatch):
         g = gsa_worker
         g.prefetch_engine.prefetch_engine_c.store_v1_ptr = 8192
         self._patch_group(monkeypatch, fakes.make_plain_connector(store_ptr=4096))
@@ -645,13 +691,11 @@ class TestStoreInjection:
     def test_ensure_store_injected_retry_limit(self, gsa_worker, monkeypatch):
         g = gsa_worker
         g._store_inject_retries = 5
-        self._patch_group(monkeypatch,
-                          fakes.make_multi_connector("no_connectors"))
+        self._patch_group(monkeypatch, fakes.make_multi_connector("no_connectors"))
         with pytest.raises(RuntimeError, match="failed after"):
             g._ensure_store_injected()
 
-    def test_ensure_store_injected_exception_below_max(
-            self, gsa_worker, monkeypatch):
+    def test_ensure_store_injected_exception_below_max(self, gsa_worker, monkeypatch):
         g = gsa_worker
 
         def _boom():
@@ -661,8 +705,7 @@ class TestStoreInjection:
         g._ensure_store_injected()  # 捕获并记日志
         assert g._store_injected is False
 
-    def test_ensure_store_injected_exception_at_max(
-            self, gsa_worker, monkeypatch):
+    def test_ensure_store_injected_exception_at_max(self, gsa_worker, monkeypatch):
         g = gsa_worker
         g._store_inject_retries = 5
 
@@ -677,9 +720,17 @@ class TestStoreInjection:
 # ===========================================================================
 # 状态构造 helper
 # ===========================================================================
-def _prime_metadata(g, req_id="r1", index_in_batch=0, prompt=200,
-                    computed=200, scheduled=1, output=1, blocks=None,
-                    preempt=False):
+def _prime_metadata(
+    g,
+    req_id="r1",
+    index_in_batch=0,
+    prompt=200,
+    computed=200,
+    scheduled=1,
+    output=1,
+    blocks=None,
+    preempt=False,
+):
     """构造带单个请求的 GSAMetaData 并挂到 GSA 实例上"""
     md = gsa_mod.GSAMetaData(g._vllm_config, 2)
     stat = gsa_mod.GSAReqStat(req_id, g._vllm_config, 2)
@@ -726,11 +777,15 @@ def _record_ops(monkeypatch):
     """把 torch.ops._C_ascend 的 copy op 替换为计数记录器"""
     rec = {"gather": 0, "scatter": 0}
     monkeypatch.setattr(
-        torch.ops._C_ascend, "gsa_gather_copy",
-        lambda *a, **k: rec.__setitem__("gather", rec["gather"] + 1))
+        torch.ops._C_ascend,
+        "gsa_gather_copy",
+        lambda *a, **k: rec.__setitem__("gather", rec["gather"] + 1),
+    )
     monkeypatch.setattr(
-        torch.ops._C_ascend, "gsa_scatter_copy",
-        lambda *a, **k: rec.__setitem__("scatter", rec["scatter"] + 1))
+        torch.ops._C_ascend,
+        "gsa_scatter_copy",
+        lambda *a, **k: rec.__setitem__("scatter", rec["scatter"] + 1),
+    )
     return rec
 
 
@@ -789,8 +844,7 @@ class TestInjectBlockHashes:
         g.indexer_cache_preempt_i_ptr = 3000
         g.indexer_cache_preempt_i_offset = 30
         g._inject_block_hashes("r1", [0], [1], inject_indexer=True)
-        calls = g.prefetch_engine.prefetch_engine_c.called(
-            "set_last_indexer_blocks")
+        calls = g.prefetch_engine.prefetch_engine_c.called("set_last_indexer_blocks")
         assert len(calls) == 1
         assert calls[0][1][2] == [3000 + 30]
 
@@ -799,8 +853,7 @@ class TestInjectBlockHashes:
         g = make_gsa()
         self._prepare(g)
         g._inject_block_hashes("r1", [0], [1], inject_indexer=False)
-        assert not g.prefetch_engine.prefetch_engine_c.called(
-            "set_last_indexer_blocks")
+        assert not g.prefetch_engine.prefetch_engine_c.called("set_last_indexer_blocks")
 
 
 # ===========================================================================
@@ -813,13 +866,13 @@ class TestAttentionHooks:
         assert out == ("q", "k", "v", None)
 
     def test_begin_layer_out_of_range(self, gsa_worker):
-        out = gsa_worker.attention_begin("q", "k", "v", "model.layers.9.x",
-                                         None)
+        out = gsa_worker.attention_begin("q", "k", "v", "model.layers.9.x", None)
         assert out == ("q", "k", "v", None)
 
     def test_begin_no_indexer(self, gsa_worker):
-        out = gsa_worker.attention_begin("q", "k", "v", "model.layers.1.x",
-                                         None, has_indexer=False)
+        out = gsa_worker.attention_begin(
+            "q", "k", "v", "model.layers.1.x", None, has_indexer=False
+        )
         assert out == ("q", "k", "v", None)
 
     def test_begin_full_path(self, gsa_worker, monkeypatch):
@@ -831,7 +884,11 @@ class TestAttentionHooks:
         g.indexer_pc_hit_index.np[:] = 0
         _register_kvcaches(g)
         out = g.attention_begin(
-            "q", "k", "v", "model.layers.1.self_attn", None,
+            "q",
+            "k",
+            "v",
+            "model.layers.1.self_attn",
+            None,
             indexer_cache=g.kv_caches[1][2],
             indexer_scale=g.kv_caches[1][3],
             vllm_indexer_cache=g.kv_caches[1][2],
@@ -860,8 +917,13 @@ class TestAttentionHooks:
         g.indexer_pc_hit_index.np[:] = 0
         _register_kvcaches(g)
         g.attention_begin(
-            "q", "k", "v", "model.layers.0.x", None,
-            indexer_cache=g.kv_caches[0][2], indexer_scale=g.kv_caches[0][3],
+            "q",
+            "k",
+            "v",
+            "model.layers.0.x",
+            None,
+            indexer_cache=g.kv_caches[0][2],
+            indexer_scale=g.kv_caches[0][3],
             vllm_indexer_cache=g.kv_caches[0][2],
             vllm_indexer_scale=g.kv_caches[0][3],
             use_li_c8=True,
@@ -881,14 +943,16 @@ class TestAttentionHooks:
     def test_finished_no_dump(self, make_gsa):
         g = make_gsa(producer=True, consumer=True)
         g.indexer_pc_dump_num = 0
-        g.attention_finished("q", "k", "v", "o", "model.layers.1.x", None,
-                             has_indexer=True)
+        g.attention_finished(
+            "q", "k", "v", "o", "model.layers.1.x", None, has_indexer=True
+        )
 
     def test_finished_no_indexer(self, make_gsa):
         g = make_gsa(producer=True, consumer=True)
         g.indexer_pc_dump_num = 3
-        g.attention_finished("q", "k", "v", "o", "model.layers.1.x", None,
-                             has_indexer=False)
+        g.attention_finished(
+            "q", "k", "v", "o", "model.layers.1.x", None, has_indexer=False
+        )
 
     def test_finished_full_path(self, make_gsa, monkeypatch):
         g = make_gsa(producer=True, consumer=True)
@@ -900,14 +964,18 @@ class TestAttentionHooks:
         assert rec == {"gather": 1, "scatter": 1}
 
     def test_finished_li_c8_path(self, make_gsa, monkeypatch):
-        g = make_gsa(producer=True, consumer=True,
-                     additional_config={"enable_sparse_li_c8": True})
+        g = make_gsa(
+            producer=True,
+            consumer=True,
+            additional_config={"enable_sparse_li_c8": True},
+        )
         rec = _record_ops(monkeypatch)
         _register_kvcaches(g)
         g.indexer_pc_dump_num = 2
         g.indexer_pc_dump_index.np[:] = 0
-        g.attention_finished("q", "k", "v", "o", "model.layers.1.x", None,
-                             use_li_c8=True)
+        g.attention_finished(
+            "q", "k", "v", "o", "model.layers.1.x", None, use_li_c8=True
+        )
         # li_c8：KV 块 + scale 块各一次 gather/scatter
         assert rec == {"gather": 2, "scatter": 2}
 
@@ -963,8 +1031,7 @@ class TestDsaInput:
         stat.add_blocks_len = 0  # 不更新增量块
         dsa_seq_len = [None]
         g._update_dsa_block_table("r1", dsa_seq_len)
-        assert not g.prefetch_engine.prefetch_engine_c.called(
-            "update_indexer_map")
+        assert not g.prefetch_engine.prefetch_engine_c.called("update_indexer_map")
 
     def test_calc_decode_slot_mapping_spec1(self, gsa_worker):
         g = gsa_worker
@@ -982,8 +1049,9 @@ class TestDsaInput:
         _, stat = _prime_metadata(g, computed=130, scheduled=0)  # x=2
         slot_mapping = [None]
         g._calc_decode_slot_mapping(stat, [1, 2, 3], 0, slot_mapping)
-        expected = (list(range(2 * 128 + 128 - (3 - 2), 2 * 128 + 128))
-                    + [i + 3 * 128 for i in range(2)])
+        expected = list(range(2 * 128 + 128 - (3 - 2), 2 * 128 + 128)) + [
+            i + 3 * 128 for i in range(2)
+        ]
         assert slot_mapping[0] == expected
 
     def test_calc_decode_slot_mapping_spec_block_boundary(self, make_gsa):
@@ -1002,34 +1070,35 @@ class TestDsaInput:
 
     def test_calc_prefill_slot_mapping_match(self, gsa_worker, monkeypatch):
         g = gsa_worker
-        _, stat = _prime_metadata(g, computed=0, scheduled=256,
-                                  prompt=256, output=0)
+        _, stat = _prime_metadata(g, computed=0, scheduled=256, prompt=256, output=0)
         stat.num_computed_tokens = 0
         dump_vllm_id, dump_gsa_id = [None], [None]
         slot_mapping = [None]
-        g._calc_prefill_slot_mapping("r1", stat, [10, 11], 0, slot_mapping,
-                                     dump_vllm_id, dump_gsa_id)
+        g._calc_prefill_slot_mapping(
+            "r1", stat, [10, 11], 0, slot_mapping, dump_vllm_id, dump_gsa_id
+        )
         assert dump_vllm_id[0] == stat.blocks[:2]
         assert dump_gsa_id[0] == [10, 11]
-        assert slot_mapping[0] == [10 * 128 + j for j in range(128)] + \
-            [11 * 128 + j for j in range(128)]
+        assert slot_mapping[0] == [10 * 128 + j for j in range(128)] + [
+            11 * 128 + j for j in range(128)
+        ]
         assert stat.slot_mapping_cal_len == 256
         # 再次调用：num_computed == cal_len → 不重算 hit（hit_num 记 0）
         g.indexer_pc_hit_num = [None]
         g.indexer_pc_hit_index.np[:] = 0
-        g._calc_prefill_slot_mapping("r1", stat, [10, 11], 0, slot_mapping,
-                                     dump_vllm_id, dump_gsa_id)
+        g._calc_prefill_slot_mapping(
+            "r1", stat, [10, 11], 0, slot_mapping, dump_vllm_id, dump_gsa_id
+        )
         assert g.indexer_pc_hit_num[0] == 0
 
     def test_calc_prefill_slot_mapping_mismatch_logs_error(self, gsa_worker):
         g = gsa_worker
-        _, stat = _prime_metadata(g, computed=0, scheduled=256, prompt=256,
-                                  output=0)
-        g._calc_prefill_slot_mapping("r1", stat, [10], 0, [None], [None],
-                                     [None])
+        _, stat = _prime_metadata(g, computed=0, scheduled=256, prompt=256, output=0)
+        g._calc_prefill_slot_mapping("r1", stat, [10], 0, [None], [None], [None])
         # slots 数量不足 → 4 条 error 日志
-        assert not hasattr(stat, "slot_mapping_cal_len") or \
-            stat.slot_mapping_cal_len == 0
+        assert (
+            not hasattr(stat, "slot_mapping_cal_len") or stat.slot_mapping_cal_len == 0
+        )
 
     def test_update_req_slot_mapping_decode_vs_prefill(self, gsa_worker):
         g = gsa_worker
@@ -1040,11 +1109,9 @@ class TestDsaInput:
         g._update_req_slot_mapping("r1", stat, [1, 2], 0, slot_mapping, dv, dg)
         assert len(slot_mapping[0]) == 1 and dv[0] == [] and dg[0] == []
         # prefill
-        _, stat = _prime_metadata(g, computed=0, scheduled=256, prompt=256,
-                                  output=0)
+        _, stat = _prime_metadata(g, computed=0, scheduled=256, prompt=256, output=0)
         g.indexer_pc_hit_num = [None]
-        g._update_req_slot_mapping("r1", stat, [10, 11], 0, slot_mapping, dv,
-                                   dg)
+        g._update_req_slot_mapping("r1", stat, [10, 11], 0, slot_mapping, dv, dg)
         assert len(slot_mapping[0]) == 256
 
     def test_copy_dsa_input_to_npu(self, gsa_worker):
@@ -1123,8 +1190,7 @@ class TestModelInputPipeline:
         g.gsa_swap_index.np[:] = 9
         g.gsa_prefetch_index.np[:] = 9
         g._reset_gsa_buffers_all()
-        assert g.prefetch_topk == [] and g.warmup_topk == [] \
-            and g.swap_index == []
+        assert g.prefetch_topk == [] and g.warmup_topk == [] and g.swap_index == []
         assert (g.select_block_index.np == 0).all()
         assert (g.gsa_swap_index.np == 0).all()
         assert (g.gsa_prefetch_index.np == 0).all()
@@ -1137,8 +1203,7 @@ class TestModelInputPipeline:
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         return make_gsa()
 
-    def test_init_indexer_offload_step_time_multiple(self, make_gsa,
-                                                     monkeypatch):
+    def test_init_indexer_offload_step_time_multiple(self, make_gsa, monkeypatch):
         g = self._offload_gsa(make_gsa, monkeypatch)
         g.prefetch_engine.step_time = 10  # 10 % 10 == 0
         g._init_indexer_offload_all()
@@ -1173,8 +1238,7 @@ class TestModelInputPipeline:
         req_cnt, _, _ = g._collect_and_swap_tokens_all()
         assert req_cnt == 0
 
-    def test_collect_and_swap_skip_prefill_not_last(self, gsa_worker,
-                                                   monkeypatch):
+    def test_collect_and_swap_skip_prefill_not_last(self, gsa_worker, monkeypatch):
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 64)
         g = gsa_worker
         # PD 分离：output 0 → last chunk，但 stage PREFILL → 跳过
@@ -1246,12 +1310,13 @@ class TestModelInputPipeline:
                 assert g.need_indexer_sparse_bs == []
                 assert g.indexer_last_q_index_tmp == []
 
-        _case(True, 0, [0], [0, 1])      # last chunk
-        _case(True, 1, [0], [0, 1])      # 非 last chunk（range 形式）
-        _case(False, 0, None, None)      # 非 prefetch indexer
+        _case(True, 0, [0], [0, 1])  # last chunk
+        _case(True, 1, [0], [0, 1])  # 非 last chunk（range 形式）
+        _case(False, 0, None, None)  # 非 prefetch indexer
 
-    def test_collect_indexer_meta_short_prompt_early_return(self, make_gsa,
-                                                            monkeypatch):
+    def test_collect_indexer_meta_short_prompt_early_return(
+        self, make_gsa, monkeypatch
+    ):
         g = self._offload_gsa(make_gsa, monkeypatch)
         g.need_cal_k_mean = []
         _, stat = _prime_metadata(g, prompt=10, computed=10, output=0)
@@ -1284,8 +1349,7 @@ class TestModelInputPipeline:
         g.prefetch_topk = []
         before = stat.use_tokens
         before_prefetch = stat.prefetch_use_token
-        req_cnt = g._collect_gsa_tokens("r1", stat, 0, [0, 1], 0, [], [], [],
-                                        [])
+        req_cnt = g._collect_gsa_tokens("r1", stat, 0, [0, 1], 0, [], [], [], [])
         assert req_cnt == 1
         assert stat.use_tokens is before_prefetch  # 双缓冲交换
         assert stat.prefetch_use_token is before
@@ -1300,8 +1364,9 @@ class TestModelInputPipeline:
         g.is_prefetch_token = False
         use_ptrs, seq_lens, swap_index, use_req_ids = [], [], [], []
         g.select_block_index.np[:] = 0
-        req_cnt = g._collect_gsa_tokens("r1", stat, 0, [0, 1], 0, use_ptrs,
-                                        seq_lens, swap_index, use_req_ids)
+        req_cnt = g._collect_gsa_tokens(
+            "r1", stat, 0, [0, 1], 0, use_ptrs, seq_lens, swap_index, use_req_ids
+        )
         assert req_cnt == 1
         assert use_ptrs == [stat.use_tokens.ptr]
         assert seq_lens == [1 + gsa_mod.GSA_SPARSE_LEN]
@@ -1313,8 +1378,7 @@ class TestModelInputPipeline:
         g = gsa_worker
         _, stat = _prime_metadata(g, output=1)
         stat.is_gsa_init = False
-        assert g._collect_gsa_tokens("r1", stat, 0, [0, 1], 0, [], [], [],
-                                     []) == 0
+        assert g._collect_gsa_tokens("r1", stat, 0, [0, 1], 0, [], [], [], []) == 0
 
     def test_pre_swap_tokens_all_empty(self, gsa_worker):
         gsa_worker._pre_swap_tokens_all([], [], [], [])  # 早退
@@ -1329,8 +1393,7 @@ class TestModelInputPipeline:
         # 再次调用：ptr 已初始化，直接提交
         g._pre_swap_tokens_all([stat_ptr], [100], [[0, 1]], ["r1"])
         assert g.gsa_swap_topk_cpu_ptr == cpu_ptr
-        assert len(g.prefetch_engine.prefetch_engine_c.called(
-            "pre_swap_tokens")) == 2
+        assert len(g.prefetch_engine.prefetch_engine_c.called("pre_swap_tokens")) == 2
 
     def test_copy_gsa_buffers_to_npu_empty(self, gsa_worker):
         g = gsa_worker
@@ -1369,9 +1432,14 @@ class TestModelInputPipeline:
         attn0, attn1 = SimpleNamespace(), SimpleNamespace()
         g.swap_index = [0]
         g.select_block_index.np[0] = 3
-        g._update_attn_gsa_lens({"a": attn0, "b": attn1},
-                                gsa_slot_len=5, gsa_prefetch_len=6,
-                                gsa_warmup_len=7, indexer_len=8, req_cnt=1)
+        g._update_attn_gsa_lens(
+            {"a": attn0, "b": attn1},
+            gsa_slot_len=5,
+            gsa_prefetch_len=6,
+            gsa_warmup_len=7,
+            indexer_len=8,
+            req_cnt=1,
+        )
         for attn in (attn0, attn1):
             assert attn.gsa_prefetch_len == 6
             assert attn.gsa_swap_len == 1
@@ -1380,8 +1448,10 @@ class TestModelInputPipeline:
             assert attn.indexer_last_query_len == 8
             # select_block_index 传递的是 npu 侧切片（此处仅验证形状/归属）
             assert attn.select_block_index.shape[0] == 1
-            assert attn.select_block_index.data_ptr() == \
-                g.select_block_index.npu[:1].data_ptr()
+            assert (
+                attn.select_block_index.data_ptr()
+                == g.select_block_index.npu[:1].data_ptr()
+            )
 
     def test_get_model_input_all_full(self, gsa_worker, monkeypatch):
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 64)
@@ -1453,8 +1523,7 @@ class TestBuildMetaAndExecute:
         g.build_gsa_metadata(so, requests, fakes.FakeInputBatch({}))
         assert len(ec.called("get_prefetch_status")) == 2
 
-    def test_build_gsa_metadata_preempted_indexer_busy(self, make_gsa,
-                                                       monkeypatch):
+    def test_build_gsa_metadata_preempted_indexer_busy(self, make_gsa, monkeypatch):
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         g = make_gsa()
         stat = self._prepare(g)
@@ -1478,11 +1547,14 @@ class TestBuildMetaAndExecute:
             new_reqs=[SimpleNamespace(req_id="r1")],
         )
         add = fakes.FakeAddReqState(
-            block_ids=[[5, 6]], prompt_token_ids=list(range(200)),
-            output_token_ids=[1], num_computed_tokens=200,
+            block_ids=[[5, 6]],
+            prompt_token_ids=list(range(200)),
+            output_token_ids=[1],
+            num_computed_tokens=200,
         )
-        gsa_meta = g.build_gsa_metadata(so, {"r1": add},
-                                        fakes.FakeInputBatch({"r1": 0}))
+        gsa_meta = g.build_gsa_metadata(
+            so, {"r1": add}, fakes.FakeInputBatch({"r1": 0})
+        )
         assert "r1" in gsa_meta.gsa_stats
         assert g.model_input["query_locals"][1] == 1
 
@@ -1510,8 +1582,7 @@ class TestBuildMetaAndExecute:
         assert "r1" not in g.gsa_stats
         assert not hasattr(g, "slots_num_manager")  # rank≠0 不更新
 
-    def test_execute_begin_early_return_ptopk_off(self, gsa_worker,
-                                                  monkeypatch):
+    def test_execute_begin_early_return_ptopk_off(self, gsa_worker, monkeypatch):
         monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
         gsa_worker.execute_begin(fakes.FakeSchedulerOutput(), {})  # 早退
 
@@ -1533,8 +1604,10 @@ class TestBuildMetaAndExecute:
         assert g.req_ids_bs == ["r1"]
         assert stat.is_gsa_init is True
         # last_chunk_init 对每层调用一次 set_tokens_map
-        assert len(g.prefetch_engine.prefetch_engine_c.called(
-            "set_tokens_map")) == g.layer_num
+        assert (
+            len(g.prefetch_engine.prefetch_engine_c.called("set_tokens_map"))
+            == g.layer_num
+        )
         # block_len = ceil(201/128) - 0 = 2 → rank0 分配 indexer slots
         assert len(stat.indexer_slab_host_slot) == 2
         assert g.num_padding_reqs == 1
@@ -1542,11 +1615,9 @@ class TestBuildMetaAndExecute:
         assert g.prefetch_engine.prefetch_engine_c.called("pre_swap_tokens")
 
     def _call_process(self, g, req_id):
-        g._process_scheduled_req(req_id, [None], [None], [None], [None],
-                                  [None])
+        g._process_scheduled_req(req_id, [None], [None], [None], [None], [None])
 
-    def test_process_scheduled_req_offload_long_prompt(self, make_gsa,
-                                                       monkeypatch):
+    def test_process_scheduled_req_offload_long_prompt(self, make_gsa, monkeypatch):
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 64)
         g = make_gsa()
@@ -1558,8 +1629,7 @@ class TestBuildMetaAndExecute:
         assert len(stat.indexer_slab_host_slot) == 1
         assert stat.add_blocks_len == 1
 
-    def test_process_scheduled_req_offload_rank_nonzero(self, make_gsa,
-                                                        monkeypatch):
+    def test_process_scheduled_req_offload_rank_nonzero(self, make_gsa, monkeypatch):
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 64)
         g = make_gsa(rank=1)
@@ -1567,8 +1637,7 @@ class TestBuildMetaAndExecute:
         stat.slab_host_slot = []
         req_ids, add_blocks, new_len = [None], [None], [None]
         i_add, i_len = [None], [None]
-        g._process_scheduled_req("r1", req_ids, add_blocks, new_len, i_add,
-                                 i_len)
+        g._process_scheduled_req("r1", req_ids, add_blocks, new_len, i_add, i_len)
         assert add_blocks[0] == []  # 非 rank0：无 gsa 池分配（保持空）
         assert new_len[0] == 2
         assert i_add[0] == [] and i_len[0] == 2
@@ -1611,8 +1680,7 @@ class TestBuildMetaAndExecute:
         g._sync_block_tables(["r1"], [None], [None], [None], [2])
         assert stat.indexer_slab_host_slot == [7, 8]
 
-    def test_sync_block_tables_offload_rank_nonzero(self, make_gsa,
-                                                    monkeypatch):
+    def test_sync_block_tables_offload_rank_nonzero(self, make_gsa, monkeypatch):
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         g = make_gsa(rank=1)
         md, stat = _prime_metadata(g)
@@ -1627,8 +1695,7 @@ class TestBuildMetaAndExecute:
         g = gsa_worker
         md, stat = _prime_metadata(g)
         g.gsa_metadata = md
-        g._apply_add_blocks(["r1", "r2"], [[7, 8], [9]], [2, 0],
-                            is_indexer=False)
+        g._apply_add_blocks(["r1", "r2"], [[7, 8], [9]], [2, 0], is_indexer=False)
         assert stat.slab_host_slot == [7, 8]
         # 第二项 new_blocks_len == 0 → continue（r2 不在 stats 也不报错）
 
@@ -1658,8 +1725,9 @@ class TestBuildMetaAndExecute:
     def test_init_dsa_data_log_disabled(self, gsa_worker):
         g = gsa_worker
         calls = []
-        g.log = SimpleNamespace(is_info_enabled=False,
-                                info=lambda *a, **k: calls.append(a))
+        g.log = SimpleNamespace(
+            is_info_enabled=False, info=lambda *a, **k: calls.append(a)
+        )
         g.init_dsa_data(SimpleNamespace())
         assert calls == []
 
@@ -1713,7 +1781,8 @@ class TestIndexer:
         g = make_gsa(rank=1)
         for layer in range(g.layer_num):
             g.indexer_k_cache_sparse[layer] = torch.zeros(
-                (16, 128, 1, 128), dtype=torch.float16)
+                (16, 128, 1, 128), dtype=torch.float16
+            )
         stat = self._indexer_stat(g, output=0)
         g.need_cal_k_mean = ["r1"]
         g.indexer_block_table_sm.read_result = [[7]]
@@ -1725,8 +1794,7 @@ class TestIndexer:
         g = make_gsa()
         g._apply_indexer_add_blocks(["r1"], None, [1])  # 早退
 
-    def test_apply_indexer_add_blocks_skips_zero_len(self, make_gsa,
-                                                     monkeypatch):
+    def test_apply_indexer_add_blocks_skips_zero_len(self, make_gsa, monkeypatch):
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         g = make_gsa()
         md, stat1 = _prime_metadata(g)
@@ -1781,9 +1849,11 @@ class TestIndexer:
         # None 赋值晚于 init_gsa_metadata 的创建语句，构造完成后恒为 None；
         # 此处手动重建以覆盖 cal_indexer_topk_blocks 主路径
         g.indexer_last_query = gsa_mod.TopkIndices(
-            (g.layer_num, 4, 32, 128), g.device, g.dtype)
+            (g.layer_num, 4, 32, 128), g.device, g.dtype
+        )
         g.indexer_last_weight = gsa_mod.TopkIndices(
-            (g.layer_num, 4, 32), g.device, g.dtype)
+            (g.layer_num, 4, 32), g.device, g.dtype
+        )
         g.max_topk_len = [3]  # 通常由 cal_indexer_k_repr_mean_decode 设置
         stat = self._indexer_stat(g, **(stat_kw or {}))
         stat.slab_host_slot = [3, 4, 5, 6]
@@ -1794,11 +1864,14 @@ class TestIndexer:
         g.need_indexer_sparse_bs = [0]
         g.need_indexer_sparse_reqs = ["r1"]
         g.repre_slot_mappings = gsa_mod.make_tensor_with_pad(
-            [[3, 4, 5, 6]], pad=0, dtype=torch.int32, device="cpu")
+            [[3, 4, 5, 6]], pad=0, dtype=torch.int32, device="cpu"
+        )
         g.include_masks = gsa_mod.make_tensor_with_pad(
-            [[False] * 4], pad=False, dtype=torch.uint8, device="cpu")
+            [[False] * 4], pad=False, dtype=torch.uint8, device="cpu"
+        )
         g.exclude_masks = gsa_mod.make_tensor_with_pad(
-            [[False] * 4], pad=True, dtype=torch.uint8, device="cpu")
+            [[False] * 4], pad=True, dtype=torch.uint8, device="cpu"
+        )
         # 有区分度的 key 表征 → topk 结果确定
         torch.manual_seed(42)
         for layer in range(g.layer_num):
@@ -1821,8 +1894,8 @@ class TestIndexer:
         stat = self._setup_topk(g)
         # include 位置 0 → inf：topk 第一名必为块 0
         g.include_masks = gsa_mod.make_tensor_with_pad(
-            [[True, False, False, False]], pad=False, dtype=torch.uint8,
-            device="cpu")
+            [[True, False, False, False]], pad=False, dtype=torch.uint8, device="cpu"
+        )
         g.cal_indexer_topk_blocks()
         assert stat.indexer_topk_blocks[:, 0].tolist() == [0, 0]
 
@@ -1831,7 +1904,8 @@ class TestIndexer:
         g = make_gsa(speculative=fakes.FakeSpeculativeConfig(2))  # spec=3
         for layer in range(g.layer_num):
             g.indexer_k_cache_sparse[layer] = torch.zeros(
-                (16, 128, 1, 128), dtype=torch.float16)
+                (16, 128, 1, 128), dtype=torch.float16
+            )
         stat = self._setup_topk(g)
         g.indexer_last_q_index_fb = [0, 2]
         # last_q_index_fb[0] + rec_result[0] = 0+1 = 1 → 取 last_query[:, 1]
@@ -1853,8 +1927,7 @@ class TestIndexer:
         g.need_indexer_sparse_reqs = ["r1"]
         g.set_indexer_topk_blocks_prefill()
         assert stat.is_indexer_init is False
-        assert not g.prefetch_engine.prefetch_engine_c.called(
-            "set_indexer_map")
+        assert not g.prefetch_engine.prefetch_engine_c.called("set_indexer_map")
 
     def test_prefill_topk_full(self, make_gsa, monkeypatch):
         g = self._offload_gsa(make_gsa, monkeypatch)
@@ -1876,8 +1949,9 @@ class TestIndexer:
         calls = g.prefetch_engine.prefetch_engine_c.called("set_indexer_map")
         assert len(calls) == 1
         assert g.prefetch_engine.prefetch_engine_c.called("indexer_init_load")
-        assert (stat.indexer_block_tables ==
-                stat.prefetch_indexer_block_tables_cpu.numpy()).all()
+        assert (
+            stat.indexer_block_tables == stat.prefetch_indexer_block_tables_cpu.numpy()
+        ).all()
 
     # ---------------- set_indexer_topk_blocks_decode ----------------
     def test_decode_topk_early_returns(self, gsa_worker, monkeypatch):
@@ -1894,8 +1968,7 @@ class TestIndexer:
         g.need_indexer_sparse_reqs = ["r1"]
         g.prefetch_engine.prefetch_engine_c.indexer_status = [True]
         g.set_indexer_topk_blocks_decode()  # is_indexer_load=True → 不提交
-        assert not g.prefetch_engine.prefetch_engine_c.called(
-            "submit_task_indexer")
+        assert not g.prefetch_engine.prefetch_engine_c.called("submit_task_indexer")
 
     def test_decode_topk_submit(self, make_gsa, monkeypatch):
         g = self._offload_gsa(make_gsa, monkeypatch)
@@ -1904,8 +1977,7 @@ class TestIndexer:
         g.need_indexer_sparse_reqs = ["r1"]
         g.prefetch_engine.prefetch_engine_c.indexer_status = [False]
         g.set_indexer_topk_blocks_decode()
-        calls = g.prefetch_engine.prefetch_engine_c.called(
-            "submit_task_indexer")
+        calls = g.prefetch_engine.prefetch_engine_c.called("submit_task_indexer")
         assert len(calls) == 1
         assert calls[0][1][0] == [2]  # topk_lens_input
         assert calls[0][1][1] == ["r1"]
@@ -1916,8 +1988,7 @@ class TestIndexer:
         g.need_indexer_sparse_reqs = ["r1"]
         g.prefetch_engine.prefetch_engine_c.indexer_status = [False]
         g.set_indexer_topk_blocks_decode()  # req_id_list 空 → return
-        assert not g.prefetch_engine.prefetch_engine_c.called(
-            "submit_task_indexer")
+        assert not g.prefetch_engine.prefetch_engine_c.called("submit_task_indexer")
 
     # ---------------- update_slot_num ----------------
     def test_update_slot_num_rank0_offload(self, make_gsa, monkeypatch):
@@ -1997,12 +2068,12 @@ class TestWarmup:
         g = make_gsa()
         for layer in range(g.layer_num):
             g.indexer_k_cache_sparse[layer] = torch.zeros(
-                (16, 128, 1, 128), dtype=torch.float16)
+                (16, 128, 1, 128), dtype=torch.float16
+            )
         stat = self._warmup_setup(g, offload=True)
         # offload + inject_indexer：prompt 200 <= 32768 → False 侧
         g._warmup_dump_blocks()
-        assert not g.prefetch_engine.prefetch_engine_c.called(
-            "set_last_indexer_blocks")
+        assert not g.prefetch_engine.prefetch_engine_c.called("set_last_indexer_blocks")
         # prompt > INDEXER_PREFETCH_TOKENS → inject_indexer True 侧
         stat.num_prompt_tokens = 40000
         stat.block_hashes = [bytes([i]) * 16 for i in range(2)]
@@ -2010,8 +2081,7 @@ class TestWarmup:
         g.indexer_cache_preempt_i_ptr = 3000
         g.indexer_cache_preempt_i_offset = 30
         g._warmup_dump_blocks()
-        assert g.prefetch_engine.prefetch_engine_c.called(
-            "set_last_indexer_blocks")
+        assert g.prefetch_engine.prefetch_engine_c.called("set_last_indexer_blocks")
 
     def test_warmup_dump_sfa_c8(self, make_gsa):
         g = make_gsa(additional_config={"enable_sparse_sfa_c8": True})
@@ -2023,20 +2093,23 @@ class TestWarmup:
 
     def test_get_vllm_blocks_branches(self, gsa_worker, make_gsa, monkeypatch):
         g = gsa_worker
-        stat = SimpleNamespace(blocks=[1, 2, 3], slab_host_slot=[],
-                               indexer_slab_host_slot=[2])
+        stat = SimpleNamespace(
+            blocks=[1, 2, 3], slab_host_slot=[], indexer_slab_host_slot=[2]
+        )
         # 非 offload + spec==1 → 原样返回
         assert g._get_vllm_blocks(stat) == [1, 2, 3]
         # spec>1 且 blocks 多于 slots → blocks[:-1]
         gs = make_gsa(speculative=fakes.FakeSpeculativeConfig(1))  # spec=2
         assert gs._get_vllm_blocks(stat) == [1, 2]
         # spec>1 但 blocks 不多 → 原样
-        stat2 = SimpleNamespace(blocks=[1, 2], slab_host_slot=[],
-                                indexer_slab_host_slot=[1, 2, 3])
+        stat2 = SimpleNamespace(
+            blocks=[1, 2], slab_host_slot=[], indexer_slab_host_slot=[1, 2, 3]
+        )
         assert gs._get_vllm_blocks(stat2) == [1, 2]
         # offload → 用 slab_host_slot 长度判断
-        stat3 = SimpleNamespace(blocks=[1, 2, 3, 4], slab_host_slot=[1],
-                                indexer_slab_host_slot=[])
+        stat3 = SimpleNamespace(
+            blocks=[1, 2, 3, 4], slab_host_slot=[1], indexer_slab_host_slot=[]
+        )
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         assert gs._get_vllm_blocks(stat3) == [1, 2, 3]
 
@@ -2080,8 +2153,7 @@ class TestExecuteFinished:
         g.warmup_topk = []
         g.is_prefetch_token = True
         g.execute_finished()
-        assert g.prefetch_engine.prefetch_engine_c.called(
-            "submit_prefetch_task")
+        assert g.prefetch_engine.prefetch_engine_c.called("submit_prefetch_task")
 
     def test_prefetch_token_branch_perf_off(self, gsa_worker, monkeypatch):
         monkeypatch.setattr(gsa_mod, "IS_PERFORMANCE_LOG", False)
@@ -2096,8 +2168,7 @@ class TestExecuteFinished:
         g = gsa_worker
         _, stat = _prime_metadata(g, output=1)
         g.prefetch_topk = [[[0], "r1"]]
-        topk_lens, req_ids, offloads, seq_lens = g._prepare_prefetch_requests(
-            None)
+        topk_lens, req_ids, offloads, seq_lens = g._prepare_prefetch_requests(None)
         assert topk_lens == [2048]
         assert req_ids == ["r1"]
         assert offloads == [False]
@@ -2110,14 +2181,13 @@ class TestExecuteFinished:
         g.prefetch_topk = [[[0, 1, 2], "r1"]]
         rec_result = [2]
         topk_lens, req_ids, offloads, seq_lens = g._prepare_prefetch_requests(
-            rec_result)
+            rec_result
+        )
         # seq = 201 - 3 + 2 + 1 = 201
         assert seq_lens == [201]
-        assert g.select_gsa_prefetch_topk[:, 0].shape == \
-            (g.topk_layer_num, 1, 2048)
+        assert g.select_gsa_prefetch_topk[:, 0].shape == (g.topk_layer_num, 1, 2048)
 
-    def test_prepare_prefetch_requests_offload_flag(self, make_gsa,
-                                                    monkeypatch):
+    def test_prepare_prefetch_requests_offload_flag(self, make_gsa, monkeypatch):
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         g = make_gsa()
         _, stat = _prime_metadata(g, output=1)
@@ -2131,16 +2201,14 @@ class TestExecuteFinished:
         g.topk_indices_len = 0
         g.prefetch_space_token = 5
         g._submit_prefetch_task([0], ["r1"], [False], [None])
-        assert not g.prefetch_engine.prefetch_engine_c.called(
-            "submit_prefetch_task")
+        assert not g.prefetch_engine.prefetch_engine_c.called("submit_prefetch_task")
         assert g.prefetch_space_token == 5  # 未重置
 
     def test_submit_prefetch_task_spec1(self, gsa_worker):
         g = gsa_worker
         g.prefetch_space_token = 5
         g._submit_prefetch_task([2048], ["r1"], [False], [201])
-        calls = g.prefetch_engine.prefetch_engine_c.called(
-            "submit_prefetch_task")
+        calls = g.prefetch_engine.prefetch_engine_c.called("submit_prefetch_task")
         assert len(calls) == 1
         assert calls[0][1][3] is g.gsa_prefetch_topk.cpu
         assert g.prefetch_space_token == 0
@@ -2148,8 +2216,7 @@ class TestExecuteFinished:
     def test_submit_prefetch_task_spec_gt1(self, make_gsa):
         g = make_gsa(speculative=fakes.FakeSpeculativeConfig(2))
         g._submit_prefetch_task([2048], ["r1"], [False], [201])
-        calls = g.prefetch_engine.prefetch_engine_c.called(
-            "submit_prefetch_task")
+        calls = g.prefetch_engine.prefetch_engine_c.called("submit_prefetch_task")
         assert calls[0][1][3] is g.select_gsa_prefetch_topk
 
 
@@ -2168,9 +2235,9 @@ class _FakeCoordinator:
     def allocate_new_blocks(self, req_id, num_tokens, num_encoder):
         self.calls.append(("allocate", req_id, num_tokens))
 
-    single_type_managers = property(lambda self: [
-        SimpleNamespace(req_to_blocks={1: [10, 11]})
-    ])
+    single_type_managers = property(
+        lambda self: [SimpleNamespace(req_to_blocks={1: [10, 11]})]
+    )
 
 
 class _FakeBlockPool:
@@ -2212,11 +2279,14 @@ class TestSchedulerSide:
         # 对象，非 req_id）直接传给 _load_kv_dram —— 疑似源码问题，此处用
         # cached 路径规避（new-req 路径已在 TestBuildMetaAndExecute 覆盖）
         so = fakes.FakeSchedulerOutput(
-            num_scheduled_tokens={"r1": 1}, cached_req_ids=["r1"],
+            num_scheduled_tokens={"r1": 1},
+            cached_req_ids=["r1"],
         )
         add = fakes.FakeAddReqState(
-            block_ids=[[5, 6]], prompt_token_ids=list(range(max(prompt, 1))),
-            output_token_ids=[1], num_computed_tokens=200,
+            block_ids=[[5, 6]],
+            prompt_token_ids=list(range(max(prompt, 1))),
+            output_token_ids=[1],
+            num_computed_tokens=200,
         )
         requests = {"r1": add}
         input_batch = fakes.FakeInputBatch({"r1": 0})
@@ -2241,8 +2311,9 @@ class TestSchedulerSide:
 
     def test_build_sparse_meta_gsa_request(self, gsa_worker, monkeypatch):
         g = gsa_worker
-        so, requests, input_batch = self._build_setup(g, monkeypatch, seg=64,
-                                                      prompt=200)
+        so, requests, input_batch = self._build_setup(
+            g, monkeypatch, seg=64, prompt=200
+        )
         # PD 分离的预取触发条件是 output == 0（请求刚到 decode 节点）
         requests["r1"].output_token_ids = []
         g.build_sparse_meta(so, requests, input_batch, {})
@@ -2250,8 +2321,7 @@ class TestSchedulerSide:
         assert g.gsa_index == [0]
         assert g.is_all_gsa is True
 
-    def test_build_sparse_meta_new_reqs_and_has_prefill(self, gsa_worker,
-                                                        monkeypatch):
+    def test_build_sparse_meta_new_reqs_and_has_prefill(self, gsa_worker, monkeypatch):
         g = gsa_worker
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 32768)
         g._store_injected = True
@@ -2259,11 +2329,12 @@ class TestSchedulerSide:
         md = gsa_mod.GSAMetaData(g._vllm_config, 2)
         md.gsa_stats[nr] = gsa_mod.GSAReqStat(nr, g._vllm_config, 2)
         g.gsa_stats = md.gsa_stats
-        so = fakes.FakeSchedulerOutput(num_scheduled_tokens={nr: 1},
-                                       new_reqs=[nr])
+        so = fakes.FakeSchedulerOutput(num_scheduled_tokens={nr: 1}, new_reqs=[nr])
         add = fakes.FakeAddReqState(
-            block_ids=[[5]], prompt_token_ids=list(range(200)),
-            output_token_ids=[], num_computed_tokens=0,
+            block_ids=[[5]],
+            prompt_token_ids=list(range(200)),
+            output_token_ids=[],
+            num_computed_tokens=0,
         )
         g.build_sparse_meta(so, {nr: add}, fakes.FakeInputBatch({nr: 0}), {})
         # prefill 请求（prompt 200 > computed 0）→ has_prefill True
@@ -2299,8 +2370,7 @@ class TestSchedulerSide:
         monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
         g.request_finished_in_scheduler("r1")  # 开关关闭 → 早退
 
-    def test_request_finished_in_worker_early_return(self, make_gsa,
-                                                     monkeypatch):
+    def test_request_finished_in_worker_early_return(self, make_gsa, monkeypatch):
         monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
         gsa_worker = make_gsa()
         gsa_worker.request_finished_in_worker("r1")
@@ -2319,8 +2389,9 @@ class TestSchedulerSide:
         assert g.prefetch_engine.prefetch_engine_c.called("del_blocks_map")
         assert "r1" not in g._block_hash_injected_reqs
 
-    def test_request_finished_in_worker_offload_empty_slots(self, make_gsa,
-                                                            monkeypatch):
+    def test_request_finished_in_worker_offload_empty_slots(
+        self, make_gsa, monkeypatch
+    ):
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         g = make_gsa()
         md, stat = _prime_metadata(g)
@@ -2348,8 +2419,7 @@ class TestSchedulerSide:
         g.request_finished_in_worker("r1")
         assert len(ec.called("get_prefetch_status")) == 2
 
-    def test_request_finished_in_worker_offload_slots(self, make_gsa,
-                                                      monkeypatch):
+    def test_request_finished_in_worker_offload_slots(self, make_gsa, monkeypatch):
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         g = make_gsa()
         md, stat = _prime_metadata(g)
@@ -2362,8 +2432,7 @@ class TestSchedulerSide:
         assert 2 in g.indexer_cpu_shared_pool.free_slots
         assert 3 in g.gsa_preempt_shared_pool.free_slots
 
-    def test_request_finished_in_worker_indexer_busy(self, make_gsa,
-                                                     monkeypatch):
+    def test_request_finished_in_worker_indexer_busy(self, make_gsa, monkeypatch):
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         g = make_gsa()
         md, stat = _prime_metadata(g)
@@ -2416,17 +2485,17 @@ class TestSchedulerSide:
 
     def test_estimate_num_slots_invalid_paths(self, gsa_worker, monkeypatch):
         monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
-        req = fakes.FakeRequest(num_output_tokens=5,
-                                prompt_token_ids=list(range(100)))
-        assert gsa_worker.estimate_num_slots_sparsed(req) == \
-            gsa_mod.INVALID_SLOT
+        req = fakes.FakeRequest(num_output_tokens=5, prompt_token_ids=list(range(100)))
+        assert gsa_worker.estimate_num_slots_sparsed(req) == gsa_mod.INVALID_SLOT
 
     def test_estimate_num_slots_preempted(self, gsa_worker, monkeypatch):
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 64)
         g = gsa_worker
         req = fakes.FakeRequest(
-            num_output_tokens=5, prompt_token_ids=list(range(100)),
-            status=gsa_mod.RequestStatus.PREEMPTED)
+            num_output_tokens=5,
+            prompt_token_ids=list(range(100)),
+            status=gsa_mod.RequestStatus.PREEMPTED,
+        )
         # preempt 记录 5 → 修正后 output 5-5=0 → INVALID_SLOT
         assert g.estimate_num_slots_sparsed(req) == gsa_mod.INVALID_SLOT
         assert g.preempt_req_output_tokens[1] == 5
@@ -2434,40 +2503,43 @@ class TestSchedulerSide:
     def test_estimate_num_slots_normal(self, gsa_worker, monkeypatch):
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 64)
         g = gsa_worker
-        req = fakes.FakeRequest(num_output_tokens=5, num_prompt_tokens=200,
-                                prompt_token_ids=list(range(200)))
-        assert g.estimate_num_slots_sparsed(req) == \
-            5 + gsa_mod.GSA_SPARSE_LEN + 3
+        req = fakes.FakeRequest(
+            num_output_tokens=5,
+            num_prompt_tokens=200,
+            prompt_token_ids=list(range(200)),
+        )
+        assert g.estimate_num_slots_sparsed(req) == 5 + gsa_mod.GSA_SPARSE_LEN + 3
 
-    def test_estimate_num_slots_preempt_adjusted(self, gsa_worker,
-                                                 monkeypatch):
+    def test_estimate_num_slots_preempt_adjusted(self, gsa_worker, monkeypatch):
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 64)
         g = gsa_worker
         g.preempt_req_output_tokens[1] = 3
-        req = fakes.FakeRequest(num_output_tokens=5, num_prompt_tokens=200,
-                                prompt_token_ids=list(range(200)))
+        req = fakes.FakeRequest(
+            num_output_tokens=5,
+            num_prompt_tokens=200,
+            prompt_token_ids=list(range(200)),
+        )
         # 修正后 output = 5-3 = 2
-        assert g.estimate_num_slots_sparsed(req) == \
-            2 + gsa_mod.GSA_SPARSE_LEN + 3
+        assert g.estimate_num_slots_sparsed(req) == 2 + gsa_mod.GSA_SPARSE_LEN + 3
 
     def test_estimate_num_slots_zero_output_or_short_prompt(self, gsa_worker):
         g = gsa_worker
-        req = fakes.FakeRequest(num_output_tokens=0,
-                                prompt_token_ids=list(range(100)))
+        req = fakes.FakeRequest(num_output_tokens=0, prompt_token_ids=list(range(100)))
         assert g.estimate_num_slots_sparsed(req) == gsa_mod.INVALID_SLOT
         req = fakes.FakeRequest(num_output_tokens=2, prompt_token_ids=[1, 2])
         assert g.estimate_num_slots_sparsed(req) == gsa_mod.INVALID_SLOT
 
     def test_allocate_slots_early_return(self, gsa_worker, monkeypatch):
         monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
-        assert gsa_worker.allocate_slots(_fake_kv_cache_manager(),
-                                         fakes.FakeRequest(), 10) is None
+        assert (
+            gsa_worker.allocate_slots(_fake_kv_cache_manager(), fakes.FakeRequest(), 10)
+            is None
+        )
 
     def test_allocate_slots_success_output_one(self, gsa_worker):
         g = gsa_worker
         mgr = _fake_kv_cache_manager()
-        req = fakes.FakeRequest(num_output_tokens=1,
-                                prompt_token_ids=list(range(100)))
+        req = fakes.FakeRequest(num_output_tokens=1, prompt_token_ids=list(range(100)))
         result = g.allocate_slots(mgr, req, 10)
         assert req.cache_salt is not None and req.cache_salt.startswith("gsa")
         assert result.blocks == ([10, 11],)
@@ -2479,8 +2551,7 @@ class TestSchedulerSide:
         monkeypatch.setattr(gsa_mod, "VLLM_ASCEND_VERSION", "0.13")
         g = gsa_worker
         mgr = _fake_kv_cache_manager()
-        req = fakes.FakeRequest(num_output_tokens=1,
-                                prompt_token_ids=list(range(100)))
+        req = fakes.FakeRequest(num_output_tokens=1, prompt_token_ids=list(range(100)))
         result = g.allocate_slots(mgr, req, 10)
         assert result is not None
         assert "num_tokens_main_model" not in mgr.coordinator.calls[0]
@@ -2488,16 +2559,16 @@ class TestSchedulerSide:
     def test_allocate_slots_unsupported_version(self, gsa_worker, monkeypatch):
         monkeypatch.setattr(gsa_mod, "VLLM_ASCEND_VERSION", "0.9")
         g = gsa_worker
-        req = fakes.FakeRequest(num_output_tokens=1,
-                                prompt_token_ids=list(range(100)))
+        req = fakes.FakeRequest(num_output_tokens=1, prompt_token_ids=list(range(100)))
         assert g.allocate_slots(_fake_kv_cache_manager(), req, 10) is None
 
     def test_allocate_slots_preempt_adjusted(self, gsa_worker):
         g = gsa_worker
         g.preempt_req_output_tokens[1] = 3
         mgr = _fake_kv_cache_manager()
-        req = fakes.FakeRequest(num_output_tokens=5,  # 修正为 2
-                                prompt_token_ids=list(range(100)))
+        req = fakes.FakeRequest(
+            num_output_tokens=5, prompt_token_ids=list(range(100))  # 修正为 2
+        )
         result = g.allocate_slots(mgr, req, 10)
         assert result is not None
         assert req.cache_salt is None  # 修正后 ≠1 → 不重置 cache_salt
@@ -2506,9 +2577,9 @@ class TestSchedulerSide:
         g = gsa_worker
         mgr = _fake_kv_cache_manager(
             coordinator=_FakeCoordinator(num_blocks=200),
-            block_pool=_FakeBlockPool(free_blocks=10))
-        req = fakes.FakeRequest(num_output_tokens=1,
-                                prompt_token_ids=list(range(100)))
+            block_pool=_FakeBlockPool(free_blocks=10),
+        )
+        req = fakes.FakeRequest(num_output_tokens=1, prompt_token_ids=list(range(100)))
         assert g.allocate_slots(mgr, req, 10) is None
 
     def test_allocate_slots_sparse_preempted(self, gsa_worker, monkeypatch):
@@ -2516,8 +2587,7 @@ class TestSchedulerSide:
         g = gsa_worker
         g.begin_sch_flag()
         mgr = _fake_kv_cache_manager(coordinator=_FakeCoordinator(num_blocks=90))
-        req = fakes.FakeRequest(num_output_tokens=5,
-                                prompt_token_ids=list(range(100)))
+        req = fakes.FakeRequest(num_output_tokens=5, prompt_token_ids=list(range(100)))
         # num_output > 1 → estimate：free_i(100)-90 < 20 → 判定抢占 → None
         assert g.allocate_slots(mgr, req, 10) is None
 
@@ -2627,8 +2697,9 @@ class TestBuffers:
         # 二次注册同层 → 早退（不再新增调用）
         n = len(g.prefetch_engine.prefetch_engine_c.called("set_kvTensor_Layer"))
         g.init_kvcache_ptrs(kv_cache, kv_cache[2], kv_cache[3], 0)
-        assert len(g.prefetch_engine.prefetch_engine_c.called(
-            "set_kvTensor_Layer")) == n
+        assert (
+            len(g.prefetch_engine.prefetch_engine_c.called("set_kvTensor_Layer")) == n
+        )
 
     def test_init_kvcache_ptrs_offload_index(self, make_gsa, monkeypatch):
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)

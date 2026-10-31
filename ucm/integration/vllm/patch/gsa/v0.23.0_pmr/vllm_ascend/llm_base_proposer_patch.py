@@ -5,16 +5,25 @@ from __future__ import annotations
 from types import FunctionType
 
 from vllm.config import CUDAGraphMode
+
 from ucm.integration.vllm.patch.utils import patch_or_inject, when_imported
 from ucm.logger import init_logger
 
 logger = init_logger(__name__)
 
 
-def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
+def __init__(
+    self,
+    vllm_config: VllmConfig,
+    device: torch.device,
+    pass_hidden_states_to_model: bool,
+    runner=None,
+):
     from ucm.utils import Config
 
-    super(AscendSpecDecodeBaseProposer, self).__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
+    super(AscendSpecDecodeBaseProposer, self).__init__(
+        vllm_config, device, pass_hidden_states_to_model, runner=runner
+    )
 
     ucm_config = Config(vllm_config.kv_transfer_config)
     self.launch_config = ucm_config.get_config()
@@ -44,12 +53,18 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_st
     )
 
     self.use_async_scheduling = self.vllm_config.scheduler_config.async_scheduling
-    self.use_compress = hasattr(self.vllm_config.model_config.hf_config, "compress_ratios")
+    self.use_compress = hasattr(
+        self.vllm_config.model_config.hf_config, "compress_ratios"
+    )
     self.has_gdn = check_gdn_layer(self.vllm_config)
     self.pass_hidden_states_to_model = pass_hidden_states_to_model
     self.decode_threshold = 1 + self.num_speculative_tokens_mtp
-    self.query_start_loc = self.runner._make_buffer(self.runner.max_num_reqs + 2, dtype=torch.int32)
-    self.arange_cpu = torch.arange(self.arange.shape[0], device="cpu", dtype=torch.int32)
+    self.query_start_loc = self.runner._make_buffer(
+        self.runner.max_num_reqs + 2, dtype=torch.int32
+    )
+    self.arange_cpu = torch.arange(
+        self.arange.shape[0], device="cpu", dtype=torch.int32
+    )
     self.attn_mask_builder = AttentionMaskBuilder(self.device)
 
     self.enable_shared_expert_dp = shared_expert_dp_enabled()
@@ -62,8 +77,12 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_st
     self._share_mtp_indices = False
     spec_config = self.vllm_config.speculative_config
     draft_model_config = getattr(spec_config, "draft_model_config", None)
-    draft_hf_config = draft_model_config.hf_config if draft_model_config is not None else None
-    self._share_mtp_indices = getattr(draft_hf_config, "index_share_for_mtp_iteration", False)
+    draft_hf_config = (
+        draft_model_config.hf_config if draft_model_config is not None else None
+    )
+    self._share_mtp_indices = getattr(
+        draft_hf_config, "index_share_for_mtp_iteration", False
+    )
 
     # NOTE:
     # `draft_tensor_parallel_size` does not take effect for Eagle:
@@ -74,7 +93,10 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_st
     # or the same as target model.
     # TODO(zhaomingyu13): If we want to adapt to the case where draft model tp
     # is not 1 and differs from target model, this part should be rewritten.
-    if vllm_config.parallel_config.tensor_parallel_size != self.speculative_config.draft_tensor_parallel_size:
+    if (
+        vllm_config.parallel_config.tensor_parallel_size
+        != self.speculative_config.draft_tensor_parallel_size
+    ):
         tp_group = init_model_parallel_group(
             [[get_world_group().rank]],
             get_world_group().rank,
@@ -82,11 +104,15 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_st
             use_message_queue_broadcaster=True,
             group_name="tp",
         )
-        self.tp_group_context: AbstractContextManager[Any] = patch_tensor_parallel_group(tp_group)
+        self.tp_group_context: AbstractContextManager[Any] = (
+            patch_tensor_parallel_group(tp_group)
+        )
     else:
         self.tp_group_context = nullcontext()
 
-    self.use_cuda_graph = self.runner._use_aclgraph() and not self.speculative_config.enforce_eager
+    self.use_cuda_graph = (
+        self.runner._use_aclgraph() and not self.speculative_config.enforce_eager
+    )
     self._raise_if_padded_drafter_batch_disabled_and_full_graph_enabled()
 
     # GLM series models: speculative decoding does not yet support running
@@ -113,23 +139,44 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_st
         self.maybe_eager_context = _maybe_eager_context(vllm_config)
 
     self.token_indices_to_sample = torch.zeros(
-        self.vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.int32, device=device
+        self.vllm_config.scheduler_config.max_num_batched_tokens,
+        dtype=torch.int32,
+        device=device,
     )
-    metadata_lens = self.runner.max_num_tokens + 2 * self.pcp_size * self.runner.max_num_reqs
-    num_mtp_draft_slots = max(self.num_speculative_tokens - 1, 0) * self.runner.max_num_reqs
+    metadata_lens = (
+        self.runner.max_num_tokens + 2 * self.pcp_size * self.runner.max_num_reqs
+    )
+    num_mtp_draft_slots = (
+        max(self.num_speculative_tokens - 1, 0) * self.runner.max_num_reqs
+    )
     slot_mapping_lens = metadata_lens + num_mtp_draft_slots
     self.slot_mapping_group = [
-        torch.zeros(slot_mapping_lens, dtype=torch.int32, device=device, pin_memory=self.runner.pin_memory)
+        torch.zeros(
+            slot_mapping_lens,
+            dtype=torch.int32,
+            device=device,
+            pin_memory=self.runner.pin_memory,
+        )
         for _ in range(self.num_speculative_tokens_mtp)
     ]
 
     # dsv32 needs seq_lens and query_start_loc persistent tensors for full graph mode
     self.seq_lens_group = [
-        torch.zeros(metadata_lens, dtype=torch.int32, device=device, pin_memory=self.runner.pin_memory)
+        torch.zeros(
+            metadata_lens,
+            dtype=torch.int32,
+            device=device,
+            pin_memory=self.runner.pin_memory,
+        )
         for _ in range(self.num_speculative_tokens_mtp)
     ]
     self.query_start_loc_group = [
-        torch.zeros(metadata_lens, dtype=torch.int32, device=device, pin_memory=self.runner.pin_memory)
+        torch.zeros(
+            metadata_lens,
+            dtype=torch.int32,
+            device=device,
+            pin_memory=self.runner.pin_memory,
+        )
         for _ in range(self.num_speculative_tokens_mtp)
     ]
 
@@ -140,7 +187,9 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_st
     self._runnable = self._run_merged_draft
     self.is_multimodal_model = self.vllm_config.model_config.is_multimodal_model
     if self.uses_mrope:
-        self.mrope_positions = torch.zeros((3, self.max_num_tokens + 1), dtype=torch.int32, device=device)
+        self.mrope_positions = torch.zeros(
+            (3, self.max_num_tokens + 1), dtype=torch.int32, device=device
+        )
     elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
         self.xdrope_positions = torch.zeros(
             (self.uses_xdrope_dim, self.max_num_tokens + 1),
@@ -149,12 +198,13 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_st
         )
     else:
         # RoPE need (max_num_tokens,)
-        self.positions = torch.zeros(self.max_num_tokens, dtype=torch.int32, device=device)
+        self.positions = torch.zeros(
+            self.max_num_tokens, dtype=torch.int32, device=device
+        )
 
     self.token_arange_np = np.arange(self.max_num_tokens + 1, dtype=np.int32)
     self.enable_enpu = self.runner.enable_enpu
     self.use_eagle = self.runner.use_eagle
-
 
 
 def dummy_run(
@@ -189,7 +239,8 @@ def dummy_run(
     ):
         self.block_table_tensor_clone = torch.zeros(
             (
-                self.runner.max_num_tokens + 2 * self.pcp_size * self.runner.max_num_reqs,
+                self.runner.max_num_tokens
+                + 2 * self.pcp_size * self.runner.max_num_reqs,
                 self.runner.input_batch.block_table[0].get_device_tensor().shape[1],
             ),
             dtype=torch.int32,
@@ -198,10 +249,14 @@ def dummy_run(
         )
 
     if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0:
-        num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+        num_computed_tokens_cpu = (
+            self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+        )
 
         # num_reqs is already the padded version
-        self.query_start_loc.cpu[: num_reqs + 1].copy_(self.runner.query_start_loc.cpu[: num_reqs + 1])
+        self.query_start_loc.cpu[: num_reqs + 1].copy_(
+            self.runner.query_start_loc.cpu[: num_reqs + 1]
+        )
         copy_snapshot_to_gpu(self.query_start_loc)
 
         common_attn_metadata = AscendCommonAttentionMetadata(
@@ -217,13 +272,17 @@ def dummy_run(
             max_query_len=self.num_speculative_tokens_mtp + 1,
             num_computed_tokens_cpu=num_computed_tokens_cpu,
             actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
-            block_table_tensor=self.runner.input_batch.block_table[self.kv_cache_gid].get_device_tensor()[
-                :num_reqs
-            ],
+            block_table_tensor=self.runner.input_batch.block_table[
+                self.kv_cache_gid
+            ].get_device_tensor()[:num_reqs],
             # This is used to hold a position.
-            slot_mapping=self.runner.input_batch.block_table[self.kv_cache_gid].slot_mapping.gpu,
+            slot_mapping=self.runner.input_batch.block_table[
+                self.kv_cache_gid
+            ].slot_mapping.gpu,
             positions=self.runner.positions,
-            positions_cpu=self.runner._dsa_positions_cpu_buf if self.use_compress else None,
+            positions_cpu=(
+                self.runner._dsa_positions_cpu_buf if self.use_compress else None
+            ),
             attn_state=self.runner.attn_state,
             decode_token_per_req=self.runner.decode_token_per_req,
             is_prefilling=torch.zeros(num_reqs, dtype=torch.bool),
@@ -231,7 +290,9 @@ def dummy_run(
         )
         if pcp_manager is not None:
             # update long_seq related params and flatten block_table
-            common_attn_metadata.prefill_context_parallel_metadata = pcp_manager.long_seq_metadata
+            common_attn_metadata.prefill_context_parallel_metadata = (
+                pcp_manager.long_seq_metadata
+            )
 
         assert len(self.draft_attn_groups) > 0
         builder = self.draft_attn_groups[0].get_metadata_builder()
@@ -249,24 +310,40 @@ def dummy_run(
                 )
             # Set the real slot_mapping.
             slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
-            self.slot_mapping_group[draft_index][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping)
-            self.slot_mapping_group[draft_index][slot_mapping_lens:].fill_(PADDING_SLOT_ID)
+            self.slot_mapping_group[draft_index][:slot_mapping_lens].copy_(
+                common_attn_metadata.slot_mapping
+            )
+            self.slot_mapping_group[draft_index][slot_mapping_lens:].fill_(
+                PADDING_SLOT_ID
+            )
             common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_index]
-            self.seq_lens_group[draft_index][:num_reqs].copy_(common_attn_metadata.seq_lens)
+            self.seq_lens_group[draft_index][:num_reqs].copy_(
+                common_attn_metadata.seq_lens
+            )
             self.seq_lens_group[draft_index][num_reqs:].fill_(0)
             common_attn_metadata.seq_lens = self.seq_lens_group[draft_index][:num_reqs]
-            self.query_start_loc_group[draft_index][: num_reqs + 1].copy_(common_attn_metadata.query_start_loc)
+            self.query_start_loc_group[draft_index][: num_reqs + 1].copy_(
+                common_attn_metadata.query_start_loc
+            )
             self.query_start_loc_group[draft_index][num_reqs + 1 :].fill_(0)
-            common_attn_metadata.query_start_loc = self.query_start_loc_group[draft_index][: num_reqs + 1]
+            common_attn_metadata.query_start_loc = self.query_start_loc_group[
+                draft_index
+            ][: num_reqs + 1]
             if self.pcp_size * self.dcp_size > 1 and draft_index > 0:
-                assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
-                common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:num_reqs]
+                assert (
+                    self.block_table_tensor_clone is not None
+                ), "block_table_tensor_clone is not init"
+                common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[
+                    :num_reqs
+                ]
             if not self.use_compress or draft_index == 0:
                 attn_metadata_eagle = builder.build_for_graph_capture(
                     common_attn_metadata,
-                    AscendAttentionState.SpecDecoding
-                    if self.method == "mtp"
-                    else AscendAttentionState.ChunkedPrefill,
+                    (
+                        AscendAttentionState.SpecDecoding
+                        if self.method == "mtp"
+                        else AscendAttentionState.ChunkedPrefill
+                    ),
                     **extra_attn_metadata_args,
                 )
             else:
@@ -290,7 +367,9 @@ def dummy_run(
     if self.supports_mm_inputs:
         mm_embeds, is_mm_embed = (None, None)
         inputs_embeds = self.model.embed_input_ids(
-            self.input_ids[:num_tokens], multimodal_embeddings=mm_embeds, is_multimodal=is_mm_embed
+            self.input_ids[:num_tokens],
+            multimodal_embeddings=mm_embeds,
+            is_multimodal=is_mm_embed,
         )
         self.inputs_embeds[:num_tokens] = inputs_embeds
         inputs_embeds = self.inputs_embeds[:num_tokens]
@@ -319,7 +398,9 @@ def dummy_run(
         self._runnable(
             num_input_tokens=num_tokens,
             batch_size=batch_size,
-            token_indices_to_sample=self.token_indices_to_sample[: batch_size * self.extra_slots_per_request],
+            token_indices_to_sample=self.token_indices_to_sample[
+                : batch_size * self.extra_slots_per_request
+            ],
             # The target_position's address is same as the model_positions's
             target_positions=model_positions,
             inputs_embeds=inputs_embeds,
@@ -327,9 +408,13 @@ def dummy_run(
             num_tokens=num_tokens,
         )
         forward_context = get_forward_context()
-        if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
-            self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
-
+        if (
+            forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not _EXTRA_CTX.capturing
+        ):
+            self._update_full_graph_params(
+                forward_context, num_tokens, multi_steps_attn_metadata
+            )
 
 
 def _propose(
@@ -373,18 +458,20 @@ def _propose(
         target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
         assert target_hidden_states.shape[-1] == self.hidden_size
 
-    num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(
-        target_token_ids=target_token_ids,
-        next_token_ids=next_token_ids,
-        target_positions=target_positions,
-        target_hidden_states=target_hidden_states,
-        token_indices_to_sample=token_indices_to_sample,
-        cad=common_attn_metadata,
-        num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-        req_scheduled_tokens=req_scheduled_tokens,
-        long_seq_metadata=long_seq_metadata,
-        num_prefill_reqs=num_prefill_reqs,
-        num_decode_reqs=num_decode_reqs,
+    num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = (
+        self.set_inputs_first_pass(
+            target_token_ids=target_token_ids,
+            next_token_ids=next_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            token_indices_to_sample=token_indices_to_sample,
+            cad=common_attn_metadata,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            req_scheduled_tokens=req_scheduled_tokens,
+            long_seq_metadata=long_seq_metadata,
+            num_prefill_reqs=num_prefill_reqs,
+            num_decode_reqs=num_decode_reqs,
+        )
     )
     assert self.runner is not None
     pcp_manager = getattr(self.runner, "pcp_manager", None)
@@ -410,8 +497,12 @@ def _propose(
     ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
 
     if self.use_cuda_graph:
-        aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
-            num_tokens=num_input_tokens, uniform_decode=uniform_decode, has_lora=has_lora
+        aclgraph_runtime_mode, batch_descriptor = (
+            self.runner.cudagraph_dispatcher.dispatch(
+                num_tokens=num_input_tokens,
+                uniform_decode=uniform_decode,
+                has_lora=has_lora,
+            )
         )
         num_input_tokens = batch_descriptor.num_tokens
     else:
@@ -426,28 +517,44 @@ def _propose(
         # Need to be fixed in the future.
         num_reqs = common_attn_metadata.query_start_loc.shape[0]
         self.query_start_loc.gpu[:num_reqs].copy_(common_attn_metadata.query_start_loc)
-        self.query_start_loc.cpu[:num_reqs].copy_(common_attn_metadata.query_start_loc_cpu)
+        self.query_start_loc.cpu[:num_reqs].copy_(
+            common_attn_metadata.query_start_loc_cpu
+        )
         num_reqs_padded = self.runner._pad_query_start_loc_for_fia(
             self.query_start_loc,
             num_input_tokens,
-            batch_descriptor.num_reqs if batch_descriptor.num_reqs is not None else common_attn_metadata.num_reqs,
+            (
+                batch_descriptor.num_reqs
+                if batch_descriptor.num_reqs is not None
+                else common_attn_metadata.num_reqs
+            ),
             common_attn_metadata.num_reqs,
             aclgraph_runtime_mode,
             batch_descriptor.num_reqs,
         )
         common_attn_metadata.num_reqs = num_reqs_padded
-        common_attn_metadata.query_start_loc = self.query_start_loc.gpu[: num_reqs_padded + 1]
-        common_attn_metadata.query_start_loc_cpu = self.query_start_loc.cpu[: num_reqs_padded + 1]
+        common_attn_metadata.query_start_loc = self.query_start_loc.gpu[
+            : num_reqs_padded + 1
+        ]
+        common_attn_metadata.query_start_loc_cpu = self.query_start_loc.cpu[
+            : num_reqs_padded + 1
+        ]
         slicing_length = (
-            num_reqs_padded * self.decode_threshold if self.pcp_size * self.dcp_size > 1 else num_reqs_padded
+            num_reqs_padded * self.decode_threshold
+            if self.pcp_size * self.dcp_size > 1
+            else num_reqs_padded
         )
         common_attn_metadata.block_table_tensor = self._adjust_tensor(
             common_attn_metadata.block_table_tensor, slicing_length
         )
         if self.method == "dflash":
-            common_attn_metadata.seq_lens = self._adjust_tensor(common_attn_metadata.seq_lens, num_reqs_padded)
+            common_attn_metadata.seq_lens = self._adjust_tensor(
+                common_attn_metadata.seq_lens, num_reqs_padded
+            )
         else:
-            common_attn_metadata.seq_lens = self._adjust_tensor(self.runner.seq_lens, num_reqs_padded)
+            common_attn_metadata.seq_lens = self._adjust_tensor(
+                self.runner.seq_lens, num_reqs_padded
+            )
             common_attn_metadata.seq_lens_cpu = self._adjust_tensor(
                 self.runner.optimistic_seq_lens_cpu, num_reqs_padded
             )
@@ -458,7 +565,9 @@ def _propose(
             # the two fields independent so per-step in-place updates in
             # ``attn_update_stack_num_spec_norm`` don't double-count.
             if common_attn_metadata._seq_lens_cpu is not None:
-                common_attn_metadata._seq_lens_cpu = common_attn_metadata.seq_lens_cpu.clone()
+                common_attn_metadata._seq_lens_cpu = (
+                    common_attn_metadata.seq_lens_cpu.clone()
+                )
         if common_attn_metadata.num_computed_tokens_cpu is not None:
             common_attn_metadata.num_computed_tokens_cpu = self._adjust_tensor(
                 common_attn_metadata.num_computed_tokens_cpu, num_reqs_padded
@@ -472,7 +581,10 @@ def _propose(
         num_reqs_padded = common_attn_metadata.num_reqs
         # In the below scenario, padding has been applied by _pad_query_start_loc_for_fia in the model runner.
         # We need to unpad here for eager mode to maintain compatibility.
-        if not self.vllm_config.model_config.use_mla and self.pcp_size * self.dcp_size == 1:
+        if (
+            not self.vllm_config.model_config.use_mla
+            and self.pcp_size * self.dcp_size == 1
+        ):
             common_attn_metadata.block_table_tensor = self._adjust_tensor(
                 common_attn_metadata.block_table_tensor, num_reqs_padded
             )
@@ -480,7 +592,9 @@ def _propose(
     if self.supports_mm_inputs:
         mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
         inputs_embeds = self.model.embed_input_ids(
-            self.input_ids[:num_tokens], multimodal_embeddings=mm_embeds, is_multimodal=is_mm_embed
+            self.input_ids[:num_tokens],
+            multimodal_embeddings=mm_embeds,
+            is_multimodal=is_mm_embed,
         )
         self.inputs_embeds[:num_tokens] = inputs_embeds
         inputs_embeds = self.inputs_embeds[:num_input_tokens]
@@ -493,7 +607,9 @@ def _propose(
     # Strictly speaking, `query_start_loc`, `seq_lens` should also have
     # their memory allocated separately for each step just like `slot_mapping`.
     slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
-    self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping)
+    self.slot_mapping_group[0][:slot_mapping_lens].copy_(
+        common_attn_metadata.slot_mapping
+    )
     self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
     common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
 
@@ -501,9 +617,13 @@ def _propose(
     self.seq_lens_group[0][num_reqs_padded:].fill_(0)
     common_attn_metadata.seq_lens = self.seq_lens_group[0][:num_reqs_padded]
 
-    self.query_start_loc_group[0][: num_reqs_padded + 1].copy_(common_attn_metadata.query_start_loc)
+    self.query_start_loc_group[0][: num_reqs_padded + 1].copy_(
+        common_attn_metadata.query_start_loc
+    )
     self.query_start_loc_group[0][num_reqs_padded + 1 :].fill_(0)
-    common_attn_metadata.query_start_loc = self.query_start_loc_group[0][: num_reqs_padded + 1]
+    common_attn_metadata.query_start_loc = self.query_start_loc_group[0][
+        : num_reqs_padded + 1
+    ]
 
     common_attn_metadata.num_input_tokens = num_input_tokens
     # FIXME(woosuk): The below two ops cause synchronization. Optimize.
@@ -517,7 +637,9 @@ def _propose(
             common_ratio_to_sas_metadata=dict(),
             block_size=self.draft_attn_groups[0].kv_cache_spec.block_size,
         )
-    attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args)
+    attn_metadata = builder.build(
+        0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args
+    )
 
     if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
         attn_metadata.attn_mask = None
@@ -539,15 +661,19 @@ def _propose(
     # in the merged graph, it does not affect position 1
     # FIXME(lilinsiman)
     if self.pcp_size * self.dcp_size > 1 and self.use_cuda_graph:
-        assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
-        self.block_table_tensor_clone[: common_attn_metadata.block_table_tensor.shape[0]] = (
-            common_attn_metadata.block_table_tensor
-        )
+        assert (
+            self.block_table_tensor_clone is not None
+        ), "block_table_tensor_clone is not init"
+        self.block_table_tensor_clone[
+            : common_attn_metadata.block_table_tensor.shape[0]
+        ] = common_attn_metadata.block_table_tensor
         common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[
             : common_attn_metadata.block_table_tensor.shape[0]
         ]
     else:
-        common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor.clone()
+        common_attn_metadata.block_table_tensor = (
+            common_attn_metadata.block_table_tensor.clone()
+        )
 
     metadata_has_prefill = bool(getattr(attn_metadata_i, "num_prefills", 0))
     is_prefill_batch = num_prefill_reqs > 0 or metadata_has_prefill
@@ -584,23 +710,27 @@ def _propose(
         for draft_index in range(1, self.num_speculative_tokens_mtp):
             per_layer_attn_metadata = dict()
             for attn_group in self.draft_attn_groups:
-                common_attn_metadata, attn_metadata = self.attn_update_stack_num_spec_norm(
-                    draft_index,
-                    attn_metadata,
-                    common_attn_metadata,
-                    batch_size,
-                    num_input_tokens,
-                    used_update_positions,
-                    aclgraph_runtime_mode,
-                    **draft_cp_kwargs,
-                    attn_group=attn_group,
+                common_attn_metadata, attn_metadata = (
+                    self.attn_update_stack_num_spec_norm(
+                        draft_index,
+                        attn_metadata,
+                        common_attn_metadata,
+                        batch_size,
+                        num_input_tokens,
+                        used_update_positions,
+                        aclgraph_runtime_mode,
+                        **draft_cp_kwargs,
+                        attn_group=attn_group,
+                    )
                 )
                 for layer_name in self.attn_layer_names:
                     per_layer_attn_metadata[layer_name] = attn_metadata
             multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
     token_indices_to_sample_len = token_indices_to_sample.shape[0]
-    self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
+    self.token_indices_to_sample[:token_indices_to_sample_len].copy_(
+        token_indices_to_sample
+    )
     self.token_indices_to_sample[token_indices_to_sample_len:].fill_(0)
 
     with set_ascend_forward_context(
@@ -614,7 +744,9 @@ def _propose(
         is_draft_model=True,
         draft_attn_metadatas=multi_steps_attn_metadata,
         eplb_heat_collection_status=(
-            self.runner.eplb_heat_collection_status if self.runner.dynamic_eplb else False
+            self.runner.eplb_heat_collection_status
+            if self.runner.dynamic_eplb
+            else False
         ),
     ):
         # Reset MOE layer index for forward pass
@@ -625,7 +757,9 @@ def _propose(
         model_inputs: dict[str, Any] = {
             "num_input_tokens": num_input_tokens,
             "batch_size": batch_size,
-            "token_indices_to_sample": self.token_indices_to_sample[:token_indices_to_sample_len],
+            "token_indices_to_sample": self.token_indices_to_sample[
+                :token_indices_to_sample_len
+            ],
             "target_positions": target_positions,
             "inputs_embeds": inputs_embeds,
             "multi_steps_attn_metadata": multi_steps_attn_metadata,
@@ -636,13 +770,16 @@ def _propose(
         run_draft: Callable[[], Any] = partial(runnable, **model_inputs)
 
         if self.enable_enpu:
-            self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+            self._update_full_graph_params_if_needed(
+                forward_context, num_input_tokens, multi_steps_attn_metadata
+            )
             draft_token_ids = run_draft()
         else:
             draft_token_ids = run_draft()
-            self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+            self._update_full_graph_params_if_needed(
+                forward_context, num_input_tokens, multi_steps_attn_metadata
+            )
     return draft_token_ids
-
 
 
 def _run_merged_draft(
@@ -673,14 +810,20 @@ def _run_merged_draft(
 
         if self.pass_hidden_states_to_model:
             model_hidden_states = self.hidden_states[:num_input_tokens]
-            model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
+            model_hidden_states, model_positions = self.maybe_pad_and_reduce(
+                model_hidden_states, model_positions
+            )
             model_kwargs["hidden_states"] = model_hidden_states
             if self.method == "mtp":
                 model_kwargs["positions"] = model_positions
 
     # step 0
     draft_model = getattr(self.model, "model", None)
-    if self._share_mtp_indices and draft_model is not None and hasattr(draft_model, "set_skip_topk"):
+    if (
+        self._share_mtp_indices
+        and draft_model is not None
+        and hasattr(draft_model, "set_skip_topk")
+    ):
         draft_model.set_skip_topk(False)
 
     ret_hidden_states = self.model(**model_kwargs)
@@ -692,18 +835,25 @@ def _run_merged_draft(
 
     # step 1+ skip indexer
     draft_model = getattr(self.model, "model", None)
-    if self._share_mtp_indices and draft_model is not None and hasattr(draft_model, "set_skip_topk"):
+    if (
+        self._share_mtp_indices
+        and draft_model is not None
+        and hasattr(draft_model, "set_skip_topk")
+    ):
         draft_model.set_skip_topk(True)
 
     if self.method != "dflash":
-        last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
-            last_hidden_states, model_positions, hidden_states
+        last_hidden_states, model_positions, hidden_states = (
+            self.maybe_all_gather_and_unpad(
+                last_hidden_states, model_positions, hidden_states
+            )
         )
 
     num_indices = token_indices_to_sample.shape[0]
     if lmhead_tp_enable():
         max_num_reqs_across_dp = (
-            self.vllm_config.scheduler_config.max_num_seqs * self.runner.uniform_decode_query_len
+            self.vllm_config.scheduler_config.max_num_seqs
+            * self.runner.uniform_decode_query_len
         )
         # It is necessary to evaluate the case where num_indices becomes large
         # in the context of the dummy‑run accompaniment of p‑eagle.
@@ -739,12 +889,14 @@ def _run_merged_draft(
         if self.method in ("eagle3", "dflash", "mtp"):
             draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
             if lmhead_tp_enable():
-                draft_token_ids, token_indices_to_sample = self._align_tensor_and_indices(
-                    draft_token_ids,
-                    num_indices,
-                    token_indices_to_sample,
-                    ori_token_indices_to_sample,
-                    is_logits=False,
+                draft_token_ids, token_indices_to_sample = (
+                    self._align_tensor_and_indices(
+                        draft_token_ids,
+                        num_indices,
+                        token_indices_to_sample,
+                        ori_token_indices_to_sample,
+                        is_logits=False,
+                    )
                 )
         else:
             logits = self.model.compute_logits(sample_hidden_states)
@@ -794,7 +946,9 @@ def _run_merged_draft(
 
     # Generate the remaining draft tokens.
     draft_token_ids_tensor = torch.zeros(
-        (self.num_speculative_tokens_mtp, *draft_token_ids.shape), dtype=draft_token_ids.dtype, device=self.device
+        (self.num_speculative_tokens_mtp, *draft_token_ids.shape),
+        dtype=draft_token_ids.dtype,
+        device=self.device,
     )
     draft_token_ids_tensor[0] = draft_token_ids
     if self.uses_mrope:
@@ -804,7 +958,11 @@ def _run_merged_draft(
     hidden_states = hidden_states[token_indices_to_sample]
     token_indices_to_sample = self.arange[:batch_size]
 
-    input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
+    input_batch_size = (
+        num_input_tokens
+        if (self.method == "mtp" or self.use_cuda_graph)
+        else batch_size
+    )
 
     forward_context = get_forward_context()
     _EXTRA_CTX.num_tokens = input_batch_size
@@ -829,14 +987,20 @@ def _run_merged_draft(
         # out-of-range access during the model execution. The draft tokens
         # generated with this adjustment should be ignored.
         if self.uses_mrope:
-            exceeds_max_model_len = positions[0] >= self.vllm_config.model_config.max_model_len
+            exceeds_max_model_len = (
+                positions[0] >= self.vllm_config.model_config.max_model_len
+            )
             # Mask out the position ids that exceed the max model length.
             # Otherwise, we may get out-of-range error in RoPE.
             clamped_positions = torch.where(
-                exceeds_max_model_len.unsqueeze(0), torch.zeros_like(positions), positions
+                exceeds_max_model_len.unsqueeze(0),
+                torch.zeros_like(positions),
+                positions,
             )
         else:
-            exceeds_max_model_len = positions >= self.vllm_config.model_config.max_model_len
+            exceeds_max_model_len = (
+                positions >= self.vllm_config.model_config.max_model_len
+            )
             clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
 
         # copy inputs to buffer for cudagraph
@@ -861,10 +1025,14 @@ def _run_merged_draft(
         model_positions = self._get_positions(input_batch_size)
         model_hidden_states = self.hidden_states[:input_batch_size]
 
-        model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
+        model_hidden_states, model_positions = self.maybe_pad_and_reduce(
+            model_hidden_states, model_positions
+        )
 
         forward_context.attn_metadata = (
-            multi_steps_attn_metadata[draft_index + 1] if multi_steps_attn_metadata else None
+            multi_steps_attn_metadata[draft_index + 1]
+            if multi_steps_attn_metadata
+            else None
         )
 
         model_kwargs = {
@@ -882,14 +1050,17 @@ def _run_merged_draft(
         else:
             last_hidden_states, hidden_states = ret_hidden_states
 
-        last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
-            last_hidden_states, model_positions, hidden_states
+        last_hidden_states, model_positions, hidden_states = (
+            self.maybe_all_gather_and_unpad(
+                last_hidden_states, model_positions, hidden_states
+            )
         )
 
         num_indices = token_indices_to_sample.shape[0]
         if lmhead_tp_enable():
             max_num_reqs_across_dp = (
-                self.vllm_config.scheduler_config.max_num_seqs * self.runner.uniform_decode_query_len
+                self.vllm_config.scheduler_config.max_num_seqs
+                * self.runner.uniform_decode_query_len
             )
             token_indices_to_sample = nn.functional.pad(
                 token_indices_to_sample,
@@ -929,14 +1100,16 @@ def _run_merged_draft(
     return draft_token_ids
 
 
-
 @when_imported("vllm_ascend.spec_decode.llm_base_proposer")
 def _patch(mod):
     if hasattr(mod.AscendSpecDecodeBaseProposer, "__init__"):
         _patched = FunctionType(
-            __init__.__code__, vars(mod),
-            name=__init__.__name__, argdefs=__init__.__defaults__,
-            closure=__init__.__closure__,)
+            __init__.__code__,
+            vars(mod),
+            name=__init__.__name__,
+            argdefs=__init__.__defaults__,
+            closure=__init__.__closure__,
+        )
         _patched.__annotations__ = __init__.__annotations__
         _patched.__kwdefaults__ = __init__.__kwdefaults__
         patch_or_inject(mod.AscendSpecDecodeBaseProposer, "__init__", _patched)
@@ -944,9 +1117,12 @@ def _patch(mod):
 
     if hasattr(mod.AscendSpecDecodeBaseProposer, "dummy_run"):
         _patched = FunctionType(
-            dummy_run.__code__, vars(mod),
-            name=dummy_run.__name__, argdefs=dummy_run.__defaults__,
-            closure=dummy_run.__closure__,)
+            dummy_run.__code__,
+            vars(mod),
+            name=dummy_run.__name__,
+            argdefs=dummy_run.__defaults__,
+            closure=dummy_run.__closure__,
+        )
         _patched.__annotations__ = dummy_run.__annotations__
         _patched.__kwdefaults__ = dummy_run.__kwdefaults__
         patch_or_inject(mod.AscendSpecDecodeBaseProposer, "dummy_run", _patched)
@@ -954,9 +1130,12 @@ def _patch(mod):
 
     if hasattr(mod.AscendSpecDecodeBaseProposer, "_propose"):
         _patched = FunctionType(
-            _propose.__code__, vars(mod),
-            name=_propose.__name__, argdefs=_propose.__defaults__,
-            closure=_propose.__closure__,)
+            _propose.__code__,
+            vars(mod),
+            name=_propose.__name__,
+            argdefs=_propose.__defaults__,
+            closure=_propose.__closure__,
+        )
         _patched.__annotations__ = _propose.__annotations__
         _patched.__kwdefaults__ = _propose.__kwdefaults__
         patch_or_inject(mod.AscendSpecDecodeBaseProposer, "_propose", _patched)
@@ -964,11 +1143,15 @@ def _patch(mod):
 
     if hasattr(mod.AscendSpecDecodeBaseProposer, "_run_merged_draft"):
         _patched = FunctionType(
-            _run_merged_draft.__code__, vars(mod),
-            name=_run_merged_draft.__name__, argdefs=_run_merged_draft.__defaults__,
-            closure=_run_merged_draft.__closure__,)
+            _run_merged_draft.__code__,
+            vars(mod),
+            name=_run_merged_draft.__name__,
+            argdefs=_run_merged_draft.__defaults__,
+            closure=_run_merged_draft.__closure__,
+        )
         _patched.__annotations__ = _run_merged_draft.__annotations__
         _patched.__kwdefaults__ = _run_merged_draft.__kwdefaults__
         patch_or_inject(mod.AscendSpecDecodeBaseProposer, "_run_merged_draft", _patched)
-        logger.info("UCM GSA AscendSpecDecodeBaseProposer._run_merged_draft patch applied")
-
+        logger.info(
+            "UCM GSA AscendSpecDecodeBaseProposer._run_merged_draft patch applied"
+        )

@@ -21,7 +21,9 @@ import pytest
 # 路径：本目录 + 仓库根
 # ---------------------------------------------------------------------------
 HERE = Path(__file__).resolve().parent
-REPO_ROOT = HERE.parents[4]  # ut -> gsav2 -> sparse -> sandbox -> ucm -> UCM_feacture_gsa_v2
+REPO_ROOT = HERE.parents[
+    4
+]  # ut -> gsav2 -> sparse -> sandbox -> ucm -> UCM_feacture_gsa_v2
 for p in (str(HERE), str(REPO_ROOT)):
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -54,9 +56,7 @@ def _make_tensor_with_pad(data, pad=False, dtype=None, device="cpu"):
     for x in data:
         t = torch.as_tensor(x, dtype=dtype)
         if t.numel() < max_len:
-            t = torch.cat(
-                [t, torch.full((max_len - t.numel(),), pad_val, dtype=dtype)]
-            )
+            t = torch.cat([t, torch.full((max_len - t.numel(),), pad_val, dtype=dtype)])
         rows.append(t)
     return torch.stack(rows)
 
@@ -109,15 +109,17 @@ def install_stubs():
     if sys.modules.get("ucm.sandbox.sparse.gsav2.gsa", None) is not None:
         return  # 已安装（pytest 多次导入 conftest 的场景）
 
-
     # ---------------- vllm ----------------
     _mod("vllm")
     _mod("vllm.config", VllmConfig=object)
     _mod("vllm.distributed")
-    _mod("vllm.distributed.kv_transfer",
-         get_kv_transfer_group=lambda: SimpleNamespace())
-    _mod("vllm.distributed.parallel_state",
-         get_world_group=lambda: SimpleNamespace(local_rank=0))
+    _mod(
+        "vllm.distributed.kv_transfer", get_kv_transfer_group=lambda: SimpleNamespace()
+    )
+    _mod(
+        "vllm.distributed.parallel_state",
+        get_world_group=lambda: SimpleNamespace(local_rank=0),
+    )
     _mod("vllm.forward_context", ForwardContext=object)
     _mod("vllm.utils")
     _mod("vllm.utils.torch_utils", make_tensor_with_pad=_make_tensor_with_pad)
@@ -127,26 +129,28 @@ def install_stubs():
     _mod("vllm.v1.core.kv_cache_manager", KVCacheBlocks=_KVCacheBlocks)
     _mod("vllm.v1.core.sched")
     _mod("vllm.v1.core.sched.output", SchedulerOutput=object)
-    _mod("vllm.v1.request",
-         Request=object,
-         RequestStatus=SimpleNamespace(PREEMPTED="preempted", RUNNING="running"))
+    _mod(
+        "vllm.v1.request",
+        Request=object,
+        RequestStatus=SimpleNamespace(PREEMPTED="preempted", RUNNING="running"),
+    )
 
     # ---------------- vllm_ascend ----------------
     _mod("vllm_ascend")
     _mod("vllm_ascend.attention")
-    _mod("vllm_ascend.attention.utils",
-         get_sfa_qsfa_packed_head_dim=lambda k, q: k + q)
+    _mod("vllm_ascend.attention.utils", get_sfa_qsfa_packed_head_dim=lambda k, q: k + q)
     _mod("vllm_ascend.cpu_binding", CpuAlloc=fakes.FakeCpuAlloc)
-    _mod("vllm_ascend.utils",
-         AscendDeviceType=SimpleNamespace(A5="A5", A2="A2"),
-         get_ascend_device_type=lambda: "A2")
+    _mod(
+        "vllm_ascend.utils",
+        AscendDeviceType=SimpleNamespace(A5="A5", A2="A2"),
+        get_ascend_device_type=lambda: "A2",
+    )
 
     # ---------------- torch_npu ----------------
     _mod("torch_npu")
 
     # ---------------- ucm.logger（C 扩展 ucmlogger 的替身）----------------
-    _mod("ucm.logger",
-         init_logger=lambda name=None: logging.getLogger(name or "ucm"))
+    _mod("ucm.logger", init_logger=lambda name=None: logging.getLogger(name or "ucm"))
 
     # ---------------- ucm.integration.vllm.ucm_connector ----------------
     _mod("ucm.integration")
@@ -155,13 +159,14 @@ def install_stubs():
     # ucm/__init__.py 会执行 from ucm.integration.vllm.patch.logger_patch import
     # patch_logger —— 预置 stub 避免触发真实 patch 链（依赖真实 vllm）
     _mod("ucm.integration.vllm.patch")
-    _mod("ucm.integration.vllm.patch.logger_patch",
-         patch_logger=lambda *a, **k: None)
+    _mod("ucm.integration.vllm.patch.logger_patch", patch_logger=lambda *a, **k: None)
 
     # ---------------- gsa_prefetch（C++ pybind11 扩展的替身）----------------
-    _mod("ucm.sandbox.sparse.gsav2.prefetch.gsa_prefetch",
-         GSAPrefetchEngineC=fakes.FakeEngineC,
-         UCMKVPrefetch=fakes.FakeUCMPrefetch)
+    _mod(
+        "ucm.sandbox.sparse.gsav2.prefetch.gsa_prefetch",
+        GSAPrefetchEngineC=fakes.FakeEngineC,
+        UCMKVPrefetch=fakes.FakeUCMPrefetch,
+    )
 
     # ---------------- torch.ops._C_ascend（ACL 自定义 op）----------------
     # 无条件覆盖：UT 不依赖真实 ACL op（NPU 环境同理，保证跨环境确定性）
@@ -177,9 +182,7 @@ def install_stubs():
 
     # ---------------- 平台分支 True 侧：确保 torch.npu 存在 ----------------
     if not hasattr(torch, "npu"):
-        torch.npu = SimpleNamespace(
-            is_available=lambda: True, synchronize=lambda: None
-        )
+        torch.npu = SimpleNamespace(is_available=lambda: True, synchronize=lambda: None)
 
 
 install_stubs()
@@ -207,7 +210,6 @@ def make_gsa(tmp_path, monkeypatch):
 
     def _make(role=None, **cfg_kwargs):
         import ucm.sandbox.sparse.gsav2.gsa as gsa_mod
-
         from ucm.sparse.base import UcmSparseRole
 
         if role is None:

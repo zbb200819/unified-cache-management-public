@@ -65,8 +65,9 @@ class TestLogger:
         assert "[20" in line  # 时间戳前缀
 
     def test_log_unknown_level_name(self, tmp_path):
-        lg, log_file = self._logger(tmp_path, show_time=False,
-                                     level=gsa_log.Logger.LEVEL_DEBUG)
+        lg, log_file = self._logger(
+            tmp_path, show_time=False, level=gsa_log.Logger.LEVEL_DEBUG
+        )
         lg.log(15, "weird level")  # 非 DEBUG/INFO/WARNING/ERROR，且高于最低级别
         assert "[UNKNOWN] weird level" in open(log_file, encoding="utf-8").read()
 
@@ -136,14 +137,16 @@ class TestGSALogger:
             return f.read()
 
     def test_init_all_creates_three_loggers(self, tmp_path):
-        gl = gsa_log.GSALogger(log_dir=str(tmp_path), dp_rank=0, tp_rank=1,
-                               log_type=gsa_log.GSALogger.LOG_TYPE_ALL)
+        gl = gsa_log.GSALogger(
+            log_dir=str(tmp_path),
+            dp_rank=0,
+            tp_rank=1,
+            log_type=gsa_log.GSALogger.LOG_TYPE_ALL,
+        )
         assert set(gl.loggers) == {"performance", "accuracy", "normal"}
         for t in ("performance", "accuracy", "normal"):
             assert isinstance(gl.loggers[t], gsa_log.Logger)
-            expected = os.path.join(
-                str(tmp_path), f"log_for_0_tp_1_{t}.log"
-            )
+            expected = os.path.join(str(tmp_path), f"log_for_0_tp_1_{t}.log")
             assert gl.loggers[t].log_file == expected
 
     @pytest.mark.parametrize("log_type", ["performance", "accuracy", "normal"])
@@ -171,11 +174,12 @@ class TestGSALogger:
         assert gl._format_message("m") == "[] m"
 
     def test_write_log_level_filtered(self, tmp_path):
-        gl = gsa_log.GSALogger(log_dir=str(tmp_path), level=gsa_log.GSALogger.LEVEL_ERROR)
+        gl = gsa_log.GSALogger(
+            log_dir=str(tmp_path), level=gsa_log.GSALogger.LEVEL_ERROR
+        )
         gl.performance_error("kept")
         gl.performance_warning("dropped")
-        perf = self._read(os.path.join(str(tmp_path),
-                                       "log_for_0_tp_0_performance.log"))
+        perf = self._read(os.path.join(str(tmp_path), "log_for_0_tp_0_performance.log"))
         assert "kept" in perf and "dropped" not in perf
 
     def test_write_log_missing_logger_is_noop(self, tmp_path):
@@ -206,29 +210,34 @@ class TestGSALogger:
         gl_all = gsa_log.GSALogger(log_dir=str(tmp_path))
         assert gl_all.normal_is_info() is True
         assert gl_all.normal_is_debug() is False
-        gl_dbg = gsa_log.GSALogger(log_dir=str(tmp_path),
-                                   level=gsa_log.GSALogger.LEVEL_DEBUG)
+        gl_dbg = gsa_log.GSALogger(
+            log_dir=str(tmp_path), level=gsa_log.GSALogger.LEVEL_DEBUG
+        )
         assert gl_dbg.normal_is_debug() is True
         gl_one = gsa_log.GSALogger(log_dir=str(tmp_path), log_type="accuracy")
         assert gl_one.normal_is_info() is False
 
-    @pytest.mark.parametrize("level_method,tag", [
-        ("performance_debug", "performance"),
-        ("performance_info", "performance"),
-        ("performance_warning", "performance"),
-        ("performance_error", "performance"),
-        ("accuracy_debug", "accuracy"),
-        ("accuracy_info", "accuracy"),
-        ("accuracy_warning", "accuracy"),
-        ("accuracy_error", "accuracy"),
-        ("normal_debug", "normal"),
-        ("normal_info", "normal"),
-        ("normal_warning", "normal"),
-        ("normal_error", "normal"),
-    ])
+    @pytest.mark.parametrize(
+        "level_method,tag",
+        [
+            ("performance_debug", "performance"),
+            ("performance_info", "performance"),
+            ("performance_warning", "performance"),
+            ("performance_error", "performance"),
+            ("accuracy_debug", "accuracy"),
+            ("accuracy_info", "accuracy"),
+            ("accuracy_warning", "accuracy"),
+            ("accuracy_error", "accuracy"),
+            ("normal_debug", "normal"),
+            ("normal_info", "normal"),
+            ("normal_warning", "normal"),
+            ("normal_error", "normal"),
+        ],
+    )
     def test_type_level_routing(self, tmp_path, level_method, tag):
-        gl = gsa_log.GSALogger(log_dir=str(tmp_path), show_time=False,
-                               level=gsa_log.GSALogger.LEVEL_DEBUG)
+        gl = gsa_log.GSALogger(
+            log_dir=str(tmp_path), show_time=False, level=gsa_log.GSALogger.LEVEL_DEBUG
+        )
         getattr(gl, level_method)(f"msg-{level_method}")
         target = os.path.join(str(tmp_path), f"log_for_0_tp_0_{tag}.log")
         others = [t for t in ("performance", "accuracy", "normal") if t != tag]
@@ -241,9 +250,11 @@ class TestGSALogger:
 
     def test_compat_interface_routes_to_normal(self, tmp_path):
         gl = gsa_log.GSALogger(log_dir=str(tmp_path), show_time=False)
-        gl.debug("d"); gl.info("i"); gl.warning("w"); gl.error("e")
-        normal = self._read(os.path.join(str(tmp_path),
-                                         "log_for_0_tp_0_normal.log"))
+        gl.debug("d")
+        gl.info("i")
+        gl.warning("w")
+        gl.error("e")
+        normal = self._read(os.path.join(str(tmp_path), "log_for_0_tp_0_normal.log"))
         assert "[INFO] i" in normal and "[ERROR] e" in normal
         # level=INFO 时 debug 被过滤
         assert "[DEBUG] d" not in normal
@@ -252,8 +263,9 @@ class TestGSALogger:
     def test_is_debug_enabled_property(self, tmp_path):
         gl = gsa_log.GSALogger(log_dir=str(tmp_path))
         assert gl.is_debug_enabled is False  # INFO 级别
-        gl_dbg = gsa_log.GSALogger(log_dir=str(tmp_path),
-                                   level=gsa_log.GSALogger.LEVEL_DEBUG)
+        gl_dbg = gsa_log.GSALogger(
+            log_dir=str(tmp_path), level=gsa_log.GSALogger.LEVEL_DEBUG
+        )
         assert gl_dbg.is_debug_enabled is True
         gl_one = gsa_log.GSALogger(log_dir=str(tmp_path), log_type="performance")
         assert gl_one.is_debug_enabled is False  # normal logger 不存在
@@ -261,8 +273,9 @@ class TestGSALogger:
     def test_is_info_enabled_property(self, tmp_path):
         gl = gsa_log.GSALogger(log_dir=str(tmp_path))
         assert gl.is_info_enabled is True
-        gl_warn = gsa_log.GSALogger(log_dir=str(tmp_path),
-                                    level=gsa_log.GSALogger.LEVEL_WARNING)
+        gl_warn = gsa_log.GSALogger(
+            log_dir=str(tmp_path), level=gsa_log.GSALogger.LEVEL_WARNING
+        )
         assert gl_warn.is_info_enabled is False
         gl_one = gsa_log.GSALogger(log_dir=str(tmp_path), log_type="accuracy")
         assert gl_one.is_info_enabled is False

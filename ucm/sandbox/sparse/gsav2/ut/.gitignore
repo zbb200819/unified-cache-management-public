@@ -2,3 +2,4 @@
 .coverage
 cov.json
 ut_result.log
+htmlcov/

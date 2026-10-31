@@ -8,10 +8,10 @@ close/unlink teardown.
 import struct
 from types import SimpleNamespace
 
+import fakes
 import pytest
 import torch
 
-import fakes
 from ucm.sandbox.sparse.gsav2 import gsa as gsa_module
 from ucm.sparse.utils import GSA_SPARSE_LEN, MAX_SLOTS_BLOCK_NUM
 
@@ -33,8 +33,18 @@ def device_type_none():
     ascend_utils.get_ascend_device_type = original
 
 
-def stat_for(g, req_id=1, topk=2, prompt=4, output=0, computed=0, scheduled=4,
-             blocks=None, slots=None, indexer_slots=None):
+def stat_for(
+    g,
+    req_id=1,
+    topk=2,
+    prompt=4,
+    output=0,
+    computed=0,
+    scheduled=4,
+    blocks=None,
+    slots=None,
+    indexer_slots=None,
+):
     """Fabricate a GSAReqStat registered in g.gsa_metadata.gsa_stats."""
     stat = gsa_module.GSAReqStat(req_id, g._vllm_config, topk)
     stat.num_prompt_tokens = prompt
@@ -44,8 +54,8 @@ def stat_for(g, req_id=1, topk=2, prompt=4, output=0, computed=0, scheduled=4,
     stat.blocks = blocks if blocks is not None else [0]
     stat.index_in_batch = 0
     stat.slab_host_slot = slots or []
-    stat.indexer_slab_host_slot = indexer_slots if indexer_slots is not None else (
-        slots or []
+    stat.indexer_slab_host_slot = (
+        indexer_slots if indexer_slots is not None else (slots or [])
     )
     stat.block_hashes = [b"\x01" * 16]
     g.gsa_metadata.gsa_stats[req_id] = stat
@@ -176,8 +186,9 @@ class TestBindCpus:
         # IS_INDEXER_OFFLOAD False -> thread num 20 -> last 20 of 30
         assert g.prefetch_engine.prefetch_engine_c.cpu_to_bind == list(range(10, 30))
 
-    def test_short_assign_main_takes_one_minus(self, make_worker, monkeypatch,
-                                               set_gsa_const):
+    def test_short_assign_main_takes_one_minus(
+        self, make_worker, monkeypatch, set_gsa_const
+    ):
         set_gsa_const(IS_INDEXER_OFFLOAD=True)
         alloc = fakes.FakeCpuAlloc(assign_main={0: list(range(24))})
         g, _ = self.run_bind(make_worker, monkeypatch, alloc)
@@ -197,8 +208,9 @@ class TestExecuteBegin:
         ensure_metadata(g)
         g.need_prefetch_index = []
         g.gsa_index = []
-        stat = stat_for(g, req_id=1, prompt=4, output=1, computed=0, scheduled=4,
-                        blocks=[11])
+        stat = stat_for(
+            g, req_id=1, prompt=4, output=1, computed=0, scheduled=4, blocks=[11]
+        )
         sched = fakes.FakeSchedulerOutput(num_scheduled_tokens={1: 4})
         attn_meta = {"attn": SimpleNamespace(num_input_tokens=4)}
         return g, stat, sched, attn_meta
@@ -417,9 +429,7 @@ class TestDsaInput:
 
     def test_copy_dsa_input_to_npu(self, make_worker):
         g, _ = make_worker()
-        n = gsa_module.GSA._copy_dsa_input_to_npu(
-            g, [8], [[1, 2]], [[3]], [[4]]
-        )
+        n = gsa_module.GSA._copy_dsa_input_to_npu(g, [8], [[1, 2]], [[3]], [[4]])
         assert n == 2
         assert g.indexer_pc_dump_num == 1
         assert g.dsa_slot_mapping.np[0] == 1
@@ -597,7 +607,9 @@ class TestAttentionBegin:
         set_gsa_const(PTOPK_PREFETCH_ENABLE=False)
         g, _ = make_worker()
         q = torch.zeros(1)
-        assert gsa_module.GSA.attention_begin(g, q, q, q, "model.layers.0.self_attn", None) == (q, q, q, None)
+        assert gsa_module.GSA.attention_begin(
+            g, q, q, q, "model.layers.0.self_attn", None
+        ) == (q, q, q, None)
 
     def test_layer_out_of_range(self, make_worker):
         g, _ = make_worker()
@@ -631,8 +643,14 @@ class TestAttentionBegin:
         indexer_cache = torch.zeros(2, 128 * 128, dtype=torch.float16)
         q = torch.zeros(1)
         gsa_module.GSA.attention_begin(
-            g, q, q, q, "model.layers.0.self_attn", None,
-            indexer_cache=indexer_cache, vllm_indexer_cache=vllm_cache,
+            g,
+            q,
+            q,
+            q,
+            "model.layers.0.self_attn",
+            None,
+            indexer_cache=indexer_cache,
+            vllm_indexer_cache=vllm_cache,
         )
         assert ascend_ops.call_counts["gsa_gather_copy"] == 1
         assert ascend_ops.call_counts["gsa_scatter_copy"] == 1
@@ -647,15 +665,24 @@ class TestAttentionBegin:
         g.indexer_pc_hit_num = [1]
         g.indexer_pc_hit_index.npu[0][0][:1] = torch.tensor([0], dtype=torch.int32)
         g.indexer_pc_hit_index.npu[1][0][:1] = torch.tensor([0], dtype=torch.int32)
-        vllm_cache = (torch.arange(128 * 128) % 100).to(torch.float16).reshape(1, 128 * 128)
+        vllm_cache = (
+            (torch.arange(128 * 128) % 100).to(torch.float16).reshape(1, 128 * 128)
+        )
         indexer_cache = torch.zeros(1, 128 * 128, dtype=torch.int8)
         vllm_scale = (torch.arange(128) % 100).to(torch.float16).reshape(1, 128)
         indexer_scale = torch.zeros(1, 128, dtype=torch.float16)
         q = torch.zeros(1)
         gsa_module.GSA.attention_begin(
-            g, q, q, q, "model.layers.0.self_attn", None,
-            indexer_cache=indexer_cache, vllm_indexer_cache=vllm_cache,
-            indexer_scale=indexer_scale, vllm_indexer_scale=vllm_scale,
+            g,
+            q,
+            q,
+            q,
+            "model.layers.0.self_attn",
+            None,
+            indexer_cache=indexer_cache,
+            vllm_indexer_cache=vllm_cache,
+            indexer_scale=indexer_scale,
+            vllm_indexer_scale=vllm_scale,
             use_li_c8=True,
         )
         assert ascend_ops.call_counts["gsa_gather_copy"] == 2
@@ -666,7 +693,9 @@ class TestAttentionFinished:
     def test_early_return_pd_separated(self, make_worker):
         g, _ = make_worker()  # is_pd_mix False by default
         q = torch.zeros(1)
-        gsa_module.GSA.attention_finished(g, q, q, q, q, "model.layers.0.self_attn", None)
+        gsa_module.GSA.attention_finished(
+            g, q, q, q, q, "model.layers.0.self_attn", None
+        )
         # nothing recorded anywhere; no crash
 
     def test_layer_out_of_range(self, make_worker):
@@ -687,12 +716,13 @@ class TestAttentionFinished:
         g.indexer_pc_dump_index.npu[0][:1] = torch.tensor([0], dtype=torch.int32)
         g.indexer_pc_dump_index.npu[1][:1] = torch.tensor([0], dtype=torch.int32)
         g.indexer_k_cache_sparse[0] = (
-            (torch.arange(128 * 128) % 100)
-            .to(torch.float16)
-            .reshape(1, 128, 128)
+            (torch.arange(128 * 128) % 100).to(torch.float16).reshape(1, 128, 128)
         )
         g.kv_caches[0] = [
-            None, None, torch.zeros(1, 128, 128, dtype=torch.float16), None
+            None,
+            None,
+            torch.zeros(1, 128, 128, dtype=torch.float16),
+            None,
         ]
         q = torch.zeros(1)
         gsa_module.GSA.attention_finished(g, q, q, q, q, "model.layers.0.a", None)
@@ -711,13 +741,12 @@ class TestAttentionFinished:
         g.indexer_pc_dump_index.npu[0][:1] = torch.tensor([0], dtype=torch.int32)
         g.indexer_pc_dump_index.npu[1][:1] = torch.tensor([0], dtype=torch.int32)
         g.indexer_k_cache_sparse[0] = (
-            (torch.arange(128 * 128) % 100)
-            .to(torch.float16)
-            .reshape(1, 128, 128)
+            (torch.arange(128 * 128) % 100).to(torch.float16).reshape(1, 128, 128)
         )
         g.indexer_scale[0] = (torch.arange(128) % 100).to(torch.float16).reshape(1, 128)
         g.kv_caches[0] = [
-            None, None,
+            None,
+            None,
             torch.zeros(1, 128, 128, dtype=torch.float16),
             torch.zeros(1, 128, dtype=torch.float16),
         ]
@@ -726,10 +755,7 @@ class TestAttentionFinished:
             g, q, q, q, q, "model.layers.0.a", None, use_li_c8=True
         )
         assert ascend_ops.call_counts["gsa_gather_copy"] == 2
-        assert (
-            g.kv_caches[0][3][0, :8].tolist()
-            == g.indexer_scale[0][0, :8].tolist()
-        )
+        assert g.kv_caches[0][3][0, :8].tolist() == g.indexer_scale[0][0, :8].tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -751,14 +777,25 @@ class TestWarmup:
         set_gsa_const(SEG_PREFILL_THRESHOLD=8)
         g, _ = make_worker()
         ensure_metadata(g)
-        stat = stat_for(g, req_id=1, prompt=64, output=1, computed=64,
-                        scheduled=4, blocks=[1], slots=[1], indexer_slots=[1])
+        stat = stat_for(
+            g,
+            req_id=1,
+            prompt=64,
+            output=1,
+            computed=64,
+            scheduled=4,
+            blocks=[1],
+            slots=[1],
+            indexer_slots=[1],
+        )
         stat.non_ucm_block_count = 1
         stat.original_prompt_block_len = 0
         g.warmup_topk = [[[0, 1], 2, 1]]
         g.kv_caches[0] = [
-            torch.full((2, 128, 1, 16), 3.0), torch.full((2, 128, 1, 16), 4.0),
-            None, None,
+            torch.full((2, 128, 1, 16), 3.0),
+            torch.full((2, 128, 1, 16), 4.0),
+            None,
+            None,
         ]
         gsa_module.GSA.warmup(g)
         eng = g.prefetch_engine.prefetch_engine_c
@@ -954,8 +991,9 @@ class TestRequestLifecycle:
         ensure_metadata(g)
         stat = stat_for(g, req_id=1, slots=[2], indexer_slots=[3])
         g.gsa_stats = g.gsa_metadata.gsa_stats
-        req = fakes.FakeRequest(req_id=1, prompt_token_ids=list(range(32)),
-                                output_token_ids=[1, 2, 3])
+        req = fakes.FakeRequest(
+            req_id=1, prompt_token_ids=list(range(32)), output_token_ids=[1, 2, 3]
+        )
         sched = fakes.FakeSchedulerOutput(
             num_scheduled_tokens={},
             preempted_req_ids=[1],
@@ -976,8 +1014,9 @@ class TestBuildSparseMeta:
         g, _ = make_worker()
         ensure_metadata(g)
         g.need_prefetch_index = []
-        stat = stat_for(g, req_id=1, prompt=4, output=0, computed=0, scheduled=4,
-                        blocks=[11])
+        stat = stat_for(
+            g, req_id=1, prompt=4, output=0, computed=0, scheduled=4, blocks=[11]
+        )
         req = fakes.FakeRequest(req_id=1, prompt_token_ids=list(range(4)))
         sched = fakes.FakeSchedulerOutput(
             num_scheduled_tokens={1: 4},
@@ -1011,8 +1050,7 @@ class TestIndexerKRepr:
         set_gsa_const(IS_INDEXER_OFFLOAD=True)
         g, _ = make_worker()
         ensure_metadata(g)
-        stat = stat_for(g, req_id=1, prompt=64, output=0, slots=[1],
-                        indexer_slots=[1])
+        stat = stat_for(g, req_id=1, prompt=64, output=0, slots=[1], indexer_slots=[1])
         stat.prompt_sparse_len = 2
         g.need_cal_k_mean = [1]
         g.indexer_k_cache_sparse[0] = torch.randn(2, 128, 1, 128)
@@ -1025,8 +1063,7 @@ class TestIndexerKRepr:
         set_gsa_const(IS_INDEXER_OFFLOAD=True)
         g, _ = make_worker()
         ensure_metadata(g)
-        stat = stat_for(g, req_id=1, prompt=64, output=2, slots=[1],
-                        indexer_slots=[1])
+        stat = stat_for(g, req_id=1, prompt=64, output=2, slots=[1], indexer_slots=[1])
         g.need_cal_k_mean = [1]
         gsa_module.GSA.cal_indexer_k_repr_mean_prefill(g)
         assert g.indexer_block_table_sm.version == 1  # rank0 wrote empty block
@@ -1035,8 +1072,7 @@ class TestIndexerKRepr:
         set_gsa_const(IS_INDEXER_OFFLOAD=True)
         g, _ = make_worker()
         ensure_metadata(g)
-        stat = stat_for(g, req_id=1, prompt=64, output=0, slots=[1],
-                        indexer_slots=[1])
+        stat = stat_for(g, req_id=1, prompt=64, output=0, slots=[1], indexer_slots=[1])
         stat.include_mask = [True, False]
         stat.exclude_mask = [False, True]
         stat.prompt_block_len = 2
@@ -1061,8 +1097,9 @@ class TestIndexerKRepr:
         set_gsa_const(IS_INDEXER_OFFLOAD=True)
         g, _ = make_worker({"dtype": torch.float32})
         ensure_metadata(g)
-        stat = stat_for(g, req_id=1, prompt=64, output=0, slots=[1, 2],
-                        indexer_slots=[1, 2])
+        stat = stat_for(
+            g, req_id=1, prompt=64, output=0, slots=[1, 2], indexer_slots=[1, 2]
+        )
         stat.include_mask = [True, False]
         stat.exclude_mask = [False, False]
         g.need_indexer_sparse_bs = [0]
@@ -1083,8 +1120,9 @@ class TestIndexerKRepr:
         set_gsa_const(IS_INDEXER_OFFLOAD=True)
         g, _ = make_worker()
         ensure_metadata(g)
-        stat = stat_for(g, req_id=1, prompt=64, output=0, slots=[1, 2],
-                        indexer_slots=[1, 2])
+        stat = stat_for(
+            g, req_id=1, prompt=64, output=0, slots=[1, 2], indexer_slots=[1, 2]
+        )
         stat.prompt_sparse_len = 1
         stat.is_last_chunk = lambda: True
         stat.indexer_topk_blocks[:, :1] = 0
@@ -1176,7 +1214,9 @@ class TestInitAndShutdown:
     def test_init_kvcache_ptrs_offload(self, make_worker, set_gsa_const):
         set_gsa_const(IS_INDEXER_OFFLOAD=True)
         g, _ = make_worker()
-        gsa_module.GSA.init_kvcache_ptrs(g, [object(), object(), None, None], "ic", None, 0)
+        gsa_module.GSA.init_kvcache_ptrs(
+            g, [object(), object(), None, None], "ic", None, 0
+        )
         assert g.prefetch_engine.prefetch_engine_c.calls_of("set_kvTensor_Index")
 
     def test_update_slot_num_rank0(self, make_worker):
@@ -1205,8 +1245,9 @@ class TestInitAndShutdown:
         g, _ = make_worker()
         gsa_module.GSA.shutdown(g)
 
-    def test_shutdown_unlink_failure_tolerated(self, make_worker, set_gsa_const,
-                                               monkeypatch):
+    def test_shutdown_unlink_failure_tolerated(
+        self, make_worker, set_gsa_const, monkeypatch
+    ):
         set_gsa_const(IS_INDEXER_OFFLOAD=True)
         g, _ = make_worker()
 
@@ -1219,4 +1260,3 @@ class TestInitAndShutdown:
     def test_print_log(self, make_worker):
         g, _ = make_worker()
         g.print_log("hello")  # routes to GSALogger.info
-

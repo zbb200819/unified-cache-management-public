@@ -23,31 +23,43 @@ COV_JSON = HERE / "cov.json"
 
 def main() -> int:
     cmd = [
-        sys.executable, "-X", "utf8", "-m", "pytest", "-q",
+        sys.executable,
+        "-X",
+        "utf8",
+        "-m",
+        "pytest",
+        "-q",
         f"--cov-report=json:{COV_JSON}",
     ]
     with open(LOG, "w", encoding="utf-8") as log:
-        rc = subprocess.call(cmd, cwd=str(HERE), stdout=log,
-                             stderr=subprocess.STDOUT)
+        rc = subprocess.call(cmd, cwd=str(HERE), stdout=log, stderr=subprocess.STDOUT)
     print(f"[run_ut] 完整日志已保存: {LOG}\n")
 
     data = json.loads(COV_JSON.read_text(encoding="utf-8"))
     rows = []
     for name, info in data["files"].items():
         s = info["summary"]
-        rows.append((
-            Path(name).name,
-            s["covered_lines"], s["num_statements"],
-            s["covered_branches"], s["num_branches"],
-        ))
+        rows.append(
+            (
+                Path(name).name,
+                s["covered_lines"],
+                s["num_statements"],
+                s["covered_branches"],
+                s["num_branches"],
+            )
+        )
     rows.sort()
 
     t = data["totals"]
-    rows.append((
-        "TOTAL",
-        t["covered_lines"], t["num_statements"],
-        t["covered_branches"], t["num_branches"],
-    ))
+    rows.append(
+        (
+            "TOTAL",
+            t["covered_lines"],
+            t["num_statements"],
+            t["covered_branches"],
+            t["num_branches"],
+        )
+    )
 
     def pct(a, b):
         return "  n/a" if b == 0 else f"{100 * a / b:6.2f}%"
@@ -62,10 +74,13 @@ def main() -> int:
         print(line)
     print("-" * (name_w + 36))
     ok_line = t["covered_lines"] == t["num_statements"]
-    ok_branch = (t["num_branches"] > 0
-                 and 100 * t["covered_branches"] / t["num_branches"] > 90)
-    print(f"行覆盖 100%: {'达标' if ok_line else '未达标'} | "
-          f"分支覆盖 >90%: {'达标' if ok_branch else '未达标'}")
+    ok_branch = (
+        t["num_branches"] > 0 and 100 * t["covered_branches"] / t["num_branches"] > 90
+    )
+    print(
+        f"行覆盖 100%: {'达标' if ok_line else '未达标'} | "
+        f"分支覆盖 >90%: {'达标' if ok_branch else '未达标'}"
+    )
     return rc
 
 

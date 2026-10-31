@@ -120,9 +120,7 @@ class FakeVllmConfig:
         self.kv_transfer_config = FakeKVTransferConfig(consumer, producer)
         self.speculative_config = speculative
         self.compilation_config = FakeCompilationConfig()
-        self.additional_config = (
-            {} if additional_config is None else additional_config
-        )
+        self.additional_config = {} if additional_config is None else additional_config
 
 
 # ---------------------------------------------------------------------------
@@ -255,9 +253,11 @@ class FakeEngineC:
         # 仅在常规属性查找失败时触发；双下划线保留原语义
         if name.startswith("__"):
             raise AttributeError(name)
+
         def _record(*args, **kwargs):
             self.calls.append((name, args, kwargs))
             return None
+
         return _record
 
 
@@ -384,8 +384,9 @@ class FakeStore:
         return self._ptr
 
 
-def make_plain_connector(with_store=True, store_ptr=4096, with_inner=False,
-                         inner_with_store=True):
+def make_plain_connector(
+    with_store=True, store_ptr=4096, with_inner=False, inner_with_store=True
+):
     """普通 connector：可选 store / 可选 .connector 二级"""
     obj = SimpleNamespace()
     if with_store:
@@ -405,8 +406,9 @@ def make_multi_connector(variant="direct_store"):
     """
     if variant == "no_connectors":
         return AscendMultiConnector()  # 无 _connectors 属性
-    inner = make_plain_connector(with_store=False, with_inner=True,
-                                 inner_with_store=(variant == "inner_store"))
+    inner = make_plain_connector(
+        with_store=False, with_inner=True, inner_with_store=(variant == "inner_store")
+    )
     return AscendMultiConnector(connectors=[inner])
 
 
@@ -427,4 +429,3 @@ class AscendMultiConnector:
     def __init__(self, connectors=None):
         if connectors is not None:
             self._connectors = connectors
-

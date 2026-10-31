@@ -218,12 +218,8 @@ class GSAReqStat:
         # PD 混合：kv_transfer_config 为 None，或同时为 consumer 与 producer。
         # PD 分离：kv_transfer_config 仅 is_kv_consumer 为 True。
         kv_transfer_config = vllm_config.kv_transfer_config
-        self.is_pd_mix = (
-            kv_transfer_config is None
-            or (
-                kv_transfer_config.is_kv_producer
-                and kv_transfer_config.is_kv_consumer
-            )
+        self.is_pd_mix = kv_transfer_config is None or (
+            kv_transfer_config.is_kv_producer and kv_transfer_config.is_kv_consumer
         )
 
         self.request_hasher = RequestHasher(vllm_config, 0)
@@ -582,12 +578,8 @@ class GSA(UcmSparseBase):
             self.num_spec_tokens += speculative_config.num_speculative_tokens
 
         kv_transfer_config = vllm_config.kv_transfer_config
-        self.is_pd_mix = (
-            kv_transfer_config is None
-            or (
-                kv_transfer_config.is_kv_producer
-                and kv_transfer_config.is_kv_consumer
-            )
+        self.is_pd_mix = kv_transfer_config is None or (
+            kv_transfer_config.is_kv_producer and kv_transfer_config.is_kv_consumer
         )
 
     def _init_slots_num_manager(self, role: UcmSparseRole):

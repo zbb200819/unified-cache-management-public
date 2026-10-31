@@ -59,9 +59,10 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
 
         num_slots_sparsed = INVALID_SLOT
         if self.ucm_sparse:
-            num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(request, self.num_lookahead_tokens)
+            num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(
+                request, self.num_lookahead_tokens
+            )
         req_sparsed_slots.update({request.request_id: num_slots_sparsed})
-
 
         if (
             request.num_output_placeholders > 0
@@ -80,7 +81,9 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
             continue
 
         num_new_tokens = (
-            request.num_tokens_with_spec + request.num_output_placeholders - request.num_computed_tokens
+            request.num_tokens_with_spec
+            + request.num_output_placeholders
+            - request.num_computed_tokens
         )
         if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
             num_new_tokens = self.scheduler_config.long_prefill_token_threshold
@@ -88,7 +91,9 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
 
         # Make sure the input position does not exceed the max model len.
         # This is necessary when using spec decoding.
-        num_new_tokens = min(num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens)
+        num_new_tokens = min(
+            num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
+        )
 
         # Schedule encoder inputs.
         encoder_inputs_to_schedule = None
@@ -160,12 +165,15 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
                         token_budget += num_scheduled_tokens.pop(preempted_req_id)
                         req_to_new_blocks.pop(preempted_req_id)
                         scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                        preempted_encoder_inputs = scheduled_encoder_inputs.pop(preempted_req_id, None)
+                        preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                            preempted_req_id, None
+                        )
                         if preempted_encoder_inputs:
                             # Restore encoder compute budget if the preempted
                             # request had encoder inputs scheduled in this step.
                             num_embeds_to_restore = sum(
-                                preempted_req.get_num_encoder_embeds(i) for i in preempted_encoder_inputs
+                                preempted_req.get_num_encoder_embeds(i)
+                                for i in preempted_encoder_inputs
                             )
                             encoder_compute_budget += num_embeds_to_restore
                         req_index -= 1
@@ -193,7 +201,10 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Speculative decode related.
         if request.spec_token_ids:
             num_scheduled_spec_tokens = (
-                num_new_tokens + request.num_computed_tokens - request.num_tokens - request.num_output_placeholders
+                num_new_tokens
+                + request.num_computed_tokens
+                - request.num_tokens
+                - request.num_output_placeholders
             )
             if num_scheduled_spec_tokens > 0:
                 spec_token_ids = request.spec_token_ids
@@ -237,7 +248,10 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
                 break
 
             if self._balance_enabled:
-                balance_flag = max(t.item() for t in self.balance_queue) == self.max_num_running_reqs
+                balance_flag = (
+                    max(t.item() for t in self.balance_queue)
+                    == self.max_num_running_reqs
+                )
                 if balance_flag:
                     break
 
@@ -248,15 +262,17 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
             request = request_queue.peek_request()
             request_id = request.request_id
 
-            num_slots_sparsed = INVALID_SLOT   ####  suit for skipped
+            num_slots_sparsed = INVALID_SLOT  ####  suit for skipped
             if self.ucm_sparse:
-                num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(request, self.num_lookahead_tokens)
+                num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(
+                    request, self.num_lookahead_tokens
+                )
             req_sparsed_slots.update({request.request_id: num_slots_sparsed})
 
             # try to promote blocked statuses while traversing skipped queue.
-            if self._is_blocked_waiting_status(request.status) and not self._try_promote_blocked_waiting_request(
-                request
-            ):
+            if self._is_blocked_waiting_status(
+                request.status
+            ) and not self._try_promote_blocked_waiting_request(request):
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     logger.debug(
                         "%s is still in WAITING_FOR_REMOTE_KVS state.",
@@ -288,14 +304,16 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
             # Get already-cached tokens.
             if request.num_computed_tokens == 0:
                 # Get locally-cached tokens.
-                new_computed_blocks, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_blocks(
-                    request
+                new_computed_blocks, num_new_local_computed_tokens = (
+                    self.kv_cache_manager.get_computed_blocks(request)
                 )
 
                 # Get externally-cached tokens if using a KVConnector.
                 if self.connector is not None:
-                    ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
-                        request, num_new_local_computed_tokens
+                    ext_tokens, load_kv_async = (
+                        self.connector.get_num_new_matched_tokens(
+                            request, num_new_local_computed_tokens
+                        )
                     )
 
                     if ext_tokens is None:
@@ -307,11 +325,15 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
                         continue
 
                     num_external_computed_tokens = ext_tokens
-                    connector_prefix_cache_queries = request.num_tokens - num_new_local_computed_tokens
+                    connector_prefix_cache_queries = (
+                        request.num_tokens - num_new_local_computed_tokens
+                    )
                     connector_prefix_cache_hits = num_external_computed_tokens
 
                 # Total computed tokens (local + external).
-                num_computed_tokens = num_new_local_computed_tokens + num_external_computed_tokens
+                num_computed_tokens = (
+                    num_new_local_computed_tokens + num_external_computed_tokens
+                )
 
                 if request.prefill_stats is not None:
                     request.prefill_stats.set(
@@ -346,7 +368,10 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
 
                 # chunked prefill has to be enabled explicitly to allow
                 # pooling requests to be chunked
-                if not self.scheduler_config.enable_chunked_prefill and num_new_tokens > token_budget:
+                if (
+                    not self.scheduler_config.enable_chunked_prefill
+                    and num_new_tokens > token_budget
+                ):
                     # If chunked_prefill is disabled,
                     # we can stop the scheduling here.
                     break
@@ -387,12 +412,21 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
             # extra block gets allocated which
             # creates a mismatch between the number
             # of local and remote blocks.
-            effective_lookahead_tokens = 0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+            effective_lookahead_tokens = (
+                0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+            )
 
             # Determine if we need to allocate cross-attention blocks.
             num_encoder_tokens = 0
-            if self.is_encoder_decoder and request.has_encoder_inputs and encoder_inputs_to_schedule:
-                num_encoder_tokens = sum(request.get_num_encoder_embeds(i) for i in encoder_inputs_to_schedule)
+            if (
+                self.is_encoder_decoder
+                and request.has_encoder_inputs
+                and encoder_inputs_to_schedule
+            ):
+                num_encoder_tokens = sum(
+                    request.get_num_encoder_embeds(i)
+                    for i in encoder_inputs_to_schedule
+                )
 
             new_blocks = self.kv_cache_manager.allocate_slots(
                 request,
@@ -425,7 +459,10 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
                     self.kv_cache_manager.get_blocks(request_id),
                     num_external_computed_tokens,
                 )
-                if self.connector_prefix_cache_stats is not None and connector_prefix_cache_queries != 0:
+                if (
+                    self.connector_prefix_cache_stats is not None
+                    and connector_prefix_cache_queries != 0
+                ):
                     self.connector_prefix_cache_stats.record(
                         num_tokens=connector_prefix_cache_queries,
                         num_hits=connector_prefix_cache_hits,
@@ -485,7 +522,9 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
     # Since some requests in the RUNNING queue may not be scheduled in
     # this step, the total number of scheduled requests can be smaller than
     # len(self.running).
-    assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs) <= len(self.running)
+    assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(
+        scheduled_running_reqs
+    ) <= len(self.running)
 
     # Get the longest common prefix among all requests in the running queue.
     # This can be potentially used for cascade attention.
@@ -493,7 +532,9 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
     with record_function_or_nullcontext("schedule: get_num_common_prefix_blocks"):
         if self.running:
             any_request_id = self.running[0].request_id
-            num_common_prefix_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
+            num_common_prefix_blocks = (
+                self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
+            )
 
     # Construct the scheduler output.
     if self.use_v2_model_runner:
@@ -509,7 +550,9 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         ]
     else:
         new_reqs_data = [
-            NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
+            NewRequestData.from_request(
+                req, req_to_new_blocks[req.request_id].get_block_ids()
+            )
             for req in scheduled_new_reqs
         ]
 
@@ -549,18 +592,21 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
     # 2. Wrap up all the KV cache load / save ops into an opaque object
     # 3. Clear the internal states of the connector
     if self.connector is not None:
-        meta: KVConnectorMetadata = self.connector.build_connector_meta(scheduler_output)
+        meta: KVConnectorMetadata = self.connector.build_connector_meta(
+            scheduler_output
+        )
         scheduler_output.kv_connector_metadata = meta
 
     # Build the connector meta for ECConnector
     if self.ec_connector is not None:
-        ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(scheduler_output)
+        ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(
+            scheduler_output
+        )
         scheduler_output.ec_connector_metadata = ec_meta
 
     with record_function_or_nullcontext("schedule: update_after_schedule"):
         self._update_after_schedule(scheduler_output)
     return scheduler_output
-
 
 
 def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
@@ -569,7 +615,9 @@ def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
 
     vllm_config = kwargs.get("vllm_config")
     if not _balance_scheduling_enabled(vllm_config):
-        return _ORIGINAL_RUN_ENGINE_CORE(*args, dp_rank=dp_rank, local_dp_rank=local_dp_rank, **kwargs)
+        return _ORIGINAL_RUN_ENGINE_CORE(
+            *args, dp_rank=dp_rank, local_dp_rank=local_dp_rank, **kwargs
+        )
 
     # Signal handler used for graceful termination.
     # SystemExit exception is only raised once to allow this and worker
@@ -617,13 +665,12 @@ def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
             engine_core._send_engine_dead()
         raise e
     finally:
-        if 'speculatorsearch' in sys.modules:
-            sys.modules['speculatorsearch'].SpeculatorPrintFtdsInfo()
+        if "speculatorsearch" in sys.modules:
+            sys.modules["speculatorsearch"].SpeculatorPrintFtdsInfo()
         with open("/tmp/job_data.pkl", "wb") as f:
             pickle.dump(PerfCounters.get_inst(), f)
         if engine_core is not None:
             engine_core.shutdown()
-
 
 
 @when_imported("vllm_ascend.patch.platform.patch_balance_schedule")
@@ -631,6 +678,7 @@ def _patch(mod):
     try:
         import pickle as _pickle
         import sys as _sys
+
         if not hasattr(mod, "pickle"):
             setattr(mod, "pickle", _pickle)
         if not hasattr(mod, "sys"):
@@ -640,9 +688,12 @@ def _patch(mod):
 
     if hasattr(mod.BalanceScheduler, "schedule"):
         _patched = FunctionType(
-            schedule.__code__, vars(mod),
-            name=schedule.__name__, argdefs=schedule.__defaults__,
-            closure=schedule.__closure__,)
+            schedule.__code__,
+            vars(mod),
+            name=schedule.__name__,
+            argdefs=schedule.__defaults__,
+            closure=schedule.__closure__,
+        )
         _patched.__annotations__ = schedule.__annotations__
         _patched.__kwdefaults__ = schedule.__kwdefaults__
         patch_or_inject(mod.BalanceScheduler, "schedule", _patched)
@@ -650,13 +701,15 @@ def _patch(mod):
 
     if hasattr(mod, "run_engine_core"):
         _patched = FunctionType(
-            run_engine_core.__code__, vars(mod),
-            name=run_engine_core.__name__, argdefs=run_engine_core.__defaults__,
-            closure=run_engine_core.__closure__,)
+            run_engine_core.__code__,
+            vars(mod),
+            name=run_engine_core.__name__,
+            argdefs=run_engine_core.__defaults__,
+            closure=run_engine_core.__closure__,
+        )
         _patched.__annotations__ = run_engine_core.__annotations__
         _patched.__kwdefaults__ = run_engine_core.__kwdefaults__
         patch_or_inject(mod, "run_engine_core", _patched)
         if hasattr(mod, "EngineCoreProc"):
             mod.EngineCoreProc.run_engine_core = _patch
         logger.info("UCM GSA run_engine_core patch applied")
-

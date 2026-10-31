@@ -34,12 +34,17 @@ def indexer_select_post_process(
     indexer_scale_cache_idx = 2 if packed_kv_cache else 3
 
     if (
-        has_ucm_sparse() and
-        PTOPK_PREFETCH_ENABLE and
-        sfa_impl.layer_id < sfa_impl.layer_num and
-        (sfa_impl.is_pdmix or not sfa_impl.vllm_config.kv_transfer_config.is_kv_producer)
+        has_ucm_sparse()
+        and PTOPK_PREFETCH_ENABLE
+        and sfa_impl.layer_id < sfa_impl.layer_num
+        and (
+            sfa_impl.is_pdmix
+            or not sfa_impl.vllm_config.kv_transfer_config.is_kv_producer
+        )
     ):
-        block_table = attn_metadata.dsa_block_table[sfa_impl.cur_topk_index][:len(actual_seq_lengths_query)]
+        block_table = attn_metadata.dsa_block_table[sfa_impl.cur_topk_index][
+            : len(actual_seq_lengths_query)
+        ]
         dsa_cache = sfa_impl.dsa_k_cache
         if enable_sparse_li_c8:
             dsa_cache_scale = sfa_impl.dsa_k_scale
@@ -99,7 +104,6 @@ def indexer_select_post_process(
             sparse_mode=3,
         )
     return topk_indices
-
 
 
 def execute_sparse_flash_attention_process(
@@ -168,7 +172,9 @@ def execute_sparse_flash_attention_process(
     )
     if not isinstance(result, tuple):
         if return_lse:
-            raise RuntimeError("Sparse flash attention did not return softmax max/sum for DCP LSE merge.")
+            raise RuntimeError(
+                "Sparse flash attention did not return softmax max/sum for DCP LSE merge."
+            )
         return result
     attn_output, softmax_max, softmax_sum = result
     return BaseDeviceAdaptor._format_sparse_flash_attention_output(
@@ -177,7 +183,6 @@ def execute_sparse_flash_attention_process(
         softmax_sum,
         return_lse,
     )
-
 
 
 def indexer_select_post_process(
@@ -200,12 +205,17 @@ def indexer_select_post_process(
     indexer_cache_idx = 1 if packed_kv_cache else 2
     indexer_scale_cache_idx = 2 if packed_kv_cache else 3
     if (
-        has_ucm_sparse() and
-        PTOPK_PREFETCH_ENABLE and
-        sfa_impl.layer_id < sfa_impl.layer_num and
-        (sfa_impl.is_pdmix or not sfa_impl.vllm_config.kv_transfer_config.is_kv_producer)
+        has_ucm_sparse()
+        and PTOPK_PREFETCH_ENABLE
+        and sfa_impl.layer_id < sfa_impl.layer_num
+        and (
+            sfa_impl.is_pdmix
+            or not sfa_impl.vllm_config.kv_transfer_config.is_kv_producer
+        )
     ):
-        block_table = attn_metadata.dsa_block_table[sfa_impl.cur_topk_index][:len(actual_seq_lengths_query)]
+        block_table = attn_metadata.dsa_block_table[sfa_impl.cur_topk_index][
+            : len(actual_seq_lengths_query)
+        ]
         dsa_cache = sfa_impl.dsa_k_cache
         if enable_sparse_li_c8:
             dsa_k_scale = sfa_impl.dsa_k_scale.squeeze(2)
@@ -269,36 +279,53 @@ def indexer_select_post_process(
     return topk_indices
 
 
-
 @when_imported("vllm_ascend.device.device_op")
 def _patch(mod):
     if hasattr(mod.BaseDeviceAdaptor, "indexer_select_post_process"):
         _patched = FunctionType(
-            indexer_select_post_process.__code__, vars(mod),
-            name=indexer_select_post_process.__name__, argdefs=indexer_select_post_process.__defaults__,
-            closure=indexer_select_post_process.__closure__,)
+            indexer_select_post_process.__code__,
+            vars(mod),
+            name=indexer_select_post_process.__name__,
+            argdefs=indexer_select_post_process.__defaults__,
+            closure=indexer_select_post_process.__closure__,
+        )
         _patched.__annotations__ = indexer_select_post_process.__annotations__
         _patched.__kwdefaults__ = indexer_select_post_process.__kwdefaults__
         patch_or_inject(mod.BaseDeviceAdaptor, "indexer_select_post_process", _patched)
-        logger.info("UCM GSA BaseDeviceAdaptor.indexer_select_post_process patch applied")
+        logger.info(
+            "UCM GSA BaseDeviceAdaptor.indexer_select_post_process patch applied"
+        )
 
     if hasattr(mod.BaseDeviceAdaptor, "execute_sparse_flash_attention_process"):
         _patched = FunctionType(
-            execute_sparse_flash_attention_process.__code__, vars(mod),
-            name=execute_sparse_flash_attention_process.__name__, argdefs=execute_sparse_flash_attention_process.__defaults__,
-            closure=execute_sparse_flash_attention_process.__closure__,)
-        _patched.__annotations__ = execute_sparse_flash_attention_process.__annotations__
+            execute_sparse_flash_attention_process.__code__,
+            vars(mod),
+            name=execute_sparse_flash_attention_process.__name__,
+            argdefs=execute_sparse_flash_attention_process.__defaults__,
+            closure=execute_sparse_flash_attention_process.__closure__,
+        )
+        _patched.__annotations__ = (
+            execute_sparse_flash_attention_process.__annotations__
+        )
         _patched.__kwdefaults__ = execute_sparse_flash_attention_process.__kwdefaults__
-        patch_or_inject(mod.BaseDeviceAdaptor, "execute_sparse_flash_attention_process", classmethod(_patched))
-        logger.info("UCM GSA BaseDeviceAdaptor.execute_sparse_flash_attention_process patch applied")
+        patch_or_inject(
+            mod.BaseDeviceAdaptor,
+            "execute_sparse_flash_attention_process",
+            classmethod(_patched),
+        )
+        logger.info(
+            "UCM GSA BaseDeviceAdaptor.execute_sparse_flash_attention_process patch applied"
+        )
 
     if hasattr(mod.A5DeviceAdaptor, "indexer_select_post_process"):
         _patched = FunctionType(
-            indexer_select_post_process.__code__, vars(mod),
-            name=indexer_select_post_process.__name__, argdefs=indexer_select_post_process.__defaults__,
-            closure=indexer_select_post_process.__closure__,)
+            indexer_select_post_process.__code__,
+            vars(mod),
+            name=indexer_select_post_process.__name__,
+            argdefs=indexer_select_post_process.__defaults__,
+            closure=indexer_select_post_process.__closure__,
+        )
         _patched.__annotations__ = indexer_select_post_process.__annotations__
         _patched.__kwdefaults__ = indexer_select_post_process.__kwdefaults__
         patch_or_inject(mod.A5DeviceAdaptor, "indexer_select_post_process", _patched)
         logger.info("UCM GSA A5DeviceAdaptor.indexer_select_post_process patch applied")
-

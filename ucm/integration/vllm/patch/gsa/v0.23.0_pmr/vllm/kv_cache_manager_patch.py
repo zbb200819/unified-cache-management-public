@@ -104,8 +104,8 @@ def allocate_slots(
     Returns:
         A list of new allocated blocks.
     """
-    from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
     from ucm.sparse.base import INVALID_SLOT
+    from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
     from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE
 
     # When loading KV data asynchronously, we may have zero new tokens to
@@ -126,9 +126,7 @@ def allocate_slots(
 
     # The number of computed tokens is the number of computed tokens plus
     # the new prefix caching hits
-    num_local_computed_tokens = (
-        request.num_computed_tokens + num_new_computed_tokens
-    )
+    num_local_computed_tokens = request.num_computed_tokens + num_new_computed_tokens
     total_computed_tokens = min(
         num_local_computed_tokens + num_external_computed_tokens,
         self.max_model_len,
@@ -161,24 +159,22 @@ def allocate_slots(
     # insufficient free blocks.
     # Should call this function before allocating new blocks to reduce
     # the number of evicted blocks.
-    self.coordinator.remove_skipped_blocks(
-        request.request_id, total_computed_tokens
-    )
+    self.coordinator.remove_skipped_blocks(request.request_id, total_computed_tokens)
 
     num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
         request_id=request.request_id,
         num_tokens=num_tokens_need_slot,
         new_computed_blocks=new_computed_block_list,
         num_encoder_tokens=num_encoder_tokens,
-        total_computed_tokens=num_local_computed_tokens
-        + num_external_computed_tokens,
+        total_computed_tokens=num_local_computed_tokens + num_external_computed_tokens,
         num_tokens_main_model=num_tokens_main_model,
     )
 
     gsa_preempted_flag = False
     if has_ucm_sparse() and PTOPK_PREFETCH_ENABLE:
         gsa_preempted_flag = get_ucm_sparse().estimate_free_slots_sparse(
-            request, num_blocks_to_allocate, num_new_computed_tokens)
+            request, num_blocks_to_allocate, num_new_computed_tokens
+        )
 
     available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
     if num_blocks_to_allocate > available_blocks or gsa_preempted_flag:
@@ -224,16 +220,17 @@ def allocate_slots(
     return self.create_kv_cache_blocks(new_blocks)
 
 
-
 @when_imported("vllm.v1.core.kv_cache_manager")
 def _patch(mod):
     if hasattr(mod.KVCacheManager, "allocate_slots"):
         _patched = FunctionType(
-            allocate_slots.__code__, vars(mod),
-            name=allocate_slots.__name__, argdefs=allocate_slots.__defaults__,
-            closure=allocate_slots.__closure__,)
+            allocate_slots.__code__,
+            vars(mod),
+            name=allocate_slots.__name__,
+            argdefs=allocate_slots.__defaults__,
+            closure=allocate_slots.__closure__,
+        )
         _patched.__annotations__ = allocate_slots.__annotations__
         _patched.__kwdefaults__ = allocate_slots.__kwdefaults__
         patch_or_inject(mod.KVCacheManager, "allocate_slots", _patched)
         logger.info("UCM GSA KVCacheManager.allocate_slots patch applied")
-

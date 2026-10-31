@@ -22,31 +22,44 @@ def create_engine_config(
     """
 
     from ucm.utils import Config
+
     ucm_config = Config(self.kv_transfer_config)
     self.launch_config = ucm_config.get_config()
     pmr_tree_config = self.launch_config.get("pmr_config", None)
     use_pmr = False
     if pmr_tree_config:
         use_pmr = pmr_tree_config["use_pmr"]
-    use_mtp = self.speculative_config is not None and 'mtp' in self.speculative_config["method"]
+    use_mtp = (
+        self.speculative_config is not None
+        and "mtp" in self.speculative_config["method"]
+    )
     if use_pmr:
         if not use_mtp:
-            self.speculative_config = {
-                "method": "suffix"
-            }
+            self.speculative_config = {"method": "suffix"}
         import torch_npu
+
         npu_count = torch_npu.npu.device_count()
-        multi_node = (self.data_parallel_size *  self.pipeline_parallel_size * self.tensor_parallel_size) > npu_count or self.data_parallel_size > 1
+        multi_node = (
+            self.data_parallel_size
+            * self.pipeline_parallel_size
+            * self.tensor_parallel_size
+        ) > npu_count or self.data_parallel_size > 1
         has_added = int(os.environ.get("HAS_ADDED", 0))
         if "num_speculative_tokens" in self.speculative_config and not has_added:
-            self.speculative_config["num_speculative_tokens"] += pmr_tree_config["num_speculative_tokens"]
+            self.speculative_config["num_speculative_tokens"] += pmr_tree_config[
+                "num_speculative_tokens"
+            ]
             if multi_node:
                 os.environ["HAS_ADDED"] = "1"
         else:
             if not multi_node:
-                self.speculative_config["num_speculative_tokens"] = pmr_tree_config["num_speculative_tokens"]
+                self.speculative_config["num_speculative_tokens"] = pmr_tree_config[
+                    "num_speculative_tokens"
+                ]
             os.environ["HAS_ADDED"] = "0"
-        print(f"[GSA] PMR self.speculative_config {self.speculative_config['num_speculative_tokens']}")
+        print(
+            f"[GSA] PMR self.speculative_config {self.speculative_config['num_speculative_tokens']}"
+        )
 
     current_platform.pre_register_and_update()
 
@@ -91,9 +104,9 @@ def create_engine_config(
         self.kv_cache_dtype, model_config
     )
 
-    assert self.enable_prefix_caching is not None, (
-        "enable_prefix_caching must be set by this point"
-    )
+    assert (
+        self.enable_prefix_caching is not None
+    ), "enable_prefix_caching must be set by this point"
 
     cache_config = CacheConfig(
         block_size=self.block_size,  # type: ignore[arg-type]
@@ -138,9 +151,7 @@ def create_engine_config(
         # Avoid logging sensitive environment variables
         sanitized_env = ray_runtime_env.to_dict() if ray_runtime_env else {}
         if "env_vars" in sanitized_env:
-            sanitized_env["env_vars"] = {
-                k: "***" for k in sanitized_env["env_vars"]
-            }
+            sanitized_env["env_vars"] = {k: "***" for k in sanitized_env["env_vars"]}
         logger.info("Using ray runtime env (env vars redacted): %s", sanitized_env)
 
     # Get the current placement group if Ray is initialized and
@@ -154,15 +165,15 @@ def create_engine_config(
         # but we should not do this here.
         placement_group = ray.util.get_current_placement_group()
 
-    assert not headless or not self.data_parallel_hybrid_lb, (
-        "data_parallel_hybrid_lb is not applicable in headless mode"
-    )
-    assert not (self.data_parallel_hybrid_lb and self.data_parallel_external_lb), (
-        "data_parallel_hybrid_lb and data_parallel_external_lb cannot both be True."
-    )
-    assert self.data_parallel_backend == "mp" or self.nnodes == 1, (
-        "nnodes > 1 is only supported with data_parallel_backend=mp"
-    )
+    assert (
+        not headless or not self.data_parallel_hybrid_lb
+    ), "data_parallel_hybrid_lb is not applicable in headless mode"
+    assert not (
+        self.data_parallel_hybrid_lb and self.data_parallel_external_lb
+    ), "data_parallel_hybrid_lb and data_parallel_external_lb cannot both be True."
+    assert (
+        self.data_parallel_backend == "mp" or self.nnodes == 1
+    ), "nnodes > 1 is only supported with data_parallel_backend=mp"
     inferred_data_parallel_rank = 0
     if self.nnodes > 1:
         world_size = (
@@ -170,16 +181,14 @@ def create_engine_config(
             * self.pipeline_parallel_size
             * self.tensor_parallel_size
         )
-        world_size_within_dp = (
-            self.pipeline_parallel_size * self.tensor_parallel_size
-        )
+        world_size_within_dp = self.pipeline_parallel_size * self.tensor_parallel_size
         local_world_size = world_size // self.nnodes
-        assert world_size % self.nnodes == 0, (
-            f"world_size={world_size} must be divisible by nnodes={self.nnodes}."
-        )
-        assert self.node_rank < self.nnodes, (
-            f"node_rank={self.node_rank} must be less than nnodes={self.nnodes}."
-        )
+        assert (
+            world_size % self.nnodes == 0
+        ), f"world_size={world_size} must be divisible by nnodes={self.nnodes}."
+        assert (
+            self.node_rank < self.nnodes
+        ), f"node_rank={self.node_rank} must be less than nnodes={self.nnodes}."
         inferred_data_parallel_rank = (
             self.node_rank * local_world_size
         ) // world_size_within_dp
@@ -252,9 +261,9 @@ def create_engine_config(
                 self.node_rank,
             )
     else:
-        assert not self.data_parallel_hybrid_lb, (
-            "data_parallel_size_local must be set to use data_parallel_hybrid_lb."
-        )
+        assert (
+            not self.data_parallel_hybrid_lb
+        ), "data_parallel_size_local must be set to use data_parallel_hybrid_lb."
 
         if self.data_parallel_backend == "ray" and (
             envs.VLLM_RAY_DP_PACK_STRATEGY == "span"
@@ -271,9 +280,7 @@ def create_engine_config(
     if self.data_parallel_address is None:
         if self.data_parallel_backend == "ray":
             host_ip = get_ip()
-            logger.info(
-                "Using host IP %s as ray-based data parallel address", host_ip
-            )
+            logger.info("Using host IP %s as ray-based data parallel address", host_ip)
             data_parallel_address = host_ip
         else:
             assert self.data_parallel_backend == "mp", (
@@ -359,16 +366,16 @@ def create_engine_config(
         parallel_config,
     )
 
-    assert self.max_num_batched_tokens is not None, (
-        "max_num_batched_tokens must be set by this point"
-    )
+    assert (
+        self.max_num_batched_tokens is not None
+    ), "max_num_batched_tokens must be set by this point"
     assert self.max_num_seqs is not None, "max_num_seqs must be set by this point"
-    assert self.enable_chunked_prefill is not None, (
-        "enable_chunked_prefill must be set by this point"
-    )
-    assert model_config.max_model_len is not None, (
-        "max_model_len must be set by this point"
-    )
+    assert (
+        self.enable_chunked_prefill is not None
+    ), "enable_chunked_prefill must be set by this point"
+    assert (
+        model_config.max_model_len is not None
+    ), "max_model_len must be set by this point"
     scheduler_config = SchedulerConfig(
         runner_type=model_config.runner_type,
         max_num_batched_tokens=self.max_num_batched_tokens,
@@ -406,9 +413,11 @@ def create_engine_config(
             enable_tower_connector_lora=self.enable_tower_connector_lora,
             specialize_active_lora=self.specialize_active_lora,
             enable_mixed_moe_lora_format=self.enable_mixed_moe_lora_format,
-            max_cpu_loras=self.max_cpu_loras
-            if self.max_cpu_loras and self.max_cpu_loras > 0
-            else None,
+            max_cpu_loras=(
+                self.max_cpu_loras
+                if self.max_cpu_loras and self.max_cpu_loras > 0
+                else None
+            ),
         )
         if self.enable_lora
         else None
@@ -470,9 +479,7 @@ def create_engine_config(
             self.enable_mamba_cache_stochastic_rounding
         )
     if self.mamba_cache_philox_rounds:
-        mamba_config.stochastic_rounding_philox_rounds = (
-            self.mamba_cache_philox_rounds
-        )
+        mamba_config.stochastic_rounding_philox_rounds = self.mamba_cache_philox_rounds
 
     # Kernel config overrides
     kernel_config = copy.deepcopy(self.kernel_config)
@@ -544,9 +551,7 @@ def create_engine_config(
                 "max_cudagraph_capture_size and compilation_config."
                 "max_cudagraph_capture_size are mutually exclusive"
             )
-        compilation_config.max_cudagraph_capture_size = (
-            self.max_cudagraph_capture_size
-        )
+        compilation_config.max_cudagraph_capture_size = self.max_cudagraph_capture_size
 
     offload_config = OffloadConfig(
         offload_backend=self.offload_backend,
@@ -596,11 +601,11 @@ def create_engine_config(
     return config
 
 
-
 @when_imported("vllm.engine.arg_utils")
 def _patch(mod):
     try:
         import os as _os
+
         if not hasattr(mod, "os"):
             setattr(mod, "os", _os)
     except Exception as e:
@@ -608,11 +613,13 @@ def _patch(mod):
 
     if hasattr(mod.EngineArgs, "create_engine_config"):
         _patched = FunctionType(
-            create_engine_config.__code__, vars(mod),
-            name=create_engine_config.__name__, argdefs=create_engine_config.__defaults__,
-            closure=create_engine_config.__closure__,)
+            create_engine_config.__code__,
+            vars(mod),
+            name=create_engine_config.__name__,
+            argdefs=create_engine_config.__defaults__,
+            closure=create_engine_config.__closure__,
+        )
         _patched.__annotations__ = create_engine_config.__annotations__
         _patched.__kwdefaults__ = create_engine_config.__kwdefaults__
         patch_or_inject(mod.EngineArgs, "create_engine_config", _patched)
         logger.info("UCM GSA EngineArgs.create_engine_config patch applied")
-

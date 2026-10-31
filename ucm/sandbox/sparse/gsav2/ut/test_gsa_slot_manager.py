@@ -63,24 +63,24 @@ class TestAllocate:
         tm = TensorManager(4)
         tm.allocate(["h1", "h2"])  # tid 0, 1
         ids, miss = tm.allocate(["h1", "new", -1])
-        assert ids[0] == 0          # h1 命中
-        assert miss == [1, 2]       # new 与 -1 未命中
+        assert ids[0] == 0  # h1 命中
+        assert miss == [1, 2]  # new 与 -1 未命中
         assert tm.active_count() == 4  # tid0(命中) + tid1 + 2 个新分配
 
     def test_old_hash_mapping_removed_on_reuse(self):
         # 堆耗尽后 free → 该 tid 成为唯一空闲项 → 必然被复用
         tm = TensorManager(2)
-        tm.allocate(["a", "b"])     # tid 0(a), 1(b)，堆空
+        tm.allocate(["a", "b"])  # tid 0(a), 1(b)，堆空
         tm.free([0])
-        tm.allocate(["c"])          # 复用 tid 0
+        tm.allocate(["c"])  # 复用 tid 0
         assert "a" not in tm.hash_to_id
         assert tm.hash_to_id["c"] == 0
 
     def test_old_minus_one_hash_skips_removal(self):
         tm = TensorManager(1)
-        tm.allocate([-1])           # tid 0, hash=-1，堆空
+        tm.allocate([-1])  # tid 0, hash=-1，堆空
         tm.free([0])
-        tm.allocate(["x"])          # 复用 tid 0：old_hash == -1 → 不查映射
+        tm.allocate(["x"])  # 复用 tid 0：old_hash == -1 → 不查映射
         assert "x" in tm.hash_to_id
 
     def test_allocated_tensor_popped_from_heap_not_reused(self):
@@ -125,9 +125,9 @@ class TestFree:
 
     def test_free_invalid_tid_prints_and_skips(self, capsys):
         tm = TensorManager(4)
-        tm.free([-1])          # 越界
-        tm.free([99])          # 越界
-        tm.free([0])           # ref_count 已为 0：走 ref_count > 0 的 False 侧
+        tm.free([-1])  # 越界
+        tm.free([99])  # 越界
+        tm.free([0])  # ref_count 已为 0：走 ref_count > 0 的 False 侧
         out = capsys.readouterr().out
         assert "tid wrong" in out
         assert tm.get_free_count() == 4

@@ -29,11 +29,13 @@ def _make_patched_init(orig_init):
 @when_imported("vllm.v1.core.sched.output")
 def _patch_sched_output(mod):
     if not hasattr(mod, "SchedulerOutput"):
-        logger.warning(
-            "Skip SchedulerOutput GSA fields patch: SchedulerOutput missing"
-        )
+        logger.warning("Skip SchedulerOutput GSA fields patch: SchedulerOutput missing")
         return
     patch_or_inject(
-        mod.SchedulerOutput, "__init__", _make_patched_init(mod.SchedulerOutput.__init__)
+        mod.SchedulerOutput,
+        "__init__",
+        _make_patched_init(mod.SchedulerOutput.__init__),
     )
-    logger.info("UCM GSA SchedulerOutput req_sparsed_slots/use_pmr fields patch applied")
+    logger.info(
+        "UCM GSA SchedulerOutput req_sparsed_slots/use_pmr fields patch applied"
+    )

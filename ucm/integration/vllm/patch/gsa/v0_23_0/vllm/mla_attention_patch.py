@@ -197,16 +197,17 @@ def __init__(
     )
 
 
-
 @when_imported("vllm.model_executor.layers.attention.mla_attention")
 def _patch(mod):
     if hasattr(mod.MLAAttention, "__init__"):
         _patched = FunctionType(
-            __init__.__code__, vars(mod),
-            name=__init__.__name__, argdefs=__init__.__defaults__,
-            closure=__init__.__closure__,)
+            __init__.__code__,
+            vars(mod),
+            name=__init__.__name__,
+            argdefs=__init__.__defaults__,
+            closure=__init__.__closure__,
+        )
         _patched.__annotations__ = __init__.__annotations__
         _patched.__kwdefaults__ = __init__.__kwdefaults__
         patch_or_inject(mod.MLAAttention, "__init__", _patched)
         logger.info("UCM GSA MLAAttention.__init__ patch applied")
-

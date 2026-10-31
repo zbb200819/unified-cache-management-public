@@ -18,10 +18,10 @@ def __init__(
     executor_fail_callback: Callable | None = None,
     include_finished_set: bool = False,
 ):
-    from ucm.sparse.utils import IS_OPEN_GSA, rm_shared_memory
-
     # plugins need to be loaded at the engine/scheduler level too
     from vllm.plugins import load_general_plugins
+
+    from ucm.sparse.utils import IS_OPEN_GSA, rm_shared_memory
 
     load_general_plugins()
 
@@ -80,9 +80,7 @@ def __init__(
         self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
     mm_registry = MULTIMODAL_REGISTRY
-    self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(
-        vllm_config
-    )
+    self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(vllm_config)
 
     # If a KV connector is initialized for scheduler, we want to collect
     # handshake metadata from all workers so the connector in the scheduler
@@ -134,9 +132,7 @@ def __init__(
             hash_block_size, caching_hash_fn
         )
 
-    self.step_fn = (
-        self.step if self.batch_queue is None else self.step_with_batch_queue
-    )
+    self.step_fn = self.step if self.batch_queue is None else self.step_with_batch_queue
     self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
     self.aborts_queue = queue.Queue[list[str]]()
@@ -151,7 +147,6 @@ def __init__(
     # Enable environment variable cache (e.g. assume no more
     # environment variable overrides after this point)
     enable_envs_cache()
-
 
 
 def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
@@ -176,7 +171,11 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         if model_output is None:
             model_output = self.model_executor.sample_tokens(grammar_output)
 
-    if not self.async_scheduling and self.use_spec_decode and scheduler_output.total_num_scheduled_tokens > 0:
+    if (
+        not self.async_scheduling
+        and self.use_spec_decode
+        and scheduler_output.total_num_scheduled_tokens > 0
+    ):
         # Take the draft token ids.
         draft_token_ids = self.model_executor.take_draft_token_ids()
         if draft_token_ids is not None:
@@ -192,7 +191,6 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
     return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
 
-
 def post_step(self, model_executed: bool) -> None:
     return
     # When using async scheduling we can't get draft token ids in advance,
@@ -205,11 +203,9 @@ def post_step(self, model_executed: bool) -> None:
             self.scheduler.update_draft_token_ids(draft_token_ids)
 
 
-
 def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
     """Launch EngineCore busy loop in background process."""
     from ucm.pmr.perf_counter import PerfCounters
-
 
     # Ensure we can serialize transformer config after spawning
     maybe_register_config_serialize_by_value()
@@ -293,8 +289,8 @@ def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
             engine_core._send_engine_dead()
         raise e
     finally:
-        if 'speculatorsearch' in sys.modules:
-            sys.modules['speculatorsearch'].SpeculatorPrintFtdsInfo()
+        if "speculatorsearch" in sys.modules:
+            sys.modules["speculatorsearch"].SpeculatorPrintFtdsInfo()
         dump_and_spawn()
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -302,7 +298,6 @@ def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
             signal_callback.stop()
         if engine_core is not None:
             engine_core.shutdown()
-
 
 
 def _process_input_queue(self):
@@ -337,7 +332,6 @@ def _process_input_queue(self):
         self._handle_client_request(*req)
 
 
-
 def dump_and_spawn():
     """主进程：1. 立即 dump 数据  2. 启动子进程做长任务"""
     from ucm.pmr.perf_counter import PerfCounters
@@ -350,10 +344,11 @@ def dump_and_spawn():
         pickle.dump(PerfCounters.get_inst(), f)
     # 子进程跑长任务（会等它完成）
     import multiprocessing as mp
-    import subprocess, shlex
+    import shlex
+    import subprocess
+
     cmd = f"nohup python -u {script_path}"
     subprocess.Popen(shlex.split(cmd), shell=False)
-
 
 
 def long_task_sub():
@@ -368,13 +363,18 @@ def long_task_sub():
     return
 
 
-
 @when_imported("vllm.v1.engine.core")
 def _patch(mod):
     # Inject module-level constants needed by dump_and_spawn / long_task_sub.
-    import subprocess, sys, os, time, pickle
+    import os
+    import pickle
+    import subprocess
+    import sys
+    import time
+
     from ucm.pmr.perf_counter import PerfCounters
-    _SUB_CODE = '''
+
+    _SUB_CODE = """
 DATA_FILE = "/tmp/job_data.pkl"
 DONE_FLAG = "/tmp/job_done.flag"
 import sys, pickle, os, time
@@ -388,13 +388,20 @@ def run():
         perfCounter.print()
     return
 run()
-'''
+"""
     _script_path = "/tmp/nohup_script.py"
     for _name, _val in {
-        "subprocess": subprocess, "sys": sys, "os": os, "time": time, "pickle": pickle,
+        "subprocess": subprocess,
+        "sys": sys,
+        "os": os,
+        "time": time,
+        "pickle": pickle,
         "PerfCounters": PerfCounters,
-        "DATA_FILE": "/tmp/job_data.pkl", "DONE_FLAG": "/tmp/job_done.flag",
-        "LOG_FILE": "nohup.out", "SUB_CODE": _SUB_CODE, "script_path": _script_path,
+        "DATA_FILE": "/tmp/job_data.pkl",
+        "DONE_FLAG": "/tmp/job_done.flag",
+        "LOG_FILE": "nohup.out",
+        "SUB_CODE": _SUB_CODE,
+        "script_path": _script_path,
     }.items():
         if not hasattr(mod, _name):
             setattr(mod, _name, _val)
@@ -407,9 +414,12 @@ run()
 
     if hasattr(mod.EngineCore, "__init__"):
         _patched = FunctionType(
-            __init__.__code__, vars(mod),
-            name=__init__.__name__, argdefs=__init__.__defaults__,
-            closure=__init__.__closure__,)
+            __init__.__code__,
+            vars(mod),
+            name=__init__.__name__,
+            argdefs=__init__.__defaults__,
+            closure=__init__.__closure__,
+        )
         _patched.__annotations__ = __init__.__annotations__
         _patched.__kwdefaults__ = __init__.__kwdefaults__
         patch_or_inject(mod.EngineCore, "__init__", _patched)
@@ -417,9 +427,12 @@ run()
 
     if hasattr(mod.EngineCore, "step"):
         _patched = FunctionType(
-            step.__code__, vars(mod),
-            name=step.__name__, argdefs=step.__defaults__,
-            closure=step.__closure__,)
+            step.__code__,
+            vars(mod),
+            name=step.__name__,
+            argdefs=step.__defaults__,
+            closure=step.__closure__,
+        )
         _patched.__annotations__ = step.__annotations__
         _patched.__kwdefaults__ = step.__kwdefaults__
         patch_or_inject(mod.EngineCore, "step", _patched)
@@ -427,9 +440,12 @@ run()
 
     if hasattr(mod.EngineCore, "post_step"):
         _patched = FunctionType(
-            post_step.__code__, vars(mod),
-            name=post_step.__name__, argdefs=post_step.__defaults__,
-            closure=post_step.__closure__,)
+            post_step.__code__,
+            vars(mod),
+            name=post_step.__name__,
+            argdefs=post_step.__defaults__,
+            closure=post_step.__closure__,
+        )
         _patched.__annotations__ = post_step.__annotations__
         _patched.__kwdefaults__ = post_step.__kwdefaults__
         patch_or_inject(mod.EngineCore, "post_step", _patched)
@@ -437,9 +453,12 @@ run()
 
     if hasattr(mod.EngineCoreProc, "run_engine_core"):
         _patched = FunctionType(
-            run_engine_core.__code__, vars(mod),
-            name=run_engine_core.__name__, argdefs=run_engine_core.__defaults__,
-            closure=run_engine_core.__closure__,)
+            run_engine_core.__code__,
+            vars(mod),
+            name=run_engine_core.__name__,
+            argdefs=run_engine_core.__defaults__,
+            closure=run_engine_core.__closure__,
+        )
         _patched.__annotations__ = run_engine_core.__annotations__
         _patched.__kwdefaults__ = run_engine_core.__kwdefaults__
         patch_or_inject(mod.EngineCoreProc, "run_engine_core", _patched)
@@ -447,9 +466,12 @@ run()
 
     if hasattr(mod.EngineCoreProc, "_process_input_queue"):
         _patched = FunctionType(
-            _process_input_queue.__code__, vars(mod),
-            name=_process_input_queue.__name__, argdefs=_process_input_queue.__defaults__,
-            closure=_process_input_queue.__closure__,)
+            _process_input_queue.__code__,
+            vars(mod),
+            name=_process_input_queue.__name__,
+            argdefs=_process_input_queue.__defaults__,
+            closure=_process_input_queue.__closure__,
+        )
         _patched.__annotations__ = _process_input_queue.__annotations__
         _patched.__kwdefaults__ = _process_input_queue.__kwdefaults__
         patch_or_inject(mod.EngineCoreProc, "_process_input_queue", _patched)
@@ -457,9 +479,12 @@ run()
 
     if not hasattr(mod, "dump_and_spawn"):
         _patched = FunctionType(
-            dump_and_spawn.__code__, vars(mod),
-            name=dump_and_spawn.__name__, argdefs=dump_and_spawn.__defaults__,
-            closure=dump_and_spawn.__closure__,)
+            dump_and_spawn.__code__,
+            vars(mod),
+            name=dump_and_spawn.__name__,
+            argdefs=dump_and_spawn.__defaults__,
+            closure=dump_and_spawn.__closure__,
+        )
         _patched.__annotations__ = dump_and_spawn.__annotations__
         _patched.__kwdefaults__ = dump_and_spawn.__kwdefaults__
         mod.dump_and_spawn = _patched
@@ -467,11 +492,13 @@ run()
 
     if not hasattr(mod, "long_task_sub"):
         _patched = FunctionType(
-            long_task_sub.__code__, vars(mod),
-            name=long_task_sub.__name__, argdefs=long_task_sub.__defaults__,
-            closure=long_task_sub.__closure__,)
+            long_task_sub.__code__,
+            vars(mod),
+            name=long_task_sub.__name__,
+            argdefs=long_task_sub.__defaults__,
+            closure=long_task_sub.__closure__,
+        )
         _patched.__annotations__ = long_task_sub.__annotations__
         _patched.__kwdefaults__ = long_task_sub.__kwdefaults__
         mod.long_task_sub = _patched
         logger.info("UCM GSA long_task_sub injected")
-
