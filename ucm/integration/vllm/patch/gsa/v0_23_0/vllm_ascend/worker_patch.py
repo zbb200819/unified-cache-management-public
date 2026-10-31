@@ -47,8 +47,6 @@ def execute_model(
     self,
     scheduler_output: "SchedulerOutput",
 ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-    from ucm.pmr.perf_counter import PerfCounters
-
     self.log_memory_stats()
     # enable msMonitor to monitor the performance of vllm-ascend
     if get_ascend_config().msmonitor_use_daemon:
@@ -81,10 +79,7 @@ def execute_model(
     if self.profiler is not None:
         self.profiler.step()
 
-    start_time = time.perf_counter()
     output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
-    if self.is_driver_worker:
-        PerfCounters.get_inst().update("--- worker.execute_model", (time.perf_counter() - start_time))
 
     if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
         return output

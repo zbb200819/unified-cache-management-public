@@ -215,17 +215,13 @@ def apply_all_patches() -> None:
             case "0.23.0":
                 if ENABLE_GSA_PATCH:
                     logger.info("UCM patching vllm 0.23.0 for GSA sparse attention...")
-                    import ucm.integration.vllm.patch.gsa.v0_23_0.vllm.arg_utils_patch
-                    import ucm.integration.vllm.patch.gsa.v0_23_0.vllm.attention_patch
+
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm.block_table_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm.engine_core_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm.gpu_model_runner_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm.gpu_worker_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm.kv_cache_manager_patch
-                    import ucm.integration.vllm.patch.gsa.v0_23_0.vllm.metrics_loggers_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm.mla_attention_patch
-                    import ucm.integration.vllm.patch.gsa.v0_23_0.vllm.multiproc_executor_patch
-                    import ucm.integration.vllm.patch.gsa.v0_23_0.vllm.request_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm.sched_output_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm.scheduler_patch
                 else:
@@ -326,12 +322,7 @@ def apply_all_patches() -> None:
                     # compiled in.
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.block_table_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.device_op_patch
-                    import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.llm_base_proposer_patch
-                    import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.mla_v1_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.model_runner_v1_patch
-                    import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.patch_balance_schedule_patch
-                    import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.platform_patch
-                    import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.scheduler_dynamic_batch_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.sfa_v1_patch
                     import ucm.integration.vllm.patch.gsa.v0_23_0.vllm_ascend.worker_patch
                 else:

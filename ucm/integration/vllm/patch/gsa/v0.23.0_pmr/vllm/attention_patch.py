@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import FunctionType
 
+from vllm.v1.attention.backend import AttentionType
 from ucm.integration.vllm.patch.utils import patch_or_inject, when_imported
 from ucm.logger import init_logger
 
@@ -78,7 +79,7 @@ def __init__(
     The KV cache is stored inside this class and is accessed via
     `self.kv_cache`.
     """
-    super().__init__()
+    super(Attention, self).__init__()
     sliding_window: int | None
     if per_layer_sliding_window is not None:
         # per-layer sliding window
@@ -369,6 +370,13 @@ def maybe_execute_sparse_attention_finished(
 
 @when_imported("vllm.model_executor.layers.attention.attention")
 def _patch(mod):
+    try:
+        import os as _os
+        if not hasattr(mod, "os"):
+            setattr(mod, "os", _os)
+    except Exception as e:
+        logger.warning(f"GSA attention os injection failed {e}")
+
     if hasattr(mod, "unified_attention_with_output"):
         _patched = FunctionType(
             unified_attention_with_output.__code__, vars(mod),

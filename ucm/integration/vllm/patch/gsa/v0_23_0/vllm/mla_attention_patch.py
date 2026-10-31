@@ -28,7 +28,7 @@ def __init__(
     indexer: object | None = None,
     **extra_impl_args,
 ):
-    super().__init__()
+    super(MLAAttention, self).__init__()
     self.num_heads = num_heads
     self.scale = scale
     self.qk_nope_head_dim = qk_nope_head_dim

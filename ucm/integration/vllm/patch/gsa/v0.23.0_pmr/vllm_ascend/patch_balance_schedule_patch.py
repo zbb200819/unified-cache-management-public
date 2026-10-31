@@ -15,8 +15,8 @@ def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
 
     if not self._balance_enabled and not self._disable_preemption:
         if vllm_version_is("0.23.0"):
-            return super().schedule()
-        return super().schedule(throttle_prefills)
+            return super(BalanceScheduler, self).schedule()
+        return super(BalanceScheduler, self).schedule(throttle_prefills)
     # NOTE(woosuk) on the scheduling algorithm:
     # There's no "decoding phase" nor "prefill phase" in the scheduler.
     # Each request just has the num_computed_tokens and
@@ -628,6 +628,16 @@ def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
 
 @when_imported("vllm_ascend.patch.platform.patch_balance_schedule")
 def _patch(mod):
+    try:
+        import pickle as _pickle
+        import sys as _sys
+        if not hasattr(mod, "pickle"):
+            setattr(mod, "pickle", _pickle)
+        if not hasattr(mod, "sys"):
+            setattr(mod, "sys", _sys)
+    except Exception as e:
+        logger.warning(f"GSA patch_balance_schedule sys/pickle injection failed {e}")
+
     if hasattr(mod.BalanceScheduler, "schedule"):
         _patched = FunctionType(
             schedule.__code__, vars(mod),

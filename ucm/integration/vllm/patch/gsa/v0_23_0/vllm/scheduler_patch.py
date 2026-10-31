@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import FunctionType
 
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from ucm.integration.vllm.patch.utils import patch_or_inject, when_imported
 from ucm.logger import init_logger
 
@@ -21,7 +22,6 @@ def __init__(
     include_finished_set: bool = False,
     log_stats: bool = False,
 ) -> None:
-    from ucm.pmr.state import PmrTreeAlgSche
     from ucm.sparse.state import ensure_ucm_sparse_initialized, get_ucm_sparse, has_ucm_sparse
     from ucm.sparse.base import UcmSparseRole
     from ucm.sparse.utils import IS_OPEN_GSA
@@ -42,8 +42,6 @@ def __init__(
         )
     self.structured_output_manager = structured_output_manager
     self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
-
-    self.speculative_config = None
 
     # include_finished_set controls whether a separate set of finished
     # request ids should be included in the EngineCoreOutputs returned
@@ -178,7 +176,6 @@ def __init__(
     )
 
     speculative_config = vllm_config.speculative_config
-    self.speculative_config = speculative_config
     self.use_eagle = False
     self.num_spec_tokens = self.num_lookahead_tokens = 0
     if speculative_config:
@@ -220,7 +217,6 @@ def __init__(
     self.use_v2_model_runner = vllm_config.use_v2_model_runner
     # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
     # cadence (`next_decode_eligible_step`).
-    self.pmr_tree_alg_sche = PmrTreeAlgSche(self.vllm_config)
     self.current_step = 0
     self.scheduler_reserve_full_isl = (
         self.scheduler_config.scheduler_reserve_full_isl
@@ -299,8 +295,6 @@ def schedule(self) -> SchedulerOutput:
     encoder_compute_budget = self.max_num_encoder_input_tokens
     # Spec decode-related.
     scheduled_spec_decode_tokens: dict[str, list[int]] = {}
-    scheduled_spec_decode_positions: dict[str, list[int]] = {}
-    scheduled_spec_decode_masks: dict[str, np.array] = {}
 
     # For logging.
     scheduled_timestamp = time.monotonic()
@@ -893,8 +887,7 @@ def schedule(self) -> SchedulerOutput:
         # the previous and the current steps.
         finished_req_ids=self.finished_req_ids,
         free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
-        new_block_ids_to_zero=new_block_ids_to_zero,
-        use_pmr=self.pmr_tree_alg_sche.use_pmr
+        new_block_ids_to_zero=new_block_ids_to_zero
     )
 
     # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1241,8 +1234,6 @@ def update_from_output(
         client_index: EngineCoreOutputs(outputs=outs)
         for client_index, outs in outputs.items()
     }
-    self.pmr_tree_alg_sche.search_insert_context(self.requests, scheduler_output, model_runner_output, len(self.running))
-    scheduler_output.use_pmr = self.pmr_tree_alg_sche.use_pmr
 
     finished_req_ids = self.finished_req_ids_dict
     if finished_req_ids:
@@ -1309,7 +1300,6 @@ def _free_request(
 ) -> dict[str, Any] | None:
     assert request.is_finished()
 
-    self.pmr_tree_alg_sche.merge_tree(request)
     print("------------------------------------------------------------------------------------------------", flush=True)
     print(f"[GSA] out tokens for req_id {request.request_id} and prompt len {len(request.prompt_token_ids)} out_put len {len(request._output_token_ids)}", flush=True)
     print(f"{self.tokenizer.decode(request._output_token_ids, skip_special_tokens=False)}", flush=True)
@@ -1335,6 +1325,13 @@ def _free_request(
 
 @when_imported("vllm.v1.core.sched.scheduler")
 def _patch(mod):
+    try:
+        from transformers import AutoTokenizer
+        if not hasattr(mod, "AutoTokenizer"):
+            setattr(mode, "AutoTokenizer", AutoTokenizer)
+    except Exception as e:
+        logger.warning(f"GSA scheduler AutoTokenizer injection failed {e}")
+
     if hasattr(mod.Scheduler, "__init__"):
         _patched = FunctionType(
             __init__.__code__, vars(mod),

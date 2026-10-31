@@ -492,27 +492,13 @@ def __init__(
     self.draft_token_ids_cpu: torch.Tensor | None = None
     self.num_accepted_tokens_event: torch.Event | None = None
 
-    from ucm.utils import Config
-    ucm_config = Config(self.vllm_config.kv_transfer_config)
-    self.launch_config = ucm_config.get_config()
-    pmr_tree_config = self.launch_config.get("pmr_config", None)
-    use_pmr = False
-    if pmr_tree_config:
-        use_pmr = pmr_tree_config["use_pmr"]
-
     if self.num_spec_tokens:
         self.draft_token_ids_event = torch.Event()
         self.num_accepted_tokens_event = torch.Event()
         self.draft_token_ids_copy_stream = torch.cuda.Stream()
 
-        if use_pmr and self.speculative_config.method != "suffix":
-            self.num_spec_tokens_mtp = self.num_spec_tokens - pmr_tree_config["num_speculative_tokens"]
-        else:
-            self.num_spec_tokens_mtp = self.num_spec_tokens
-
-
         self.draft_token_ids_cpu = torch.empty(
-            (self.max_num_reqs, self.num_spec_tokens_mtp),
+            (self.max_num_reqs, self.num_spec_tokens),
             dtype=torch.int64,
             device="cpu",
             pin_memory=self.pin_memory,

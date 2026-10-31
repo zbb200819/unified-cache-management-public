@@ -289,7 +289,7 @@ def _patch(mod):
             closure=execute_sparse_flash_attention_process.__closure__,)
         _patched.__annotations__ = execute_sparse_flash_attention_process.__annotations__
         _patched.__kwdefaults__ = execute_sparse_flash_attention_process.__kwdefaults__
-        patch_or_inject(mod.BaseDeviceAdaptor, "execute_sparse_flash_attention_process", _patched)
+        patch_or_inject(mod.BaseDeviceAdaptor, "execute_sparse_flash_attention_process", classmethod(_patched))
         logger.info("UCM GSA BaseDeviceAdaptor.execute_sparse_flash_attention_process patch applied")
 
     if hasattr(mod.A5DeviceAdaptor, "indexer_select_post_process"):

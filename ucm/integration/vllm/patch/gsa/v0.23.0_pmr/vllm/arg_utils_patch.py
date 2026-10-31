@@ -599,6 +599,13 @@ def create_engine_config(
 
 @when_imported("vllm.engine.arg_utils")
 def _patch(mod):
+    try:
+        import os as _os
+        if not hasattr(mod, "os"):
+            setattr(mod, "os", _os)
+    except Exception as e:
+        logger.warning(f"GSA arg_utils os injection failed {e}")
+
     if hasattr(mod.EngineArgs, "create_engine_config"):
         _patched = FunctionType(
             create_engine_config.__code__, vars(mod),

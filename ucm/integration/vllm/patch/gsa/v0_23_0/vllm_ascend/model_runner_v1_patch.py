@@ -29,7 +29,7 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device):
     )
 
     with _torch_cuda_wrapper():
-        super().__init__(vllm_config, device)
+        super(NPUModelRunner, self).__init__(vllm_config, device)
 
     if not vllm_version_is("0.23.0"):
         self.pin_memory = PIN_MEMORY
@@ -76,11 +76,6 @@ def __init__(self, vllm_config: VllmConfig, device: torch.device):
 
     self.sampler = AscendSampler()
     self.attn_state: AscendAttentionState | None = None
-
-    from ucm.utils import Config
-    ucm_config = Config(vllm_config.kv_transfer_config)
-    self.launch_config = ucm_config.get_config()
-    self.pmr_tree_config = self.launch_config.get("pmr_config", None)
 
     # Ascend-specific configurations
     self.ascend_config = get_ascend_config()
@@ -387,12 +382,6 @@ def _set_up_drafter(self):
             self.rejection_sampler = AscendRejectionSampler(self.sampler)
     self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
     self.num_discarded_requests = 0
-
-    if self.pmr_tree_config is not None:
-        self.use_eagle = False
-        if get_pp_group().is_last_rank:
-            self.rejection_sampler = AscendRejectionSampler(self.sampler)
-
 
 
 def _prepare_inputs(
@@ -947,10 +936,6 @@ def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
     # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
     elif np.all(num_scheduled_tokens == 1):
         attn_state = AscendAttentionState.DecodeOnly
-        if self.speculative_config and self.speculative_config.method == "mtp":
-            # SpecDecoding now supports seq_len=1 and seq_len=2
-            # In Prefilling Decoding Disaggregation scenario, SpecDecoding need to supports seq_len=1
-            attn_state = AscendAttentionState.SpecDecoding
     # Speculative decoding.
     elif np.all(num_valid_tokens == 1):
         if self.speculative_config:
@@ -962,16 +947,12 @@ def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
     # splitfuse
     elif self.scheduler_config.enable_chunked_prefill:
         attn_state = AscendAttentionState.ChunkedPrefill
-        if self.pmr_tree_config:
-           attn_state = AscendAttentionState.SpecDecoding
-           if self.speculative_config and self.speculative_config.method == 'mtp' and num_scheduled_tokens.max() > (1 + self.speculative_config.num_speculative_tokens):
-               attn_state = AscendAttentionState.ChunkedPrefill
     else:
         attn_state = AscendAttentionState.PrefillCacheHit
 
     # For the overlay of the PCP feature and the eagle3, attn_state needs to be recovered
     # TODO: Resolved the conflict between the sunset of attn_state and the PCP that requires this interface.
-    if self.speculative_config and attn_state == AscendAttentionState.SpecDecoding and self.speculative_config.method != "mtp":
+    if attn_state == AscendAttentionState.SpecDecoding and self.speculative_config.method != "mtp":
         self.attn_state = AscendAttentionState.ChunkedPrefill  # type: ignore
     else:
         self.attn_state = attn_state  # type: ignore
@@ -985,11 +966,6 @@ def execute_model(
     scheduler_output: "SchedulerOutput",
     intermediate_tensors: IntermediateTensors | None = None,
 ) -> ModelRunnerOutput | IntermediateTensors | None:
-
-    from ucm.pmr.perf_counter import PerfCounters
-    from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
-
-    execute_model_start = time.perf_counter()
 
     if self.vllm_config.model_config.enable_return_routed_experts:
         if self.routed_experts_initialized:
@@ -1062,7 +1038,6 @@ def execute_model(
 
     num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
 
-    pre_input_start = time.perf_counter()
     with record_function_or_nullcontext("prepare input"):
         with self.synchronize_input_prep():
             # Fix up prev_req_id_to_index for requests that were discarded
@@ -1131,9 +1106,6 @@ def execute_model(
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-
-            PerfCounters.get_inst().update_draft_num(scheduler_output.total_num_scheduled_tokens)
-            prepare_start = time.perf_counter()
 
             (
                 logits_indices,
@@ -1307,11 +1279,9 @@ def execute_model(
             intermediate_tensors,
         )
 
-        PerfCounters.get_inst().update("---- prepare input[cpu]", (time.perf_counter() - prepare_start))
         # update global cos, sin
         update_cos_sin(positions)
 
-    pre_input_time = (time.perf_counter() - pre_input_start)  * 1_000_000
     if self.dynamic_eplb:
         self.eplb_updator.forward_before()
 
@@ -1338,7 +1308,6 @@ def execute_model(
     defer_kv_connector_finalize = self.speculative_config is not None and (
         get_pp_group().is_last_rank or self.broadcast_pp_output
     )
-    forward_start = time.perf_counter()
     with (
         record_function_or_nullcontext("forward"),
         set_ascend_forward_context(
@@ -1375,10 +1344,6 @@ def execute_model(
         self.maybe_execute_ucm_sparse_warmup()
         if self.vllm_config.speculative_config is None:
             self.maybe_execute_ucm_sparse_finished()
-
-    forward_time = (time.perf_counter() - forward_start)  * 1_000_000
-    PerfCounters.get_inst().update("---- forward[cpu]", (time.perf_counter() - forward_start))
-    post_start = time.perf_counter()
 
     with record_function_or_nullcontext("post process"):
         aux_hidden_states = None
@@ -1459,12 +1424,6 @@ def execute_model(
     if deferred_state_corrections_fn:
         deferred_state_corrections_fn()
 
-    PerfCounters.get_inst().update("---- post process[cpu]", (time.perf_counter() - post_start))
-    post_time = (time.perf_counter() - post_start)  * 1_000_000
-    if self.speculative_config and self.speculative_config.method == "mtp":
-        self.drafter.use_pmr = scheduler_output.use_pmr
-    if has_ucm_sparse():
-        get_ucm_sparse().print_log(f"[GSA] execute_model time {(time.perf_counter() - execute_model_start)  * 1_000_000} pre_input_time {pre_input_time} forward_time {forward_time} post_time {post_time}")
     return None
 
 
@@ -1474,7 +1433,6 @@ def sample_tokens(
 ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
     from ucm.sparse.state import has_ucm_sparse
 
-    sample_tokens_start = time.perf_counter()
     kv_connector_output = self.kv_connector_output
     self.kv_connector_output = None
     pp = get_pp_group()
@@ -1539,22 +1497,19 @@ def sample_tokens(
 
     def propose_draft_token_ids(sampled_token_ids):
         assert spec_decode_common_attn_metadata is not None
-        if scheduler_output.use_pmr and self.speculative_config.method == "suffix":
-            self._draft_token_ids = None
-        else:
-            self._draft_token_ids = self.propose_draft_token_ids(
-                sampled_token_ids,
-                self.input_batch.sampling_metadata,
-                scheduler_output,
-                spec_decode_metadata,
-                spec_decode_common_attn_metadata,
-                positions,
-                scheduler_output.total_num_scheduled_tokens,
-                hidden_states,
-                aux_hidden_states,
-                sample_hidden_states,
-                batch_desc,
-            )
+        self._draft_token_ids = self.propose_draft_token_ids(
+            sampled_token_ids,
+            self.input_batch.sampling_metadata,
+            scheduler_output,
+            spec_decode_metadata,
+            spec_decode_common_attn_metadata,
+            positions,
+            scheduler_output.total_num_scheduled_tokens,
+            hidden_states,
+            aux_hidden_states,
+            sample_hidden_states,
+            batch_desc,
+        )
         self._copy_draft_token_ids_to_cpu(scheduler_output)
 
     (

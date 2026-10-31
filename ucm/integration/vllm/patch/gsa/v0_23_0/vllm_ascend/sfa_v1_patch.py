@@ -533,7 +533,7 @@ def _patch(mod):
     # can resolve them through vars(mod).
     try:
         from vllm.forward_context import ForwardContext, get_forward_context
-        from vllm.model_executor.layers.attention.attention import (
+        from ucm.sparse.state import (
             maybe_execute_sparse_attention_begin,
             maybe_execute_sparse_attention_finished,
         )

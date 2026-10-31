@@ -48,6 +48,7 @@ void MultiBSThreadFun(const TaskInfo& taskInfo, ThreadInfo& threadInfo);
 void MultiBSThreadFunIndexer(const TaskInfo& taskInfo, ThreadInfo& threadInfo);
 
 float average(const std::vector<float>& vec);
+float average2d(const std::vector<std::vector<float>>& matrix);
 
 class __attribute__((visibility("hidden"))) GSAPrefetchEngineC {
     friend struct UCMMergeHostAddress;

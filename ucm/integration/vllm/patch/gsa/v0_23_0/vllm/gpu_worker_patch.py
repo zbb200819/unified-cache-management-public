@@ -17,7 +17,7 @@ def _make_patched_init(orig):
         from ucm.sparse.state import ensure_ucm_sparse_initialized
 
         # vllm_config is the last positional arg in the upstream signature.
-        vllm_config = args[-1] if args else kwargs.get("vllm_config")
+        vllm_config = args[0] if args else kwargs.get("vllm_config")
         orig(*args, **kwargs)
         if vllm_config is not None:
             ensure_ucm_sparse_initialized(vllm_config)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import FunctionType
 
+from vllm.config import CUDAGraphMode
 from ucm.integration.vllm.patch.utils import patch_or_inject, when_imported
 from ucm.logger import init_logger
 
@@ -13,7 +14,7 @@ logger = init_logger(__name__)
 def __init__(self, vllm_config: VllmConfig, device: torch.device, pass_hidden_states_to_model: bool, runner=None):
     from ucm.utils import Config
 
-    super().__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
+    super(AscendSpecDecodeBaseProposer, self).__init__(vllm_config, device, pass_hidden_states_to_model, runner=runner)
 
     ucm_config = Config(vllm_config.kv_transfer_config)
     self.launch_config = ucm_config.get_config()

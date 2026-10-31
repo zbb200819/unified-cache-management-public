@@ -118,6 +118,25 @@ def forward(
 
 @when_imported("vllm_ascend.attention.mla_v1")
 def _patch(mod):
+    try:
+        import os as _os
+        from vllm.forward_context import ForwardContext, get_forward_context
+        from vllm.model_executor.layers.attention.attention import (
+            maybe_execute_sparse_attention_begin,
+            maybe_execute_sparse_attention_finished,
+        )
+        for _name, _val in {
+            "os": _os,
+            "ForwardContext": ForwardContext,
+            "get_forward_context": get_forward_context,
+            "maybe_execute_sparse_attention_begin": maybe_execute_sparse_attention_begin,
+            "maybe_execute_sparse_attention_finished": maybe_execute_sparse_attention_finished,
+        }.items():
+            if not hasattr(mod, _name):
+                setattr(mod, _name, _val)
+    except Exception as e:
+        logger.warning(f"GSA ,la_v1 injection failed {e}")
+
     if hasattr(mod.AscendMLAImpl, "forward"):
         _patched = FunctionType(
             forward.__code__, vars(mod),
