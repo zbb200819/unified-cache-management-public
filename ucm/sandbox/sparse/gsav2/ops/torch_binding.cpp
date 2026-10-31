@@ -18,7 +18,6 @@
 #include "acl/acl_rt.h"
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "torch_npu/csrc/core/npu/NPUGuard.h"
-#include "utils.h"
 
 namespace gsa {
 
@@ -154,8 +153,8 @@ at::Tensor gsa_topk_expand_tmp_pybind(at::Tensor& topk_indices, at::Tensor& swap
 
 PYBIND11_MODULE(TORCH_EXTENSION, m)
 {
-    ops.impl("gsa_scatter_copy", &gsa::gsa_scatter_copy, "GSA scatter copy");
-    ops.impl("gsa_gather_copy", &gsa::gsa_gather_copy, "GSA gather copy");
-    ops.impl("indexer_gather_qw", &gsa::indexer_gather_qw, "GSA indexer gather q/w");
-    ops.impl("gsa_topk_expand_tmp", &gsa::gsa_topk_expand_tmp, "GSA topk expand into tmp");
+    m.def("gsa_scatter_copy", &gsa::gsa_scatter_copy, "GSA scatter copy");
+    m.def("gsa_gather_copy", &gsa::gsa_gather_copy, "GSA gather copy");
+    m.def("indexer_gather_qw", &gsa::indexer_gather_qw, "GSA indexer gather q/w");
+    m.def("gsa_topk_expand_tmp", &gsa::gsa_topk_expand_tmp, "GSA topk expand into tmp");
 }
