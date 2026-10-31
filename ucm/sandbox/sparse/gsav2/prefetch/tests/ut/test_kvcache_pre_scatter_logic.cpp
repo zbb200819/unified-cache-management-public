@@ -5,7 +5,7 @@
  * in kvcache_pre.h and implemented in kvcache_pre_scatter.cpp.
  *
  * These methods (GetHitAndMissBlock, RunPrefetchH2D, DealLessPrefetchBlock,
- * LoadKVToHBM, FinishOneLayerPrefetch, SetTopkIndies, and the Get* accessors)
+ * LoadKVToHBM, FinishOneLayerPrefetch, SetTopkIndices, and the Get* accessors)
  * are pure host logic gated by mOpenIndexerOffload; they only touch engine
  * state and never touch ACL device ops.  Driving them directly exercises the
  * largest block of uncovered logic in kvcache_pre_scatter.cpp without needing
@@ -346,17 +346,17 @@ TEST_F(ScatterLogicTest, FinishOneLayerPrefetchRefillsPrefetchIdxWithNonHits)
     EXPECT_EQ(refillIdx, (std::vector<int>{1, 3}));
 }
 
-/* ---------------- SetTopkIndies ---------------- */
+/* ---------------- SetTopkIndices ---------------- */
 
-TEST_F(ScatterLogicTest, SetTopkIndiesStoresTensorPerReqID)
+TEST_F(ScatterLogicTest, SetTopkIndicesStoresTensorPerReqID)
 {
     engine = MakeEngine(/*layerNum=*/1);
     auto tensor = torch::arange(0, 4, torch::dtype(torch::kInt32));
-    engine->SetTopkIndies("req1", tensor);
+    engine->SetTopkIndices("req1", tensor);
     EXPECT_TRUE(torch::equal(engine->mAllTopkIndicesTensor["req1"], tensor));
     // Update with a different tensor.
     auto tensor2 = torch::arange(0, 8, torch::dtype(torch::kInt32));
-    engine->SetTopkIndies("req1", tensor2);
+    engine->SetTopkIndices("req1", tensor2);
     EXPECT_TRUE(torch::equal(engine->mAllTopkIndicesTensor["req1"], tensor2));
 }
 
@@ -533,18 +533,34 @@ TEST_F(ScatterLogicTest, SubmitIndexerInitLoadTaskReturnsTrueOnEmptyTask)
     UC::Detail::TaskDesc task;  // empty task -> early return true
     bool ok = engine->SubmitIndexerInitLoadTask(task, /*reqID=*/"req1", /*layerID=*/0);
     EXPECT_TRUE(ok);
-    EXPECT_EQ(store->calls.size(), 0u);  // LoadToDevice not invoked
+    EXPECT_EQ(store->calls.size(), 0u);  // Load not invoked
 }
 
 TEST_F(ScatterLogicTest, SubmitIndexerInitLoadTaskReturnsFalseWhenStoreFails)
 {
     engine = MakeEngine(/*layerNum=*/1);
-    store->loadToDeviceFails = true;
+    store->loadFails = true;
     engine->SetStoreV1(store.get());
     UC::Detail::TaskDesc task;
-    task.resize(1);  // non-empty task -> LoadToDevice invoked -> fails
+    task.resize(1);  // non-empty task -> Load invoked -> fails (no Wait)
     bool ok = engine->SubmitIndexerInitLoadTask(task, /*reqID=*/"req1", /*layerID=*/0);
     EXPECT_FALSE(ok);
     EXPECT_EQ(store->calls.size(), 1u);
-    EXPECT_EQ(store->calls[0].name, "LoadToDevice");
+    EXPECT_EQ(store->calls[0].name, "Load");
+}
+
+TEST_F(ScatterLogicTest, SubmitIndexerInitLoadTaskReturnsFalseWhenWaitFails)
+{
+    /* After the ddr-load refactor SubmitIndexerInitLoadTask issues Load + Wait
+     * (replacing the old LoadToDevice). A Wait failure is a new failure mode. */
+    engine = MakeEngine(/*layerNum=*/1);
+    store->waitFails = true;
+    engine->SetStoreV1(store.get());
+    UC::Detail::TaskDesc task;
+    task.resize(1);  // non-empty task -> Load succeeds, Wait fails
+    bool ok = engine->SubmitIndexerInitLoadTask(task, /*reqID=*/"req1", /*layerID=*/0);
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(store->calls.size(), 2u);  // Load + Wait
+    EXPECT_EQ(store->calls[0].name, "Load");
+    EXPECT_EQ(store->calls[1].name, "Wait");
 }

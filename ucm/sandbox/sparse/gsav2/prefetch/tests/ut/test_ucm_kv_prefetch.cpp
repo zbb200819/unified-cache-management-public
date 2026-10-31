@@ -2,9 +2,14 @@
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
  *
  * UT for the UCMKVPrefetch class declared in include/kvcache_prefetch.h.
- * The class owns a background waiter thread and delegates to UC::StoreV1; we
- * exercise it with MockStoreV1 so the async load/wait/release lifecycle runs
- * deterministically and all exception branches are covered.
+ *
+ * After the ddr-load refactor (post 717d416) the class no longer owns a
+ * background waiter thread: UCMLoadSSD now issues a synchronous UC::StoreV1::Load
+ * and returns a PrefetchStatus int32_t instead of throwing / returning a task id,
+ * and UCMLookup returns an empty vector on any error instead of throwing. The
+ * async-wait infrastructure (mWaitQueue_/mTaskHandle/mAsyncWaiter_/UCMWait) that
+ * previously leaked (bug #11: UCMLoadSSD never enqueued into mWaitQueue_) was
+ * removed entirely, so the documented hang / never-processed behaviours are gone.
  */
 #include <atomic>
 #include <chrono>
@@ -28,215 +33,157 @@ UC::Detail::BlockId MakeBlockId(uint8_t v)
 }
 }  // namespace
 
+/* PrefetchStatus enum values returned as int32_t by UCMLoadSSD.
+ * (The enum is private inside UCMKVPrefetch, so the int values are used.) */
+namespace {
+constexpr int32_t kStatusPrefetchDone = 0;    // GSA_PREFETCH_DONE
+constexpr int32_t kStatusStoreEmpty = 1;      // GSA_STORE_EMPTY
+constexpr int32_t kStatusBlockIdEmpty = 2;    // GSA_BLOCKID_EMPTY
+constexpr int32_t kStatusHandleError = 3;     // GSA_HANDLE_ERROR
+}  // namespace
+
 TEST(UCMKVPrefetch, StoreInitRejectsNullPointer)
 {
     UCMKVPrefetch p;
-    EXPECT_THROW(p.StoreInit(reinterpret_cast<uintptr_t>(nullptr)), std::runtime_error);
+    EXPECT_THROW(p.StoreInit(reinterpret_cast<uintptr_t>(nullptr), /*layerNum=*/78),
+                 std::runtime_error);
 }
 
 TEST(UCMKVPrefetch, StoreInitAcceptsValidPointer)
 {
     MockStoreV1 store;
     UCMKVPrefetch p;
-    p.StoreInit(reinterpret_cast<uintptr_t>(&store));
+    p.StoreInit(reinterpret_cast<uintptr_t>(&store), /*layerNum=*/78);
     /* No exception. */
     SUCCEED();
 }
 
-TEST(UCMKVPrefetch, UCMLoadSSDRejectsNullStore)
+TEST(UCMKVPrefetch, UCMLoadSSDReturnsStoreEmptyWhenStoreNull)
 {
+    /* Without StoreInit the store pointer is null -> GSA_STORE_EMPTY (no throw). */
     UCMKVPrefetch p;
     std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1)};
-    EXPECT_THROW(p.UCMLoadSSD(ids), std::runtime_error);
+    EXPECT_EQ(p.UCMLoadSSD(ids), kStatusStoreEmpty);
 }
 
-TEST(UCMKVPrefetch, UCMLoadSSDRejectsEmptyBlockIds)
+TEST(UCMKVPrefetch, UCMLoadSSDReturnsBlockIdEmptyForEmptyInput)
 {
     MockStoreV1 store;
     UCMKVPrefetch p;
-    p.StoreInit(reinterpret_cast<uintptr_t>(&store));
+    p.StoreInit(reinterpret_cast<uintptr_t>(&store), /*layerNum=*/78);
     std::vector<UC::Detail::BlockId> empty;
-    EXPECT_THROW(p.UCMLoadSSD(empty), std::runtime_error);
+    EXPECT_EQ(p.UCMLoadSSD(empty), kStatusBlockIdEmpty);
 }
 
-TEST(UCMKVPrefetch, UCMLoadSSDReturnsIncreasingTaskIds)
+TEST(UCMKVPrefetch, UCMLoadSSDSucceedsAndInvokesLoad)
 {
     MockStoreV1 store;
     UCMKVPrefetch p;
-    p.StoreInit(reinterpret_cast<uintptr_t>(&store));
+    p.StoreInit(reinterpret_cast<uintptr_t>(&store), /*layerNum=*/4);
     std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1), MakeBlockId(2)};
-    int32_t t1 = p.UCMLoadSSD(ids);
-    int32_t t2 = p.UCMLoadSSD(ids);
-    EXPECT_GT(t2, t1);
-    // NOTE: do NOT call UCMWait here — see UCMLoadSSDDoesNotEnqueueAsyncWait_BugDocumented.
+    EXPECT_EQ(p.UCMLoadSSD(ids), kStatusPrefetchDone);
+    /* UCMLoadSSD now uses UC::StoreV1::Load (sync) — exactly one Load call,
+     * no LoadSSDToHost / WaitSSDToHost / ReleaseHostBuffer. */
+    ASSERT_EQ(store.calls.size(), 1u);
+    EXPECT_EQ(store.calls[0].name, "Load");
+    /* The task is sized blockIds.size() * layerNum = 2 * 4 = 8 shards. */
+    EXPECT_EQ(store.calls[0].task.size(), 8u);
 }
 
-TEST(UCMKVPrefetch, UCMLoadSSDDoesNotEnqueueAsyncWait_BugDocumented)
-{
-    // BUG-FOCUS: UCMLoadSSD (kvcache_prefetch.h) registers the handle in
-    // mTaskHandle but NEVER enqueues the taskID into mWaitQueue_ nor notifies
-    // mTaskCv_. Consequently AsyncWaitLoop never wakes to process the task,
-    // and a subsequent UCMWait(taskID) blocks forever (the predicate
-    // `mTaskHandle.find(taskID) == end()` never becomes true).
-    // This test proves the hang by running UCMWait in a thread with a timeout:
-    // if UCMWait returns within the timeout, the bug is fixed (flip the assert).
-    // The UCMKVPrefetch is heap-allocated and intentionally leaked here so the
-    // detached waiter thread does not touch freed memory; the process exits
-    // right after anyway.
-    auto* store = new MockStoreV1;
-    auto* p = new UCMKVPrefetch;
-    p->StoreInit(reinterpret_cast<uintptr_t>(store));
-    std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1)};
-    int32_t t = p->UCMLoadSSD(ids);
-
-    std::atomic<bool> returned{false};
-    std::thread waiter([&] {
-        p->UCMWait(t);
-        returned.store(true);
-    });
-    // Give the waiter at most 500ms; the (buggy) code blocks indefinitely.
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    EXPECT_FALSE(returned.load());  // bug: still blocked
-    waiter.detach();                // leak intentionally; process exits after this test.
-    // Do NOT delete p/store: the detached waiter still references them.
-}
-
-TEST(UCMKVPrefetch, UCMLoadSSDPropagatesStoreFailure)
+TEST(UCMKVPrefetch, UCMLoadSSDReturnsHandleErrorOnStoreFailure)
 {
     MockStoreV1 store;
-    store.loadSSDToHostFails = true;
+    store.loadFails = true;
     UCMKVPrefetch p;
-    p.StoreInit(reinterpret_cast<uintptr_t>(&store));
+    p.StoreInit(reinterpret_cast<uintptr_t>(&store), /*layerNum=*/78);
     std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1)};
-    EXPECT_THROW(p.UCMLoadSSD(ids), std::runtime_error);
+    EXPECT_EQ(p.UCMLoadSSD(ids), kStatusHandleError);
+    ASSERT_EQ(store.calls.size(), 1u);
+    EXPECT_EQ(store.calls[0].name, "Load");
 }
 
-TEST(UCMKVPrefetch, UCMWaitOnUnknownTaskIsNoop)
+TEST(UCMKVPrefetch, UCMLoadSSDUsesConfiguredLayerNumForShardCount)
 {
     MockStoreV1 store;
     UCMKVPrefetch p;
-    p.StoreInit(reinterpret_cast<uintptr_t>(&store));
-    /* Wait on an unknown task id: must return without blocking forever. */
-    p.UCMWait(424242);
-    SUCCEED();
+    p.StoreInit(reinterpret_cast<uintptr_t>(&store), /*layerNum=*/3);
+    std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1)};
+    EXPECT_EQ(p.UCMLoadSSD(ids), kStatusPrefetchDone);
+    ASSERT_EQ(store.calls.size(), 1u);
+    EXPECT_EQ(store.calls[0].task.size(), 3u);  // 1 block * 3 layers
 }
 
-TEST(UCMKVPrefetch, UCMLookupRejectsNullStore)
+TEST(UCMKVPrefetch, UCMLoadSSDNoLongerEnqueuesAsyncWait_BugFixed)
+{
+    /* Previously (bug #11) UCMLoadSSD registered a handle in mTaskHandle but
+     * never enqueued into mWaitQueue_, so the background AsyncWaitLoop never
+     * processed the task and UCMWait blocked forever. The ddr-load refactor
+     * removed the async-waiter infrastructure entirely: UCMLoadSSD now issues a
+     * synchronous Load and returns immediately. Prove the fix: after UCMLoadSSD
+     * the mock records exactly one Load call and no Wait/Release bookkeeping,
+     * and the destructor returns promptly without joining any thread. */
+    MockStoreV1 store;
+    auto start = std::chrono::steady_clock::now();
+    {
+        UCMKVPrefetch p;
+        p.StoreInit(reinterpret_cast<uintptr_t>(&store), /*layerNum=*/78);
+        std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1)};
+        (void)p.UCMLoadSSD(ids);
+    }
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    EXPECT_LT(elapsed.count(), 1000);
+    ASSERT_EQ(store.calls.size(), 1u);
+    EXPECT_EQ(store.calls[0].name, "Load");
+}
+
+TEST(UCMKVPrefetch, UCMLookupReturnsEmptyWhenStoreNull)
 {
     UCMKVPrefetch p;
     std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1)};
-    EXPECT_THROW(p.UCMLookup(ids), std::runtime_error);
+    EXPECT_TRUE(p.UCMLookup(ids).empty());
 }
 
-TEST(UCMKVPrefetch, UCMLookupRejectsEmptyBlockIds)
+TEST(UCMKVPrefetch, UCMLookupReturnsEmptyForEmptyInput)
 {
     MockStoreV1 store;
     UCMKVPrefetch p;
-    p.StoreInit(reinterpret_cast<uintptr_t>(&store));
+    p.StoreInit(reinterpret_cast<uintptr_t>(&store), /*layerNum=*/78);
     std::vector<UC::Detail::BlockId> empty;
-    EXPECT_THROW(p.UCMLookup(empty), std::runtime_error);
+    EXPECT_TRUE(p.UCMLookup(empty).empty());
 }
 
 TEST(UCMKVPrefetch, UCMLookupReturnsExistenceVector)
 {
     MockStoreV1 store;
     UCMKVPrefetch p;
-    p.StoreInit(reinterpret_cast<uintptr_t>(&store));
+    p.StoreInit(reinterpret_cast<uintptr_t>(&store), /*layerNum=*/78);
     std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1), MakeBlockId(2), MakeBlockId(3)};
     auto result = p.UCMLookup(ids);
     EXPECT_EQ(result.size(), ids.size());
     for (auto v : result) { EXPECT_EQ(v, 1u); }
 }
 
-TEST(UCMKVPrefetch, UCMLookupPropagatesStoreFailure)
+TEST(UCMKVPrefetch, UCMLookupReturnsEmptyOnStoreFailure)
 {
     MockStoreV1 store;
     store.lookupFails = true;
     UCMKVPrefetch p;
-    p.StoreInit(reinterpret_cast<uintptr_t>(&store));
+    p.StoreInit(reinterpret_cast<uintptr_t>(&store), /*layerNum=*/78);
     std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1)};
-    EXPECT_THROW(p.UCMLookup(ids), std::runtime_error);
+    EXPECT_TRUE(p.UCMLookup(ids).empty());
 }
 
-TEST(UCMKVPrefetch, UCMLookupDetectsSizeMismatch)
+TEST(UCMKVPrefetch, UCMLookupReturnsEmptyOnSizeMismatch)
 {
-    /* Force a mismatch by overriding Lookup to return a vector of different
-     * size. MockStoreV1 returns exactly num entries, so trigger via a custom
-     * subclass that returns a short vector. */
+    /* Force a mismatch by overriding Lookup to return a vector of a different
+     * size. UCMLookup now returns an empty vector instead of throwing. */
     struct ShortStore : MockStoreV1 {
         UC::Expected<std::vector<uint8_t>> Lookup(const UC::Detail::BlockId*, size_t num) override
         { return std::vector<uint8_t>(num + 1, 1u); }
     } store;
     UCMKVPrefetch p;
-    p.StoreInit(reinterpret_cast<uintptr_t>(&store));
+    p.StoreInit(reinterpret_cast<uintptr_t>(&store), /*layerNum=*/78);
     std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1)};
-    EXPECT_THROW(p.UCMLookup(ids), std::runtime_error);
-}
-
-TEST(UCMKVPrefetch, AsyncWaiterNeverProcessesDueToMissingEnqueue_BugDocumented)
-{
-    // BUG-FOCUS (same root cause as UCMLoadSSDDoesNotEnqueueAsyncWait):
-    // Because UCMLoadSSD never enqueues into mWaitQueue_, AsyncWaitLoop never
-    // calls WaitSSDToHost/ReleaseHostBuffer. Prove it: after UCMLoadSSD, the
-    // mock store records LoadSSDToHost but NEVER WaitSSDToHost / ReleaseHostBuffer.
-    // When the enqueue bug is fixed, flip the assertion to EXPECT_TRUE.
-    MockStoreV1 store;
-    UCMKVPrefetch p;
-    p.StoreInit(reinterpret_cast<uintptr_t>(&store));
-    std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1)};
-    (void)p.UCMLoadSSD(ids);
-    // Give the async waiter a moment to (not) process.
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    bool hasWait = false;
-    bool hasRelease = false;
-    for (const auto& c : store.calls) {
-        if (c.name == "WaitSSDToHost") { hasWait = true; }
-        if (c.name == "ReleaseHostBuffer") { hasRelease = true; }
-    }
-    EXPECT_FALSE(hasWait);     // bug: async waiter never runs
-    EXPECT_FALSE(hasRelease);  // bug: nothing released
-}
-
-TEST(UCMKVPrefetch, WaitSSDToHostFailurePathUnreachableDueToEnqueueBug_BugDocumented)
-{
-    // BUG-FOCUS: Because the async waiter never processes (missing enqueue),
-    // a failing WaitSSDToHost is never invoked, so the failure-swallowing
-    // try/catch in UCMWaitInternal is dead code in practice. Documented:
-    // the mock's waitSSDToHostFails flag has no observable effect.
-    // When the enqueue bug is fixed, this test should be replaced with one that
-    // confirms UCMWait returns despite the failure.
-    MockStoreV1 store;
-    store.waitSSDToHostFails = true;
-    UCMKVPrefetch p;
-    p.StoreInit(reinterpret_cast<uintptr_t>(&store));
-    std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1)};
-    (void)p.UCMLoadSSD(ids);
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    // WaitSSDToHost was never called (bug).
-    bool hasWait = false;
-    for (const auto& c : store.calls) {
-        if (c.name == "WaitSSDToHost") { hasWait = true; }
-    }
-    EXPECT_FALSE(hasWait);
-}
-
-TEST(UCMKVPrefetch, DestructorJoinsBackgroundThread)
-{
-    // The destructor sets mStop_ and joins mAsyncWaiter_. Even with a pending
-    // (never-enqueued) task, the destructor must return promptly because the
-    // waiter loop's cv predicate `mStop_ || !mWaitQueue_.empty()` becomes true
-    // on stop (queue empty -> returns).
-    MockStoreV1 store;
-    auto start = std::chrono::steady_clock::now();
-    {
-        UCMKVPrefetch p;
-        p.StoreInit(reinterpret_cast<uintptr_t>(&store));
-        std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1)};
-        (void)p.UCMLoadSSD(ids);
-        /* Pending task is still registered when destructor runs. */
-    }
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start);
-    // Destructor must complete in well under 1s (cv wakes immediately on stop).
-    EXPECT_LT(elapsed.count(), 1000);
+    EXPECT_TRUE(p.UCMLookup(ids).empty());
 }

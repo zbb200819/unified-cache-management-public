@@ -4,9 +4,9 @@
  * MST: cross-module flow for UCMTensorMerge.
  *
  * UCMTensorMerge ties together HBM miss-bookkeeping (mMissGlobalToken /
- * mLoadSlot), the UCM store (LoadToHostBuffer / ReleaseHostBuffer), the
- * multi-rank KVPack shared staging buffers, and the CPU token-merge loop.  We
- * drive it with a mock store and the ACL stub, and verify both the success path
+ * mLoadSlot), the UCM store (Load + Wait via mock), the multi-rank KVPack
+ * shared staging buffers, and the CPU token-merge loop.  We drive it with a
+ * mock store and the ACL stub, and verify both the success path
  * (hbmSlotIndex filled, loadNum advanced) and the failure fallback path
  * (FillFailedUCMMerge zeroes owned tokens while preserving all-rank indices).
  */
@@ -72,6 +72,14 @@ struct MergeFixture {
                                                       /*cpuToBind=*/std::vector<int>{0},
                                                       topkLayerMap, logFile->Path());
         engine->SetStoreV1(store.get());
+        /* The ddr-load refactor made UCMTensorMerge stage into the engine-owned
+         * mUCMMergeLoadBuffer (set by SetupKVPackSharedBuffers in production,
+         * which tests skip). Alias it to mLastChunkLoadBuffer so the merge path
+         * has a valid staging region. The destructor frees mLastChunkLoadBuffer
+         * and never frees mUCMMergeLoadBuffer, so this is safe. */
+        if (engine->mUCMMergeLoadBuffer == nullptr && engine->mLastChunkLoadBuffer != nullptr) {
+            engine->mUCMMergeLoadBuffer = static_cast<std::byte*>(engine->mLastChunkLoadBuffer);
+        }
 
         // Shared K/V staging buffers (engine reads via mSharedKBufferHostPtr).
         sharedK.assign(64, 0xAA);
@@ -164,7 +172,7 @@ TEST(UCMMergeFlow, StoreLoadFailureFallsBackToZeroedOwnedTokens)
     f.Setup();
     f.SeedMissScenario();
     f.engine->mLoadSlot["req1"][0] = {0, 1, 4, 5};
-    f.store->loadToHostBufferFails = true;
+    f.store->loadFails = true;
     // Clear shared buffers so we can detect the zero-fill fallback.
     std::memset(f.sharedK.data(), 0xCC, f.sharedK.size());
     std::memset(f.sharedV.data(), 0xDD, f.sharedV.size());

@@ -327,9 +327,9 @@ TEST_F(IndexerMapTest, ProcessIndexerInitLoadLayerBuildsUcmShardsAndSubmits)
         {0, 1}
     };  // blockIdxs (both UCM)
     EXPECT_TRUE(engine->ProcessIndexerInitLoadLayer(blockTable, slabIdx, "req1", 0, 2));
-    // task non-empty (2 UCM shards) -> SubmitIndexerInitLoadTask -> mock LoadToDevice.
-    ASSERT_EQ(store->calls.size(), 1u);
-    EXPECT_EQ(store->calls[0].name, "LoadToDevice");
+    // task non-empty (2 UCM shards) -> SubmitIndexerInitLoadTask -> mock Load (+Wait).
+    ASSERT_EQ(store->calls.size(), 2u);  // Load + Wait
+    EXPECT_EQ(store->calls[0].name, "Load");
     ReleaseIndexer(1);
 }
 
@@ -388,8 +388,9 @@ TEST_F(IndexerMapTest, IndexerInitLoadDrivesAllLayers)
         {0, 1}
     };
     engine->IndexerInitLoad(blockTable, slabIdx, "req1");
-    // 2 layers, each submits a 2-shard task -> 2 LoadToDevice calls.
-    ASSERT_EQ(store->calls.size(), 2u);
+    // 2 layers, each submits a 2-shard task -> 2 Load (+Wait) call pairs.
+    ASSERT_EQ(store->calls.size(), 4u);  // 2 layers * (Load + Wait)
+    EXPECT_EQ(store->calls[0].name, "Load");
     ReleaseIndexer(2);
 }
 

@@ -169,14 +169,19 @@ TEST(LastChunkMoveFlow, UcmAndNonUcmBlocksLandInCorrectHbmSlots)
     }
     // V path (non-c8 mode): non-UCM V is 0xCD.
     for (int i = 0; i < f.vBlockBytes; ++i) { EXPECT_EQ(f.vHbm[30 * f.vBlockBytes + i], 0xCDu); }
-    // Store should have been called for the UCM load + release.
-    bool hasLoad = false, hasRelease = false;
+    /* After the ddr-load refactor LastChunkMove uses Load + Wait into the
+     * engine-owned mLastChunkLoadBuffer (no LoadToHostBuffer / ReleaseHostBuffer).
+     * The mock Load fills each UCM shard's staging slot with a per-shard byte
+     * pattern (shard 0 -> 0x01, shard 1 -> 0x02). */
+    bool hasLoad = false, hasWait = false, hasRelease = false;
     for (const auto& c : f.store->calls) {
-        if (c.name == "LoadToHostBuffer") { hasLoad = true; }
+        if (c.name == "Load") { hasLoad = true; }
+        if (c.name == "Wait") { hasWait = true; }
         if (c.name == "ReleaseHostBuffer") { hasRelease = true; }
     }
     EXPECT_TRUE(hasLoad);
-    EXPECT_TRUE(hasRelease);
+    EXPECT_TRUE(hasWait);
+    EXPECT_FALSE(hasRelease);  // no per-call release after the refactor
 
     f.TearDown();
 }
@@ -211,7 +216,7 @@ TEST(LastChunkMoveFlow, StoreLoadFailureAbortsBeforeCopy)
     LastChunkFixture f;
     f.Setup();
     f.SeedBlocksMap();
-    f.store->loadToHostBufferFails = true;
+    f.store->loadFails = true;
     std::vector<int> moveMap = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
     f.engine->LastChunkMove(0, "req1", moveMap);
     // On load failure, LastChunkMove returns early; HBM stays untouched.

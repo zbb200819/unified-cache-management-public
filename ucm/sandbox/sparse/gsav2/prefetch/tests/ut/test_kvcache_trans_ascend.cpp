@@ -110,7 +110,7 @@ TEST_F(AscendTransTest, CopyTransMultipleEntriesCopiesAllInOrder)
     EXPECT_EQ(acl_stub::Stub().memcpyAsyncCount.load(), 2);
 }
 
-/* ---- ObtainStream / DestoryStream ---- */
+/* ---- ObtainStream / DestroyStream ---- */
 
 TEST_F(AscendTransTest, ObtainStreamCreatesContextAndStreams)
 {
@@ -122,7 +122,7 @@ TEST_F(AscendTransTest, ObtainStreamCreatesContextAndStreams)
     EXPECT_EQ(acl_stub::Stub().setDeviceCount.load(), 1);
     EXPECT_EQ(acl_stub::Stub().createContextCount.load(), 1);
     EXPECT_EQ(acl_stub::Stub().createStreamCount.load(), 2);
-    DestoryStream(stream, context, 0, 2);
+    DestroyStream(stream, context, 0, 2);
     EXPECT_EQ(acl_stub::Stub().destroyStreamCount.load(), 2);
 }
 
@@ -203,19 +203,19 @@ TEST_F(AscendTransTest, IsStreamIdleReturnsFalseOnQueryFailure)
     /* BUG-FOCUS: query failure is silently swallowed. See README. */
 }
 
-/* ---- DestoryStream error path ---- */
+/* ---- DestroyStream error path ---- */
 
-TEST_F(AscendTransTest, DestoryStreamToleratesDestroyFailure)
+TEST_F(AscendTransTest, DestroyStreamToleratesDestroyFailure)
 {
     acl_stub::Stub().destroyStreamFails = true;
-    // DestoryStream free()s the stream/context arrays, so they MUST be
+    // DestroyStream free()s the stream/context arrays, so they MUST be
     // heap-allocated (mirroring ObtainStream's malloc). Use a 1-element array.
     aclrtStream* streamArr = static_cast<aclrtStream*>(std::malloc(sizeof(aclrtStream)));
     *streamArr = reinterpret_cast<aclrtStream>(0x1);
     aclrtContext* ctxArr = static_cast<aclrtContext*>(std::malloc(sizeof(aclrtContext)));
     *ctxArr = reinterpret_cast<aclrtContext>(0x2);
-    DestoryStream(streamArr, ctxArr, /*deviceID=*/0, /*mStreamNum=*/1);
-    /* DestoryStream only logs on failure; ensure no crash. */
+    DestroyStream(streamArr, ctxArr, /*deviceID=*/0, /*mStreamNum=*/1);
+    /* DestroyStream only logs on failure; ensure no crash. */
     EXPECT_EQ(acl_stub::Stub().destroyStreamCount.load(), 1);
 }
 

@@ -1,7 +1,7 @@
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
  *
- * UT for SubmitTask / SubmitTaskIndxer (kvcache_pre_scatter.cpp), which submit
+ * UT for SubmitTask / SubmitTaskIndexer (kvcache_pre_scatter.cpp), which submit
  * work to the TaskManager worker thread.  Uses mRank=1 (non-rank-0) to avoid
  * the omp parallel loop in PreparePrefetchResults (which crashes under qemu).
  * With empty reqIDList, the worker's CallPrefetchProcess does minimal work.
@@ -119,31 +119,31 @@ protected:
 // PreparePrefetchResults + MergeAndCopyPrefetchLayer interaction that affects
 // the direct CallPrefetchProcess test.  SubmitTask is covered on real hardware.
 
-TEST_F(SubmitTaskTest, SubmitTaskIndxerReturnsEarlyWhenIndexerOffloadClosed)
+TEST_F(SubmitTaskTest, SubmitTaskIndexerReturnsEarlyWhenIndexerOffloadClosed)
 {
     SetupEngine();
     engine->mOpenIndexerOffload = false;  // early return
     std::vector<int> topkLensInput;
     std::vector<std::string> reqIDList;
     std::vector<torch::Tensor> topkLists;
-    engine->SubmitTaskIndxer(topkLensInput, reqIDList, topkLists, /*stepTime=*/1);
+    engine->SubmitTaskIndexer(topkLensInput, reqIDList, topkLists, /*stepTime=*/1);
     // No worker spawned; mIsIndexerLoadRunning stays false.
     EXPECT_FALSE(engine->mIsIndexerLoadRunning.load());
 }
 
-TEST_F(SubmitTaskTest, SubmitTaskIndxerWithEmptyReqListCompletesViaWorker)
+TEST_F(SubmitTaskTest, SubmitTaskIndexerWithEmptyReqListCompletesViaWorker)
 {
     SetupEngine();
     engine->mOpenIndexerOffload = true;
     std::vector<int> topkLensInput;
     std::vector<std::string> reqIDList;
     std::vector<torch::Tensor> topkLists;
-    engine->SubmitTaskIndxer(topkLensInput, reqIDList, topkLists, /*stepTime=*/1);
+    engine->SubmitTaskIndexer(topkLensInput, reqIDList, topkLists, /*stepTime=*/1);
     WaitForIndexerLoadDone();
     EXPECT_FALSE(engine->mIsIndexerLoadRunning.load());
 }
 
-TEST_F(SubmitTaskTest, SubmitTaskIndxerWithNonEmptyReqListCopiesBlockTable)
+TEST_F(SubmitTaskTest, SubmitTaskIndexerWithNonEmptyReqListCopiesBlockTable)
 {
     SetupEngine();
     engine->mOpenIndexerOffload = true;
@@ -154,7 +154,7 @@ TEST_F(SubmitTaskTest, SubmitTaskIndxerWithNonEmptyReqListCopiesBlockTable)
     std::vector<int> topkLensInput = {32};
     std::vector<std::string> reqIDList = {reqID};
     std::vector<torch::Tensor> topkLists = {torch::zeros({32}, torch::dtype(torch::kInt32))};
-    engine->SubmitTaskIndxer(topkLensInput, reqIDList, topkLists, /*stepTime=*/1);
+    engine->SubmitTaskIndexer(topkLensInput, reqIDList, topkLists, /*stepTime=*/1);
     // Verify the memcpy happened: mUseBlockTableIdx should now contain 42.
     EXPECT_EQ(engine->mUseBlockTableIdx[reqID][0][0], 42);
     WaitForIndexerLoadDone();

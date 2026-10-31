@@ -30,7 +30,9 @@ err()   { printf "${RED}[ERROR]${NC} %s\n" "$*"; }
 # ── 路径 ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFETCH_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_ROOT="$(cd "$PREFETCH_DIR/../../../.." && pwd)"
+# prefetch/ is 5 levels deep from the repo root (repo/ucm/sandbox/sparse/gsav2/prefetch),
+# so the repo root (which contains ucm/ and toolkit/) is 5 levels up.
+REPO_ROOT="$(cd "$PREFETCH_DIR/../../../../.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-/tmp/opencode/prefetch_build}"
 
 # ── 参数解析 ─────────────────────────────────────────────────────────────────
@@ -162,8 +164,12 @@ LINK_FLAGS=(
     $COV_FLAGS -fopenmp
     -L"$TORCH_LIB" -ltorch -lc10 -ltorch_cpu
     -L"$PYTHON_LIB_DIR" -l"$PYTHON_VER"
-    -lpthread -ldl -lrt -lgcov
+    -lpthread -ldl -lrt
 )
+# -lgcov is appended AFTER the objects (see link invocation) so the linker can
+# resolve __gcov_dump (referenced by KVPackAbort's coverage-flush call) even in
+# --no-cov mode, where the symbol is not auto-pulled in by the objects.
+GCOV_LINK_FLAG="-lgcov"
 
 # ============================================================================
 # 2.6. 增量编译辅助：源比 .o 新（或 .o 不存在）才重编
@@ -264,7 +270,7 @@ for tsrc in "${TEST_SOURCES[@]}"; do
     # 链接（增量：.o 比 bin 新才重链）
     if needs_rebuild "$tobj" "$tbin"; then
         if ! g++ "${LINK_FLAGS[@]}" "$tobj" "${PROD_OBJS[@]}" "$BUILD_DIR/libgtest.a" \
-                -o "$tbin" 2>>"$BUILD_DIR/${tname}.err"; then
+                $GCOV_LINK_FLAG -o "$tbin" 2>>"$BUILD_DIR/${tname}.err"; then
             err "链接失败: $tname"; tail -8 "$BUILD_DIR/${tname}.err"
             COMPILE_FAIL=$((COMPILE_FAIL + 1))
             echo "LINK_FAIL  $tname" >> "$RESULTS_FILE"

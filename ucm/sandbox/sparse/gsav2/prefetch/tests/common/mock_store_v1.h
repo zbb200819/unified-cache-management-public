@@ -21,6 +21,13 @@ namespace ucmprefetch_test {
  * tests inject failures / canned host-buffer payloads so the prefetch code
  * paths that depend on mStoreV1_ (LastChunkMove, UCMTensorMerge, indexer load,
  * UCMKVPrefetch) can be driven deterministically without a real store.
+ *
+ * After the ddr-load refactor (post 717d416) the UC::StoreV1 interface dropped
+ * the LoadToDevice / LoadSSDToHost / WaitSSDToHost / LoadToHostBuffer /
+ * ReleaseHostBuffer methods (and the HostBufferResult / HostBufferView types).
+ * The prefetch code now drives loads through Load + Wait, with shards carrying
+ * caller-provided DDR host addresses; the mock's Load honours that contract by
+ * writing a deterministic per-shard payload into each shard's host address.
  */
 class MockStoreV1 : public UC::StoreV1 {
 public:
@@ -32,20 +39,25 @@ public:
     };
 
     /* Failure injection switches. */
+    /* Legacy switches kept as inert data members so older tests that still set
+     * them compile; they have no effect now that the corresponding virtuals are
+     * gone from the UC::StoreV1 interface. */
     bool loadToHostBufferFails{false};
     bool loadToDeviceFails{false};
     bool loadSSDToHostFails{false};
     bool waitSSDToHostFails{false};
     bool releaseHostBufferFails{false};
+    bool mismatchedViewCount{false};
+    bool nullHostAddr{false};
+
+    /* Live switches for the surviving Load / Wait / Lookup interface. */
     bool lookupFails{false};
     bool waitFails{false};
     bool checkFails{false};
     bool loadFails{false};
     bool dumpFails{false};
-    bool mismatchedViewCount{false};
-    bool nullHostAddr{false};
 
-    /* Configuration of canned host-buffer payloads. */
+    /* Configuration of canned per-shard payloads written into DDR addresses. */
     void SetHostBufferPayload(std::size_t bytesPerBlock, std::size_t kvLayerBytes)
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -85,8 +97,20 @@ public:
         CallRecord r{"Load"};
         r.task = task;
         r.handle = NextHandle();
+        r.blockCount = task.size();
         calls.push_back(std::move(r));
         if (loadFails) { return UC::Status::Error("load-failed-injected"); }
+        /* DDR contract: for shards carrying a host address, write a deterministic
+         * per-shard payload (shard index + 1, mod 256) into the address so tests
+         * can verify the downstream copy pipeline. This mirrors how the real
+         * store fills the caller-provided DDR staging slots. */
+        for (std::size_t i = 0; i < task.size(); ++i) {
+            void* addr = nullptr;
+            for (const auto& a : task[i].addrs) { addr = a; break; }
+            if (addr != nullptr && bytesPerBlock_ > 0) {
+                std::memset(addr, static_cast<int>((i + 1) & 0xFF), bytesPerBlock_);
+            }
+        }
         return UC::Detail::TaskHandle{r.handle};
     }
 
@@ -107,107 +131,23 @@ public:
         return true;
     }
 
-    UC::Status Wait(UC::Detail::TaskHandle) override
+    UC::Status Wait(UC::Detail::TaskHandle handle) override
     {
+        std::lock_guard<std::mutex> lock(mu_);
+        CallRecord r{"Wait"};
+        r.handle = handle;
+        calls.push_back(std::move(r));
         if (waitFails) { return UC::Status::Error("wait-failed-injected"); }
         return UC::Status::OK();
     }
 
-    UC::Status LoadToDevice(UC::Detail::TaskDesc task) override
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        CallRecord r{"LoadToDevice"};
-        r.task = task;
-        r.blockCount = task.size();
-        calls.push_back(std::move(r));
-        if (loadToDeviceFails) { return UC::Status::Error("load-to-device-failed-injected"); }
-        return UC::Status::OK();
-    }
-
-    UC::Expected<UC::Detail::TaskHandle> LoadSSDToHost(UC::Detail::TaskDesc task) override
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        CallRecord r{"LoadSSDToHost"};
-        r.task = task;
-        r.handle = NextHandle();
-        calls.push_back(std::move(r));
-        if (loadSSDToHostFails) { return UC::Status::Error("load-ssd-to-host-failed-injected"); }
-        return UC::Detail::TaskHandle{r.handle};
-    }
-
-    UC::Status WaitSSDToHost(UC::Detail::TaskHandle) override
-    {
-        if (waitSSDToHostFails) { return UC::Status::Error("wait-ssd-to-host-failed-injected"); }
-        return UC::Status::OK();
-    }
-
-    UC::Expected<UC::Detail::HostBufferResult> LoadToHostBuffer(UC::Detail::TaskDesc task) override
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        CallRecord r{"LoadToHostBuffer"};
-        r.task = task;
-        r.blockCount = task.size();
-        r.handle = NextHandle();
-        calls.push_back(std::move(r));
-        if (loadToHostBufferFails) {
-            return UC::Status::Error("load-to-host-buffer-failed-injected");
-        }
-
-        UC::Detail::HostBufferResult result;
-        result.taskId = r.handle;
-        std::size_t count = task.size();
-        if (mismatchedViewCount) { count = count + 1; }
-        result.views.reserve(count);
-        std::vector<void*> owned;
-        owned.reserve(count);
-        for (std::size_t i = 0; i < count; ++i) {
-            UC::Detail::HostBufferView v;
-            void* buf = std::malloc(bytesPerBlock_);
-            if (buf != nullptr) {
-                std::memset(buf, static_cast<int>((i + 1) & 0xFF), bytesPerBlock_);
-            }
-            v.hostAddr = nullHostAddr ? nullptr : buf;
-            v.sizeBytes = bytesPerBlock_;
-            v.owner = i < task.size() ? task[i].owner : UC::Detail::BlockId{};
-            v.index = i < task.size() ? task[i].index : 0;
-            owned.push_back(buf);
-            result.views.push_back(std::move(v));
-        }
-        outstandingHostBuffers_[r.handle] = std::move(owned);
-        return result;
-    }
-
-    UC::Status ReleaseHostBuffer(UC::Detail::TaskHandle handle) override
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        CallRecord r{"ReleaseHostBuffer"};
-        r.handle = handle;
-        calls.push_back(std::move(r));
-        if (releaseHostBufferFails) {
-            return UC::Status::Error("release-host-buffer-failed-injected");
-        }
-        auto it = outstandingHostBuffers_.find(handle);
-        if (it != outstandingHostBuffers_.end()) {
-            for (void* p : it->second) { std::free(p); }
-            outstandingHostBuffers_.erase(it);
-        }
-        return UC::Status::OK();
-    }
-
-    ~MockStoreV1() override
-    {
-        /* Free any host buffers that were never released. */
-        for (auto& kv : outstandingHostBuffers_) {
-            for (void* p : kv.second) { std::free(p); }
-        }
-    }
+    ~MockStoreV1() override = default;
 
 private:
     UC::Detail::TaskHandle NextHandle() { return ++nextHandle_; }
     UC::Detail::TaskHandle nextHandle_{0};
     std::size_t bytesPerBlock_{4096};
     std::size_t kvLayerBytes_{1024};
-    std::map<UC::Detail::TaskHandle, std::vector<void*>> outstandingHostBuffers_;
 };
 
 }  // namespace ucmprefetch_test

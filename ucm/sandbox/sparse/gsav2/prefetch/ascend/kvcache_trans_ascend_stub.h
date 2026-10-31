@@ -410,7 +410,7 @@ int32_t CopyTrans(void** host_ptrs_addr, void** device_ptrs_addr, size_t size_by
 void ObtainStream(void** outputStream, void** outputContext, int32_t deviceID, int32_t mStreamNum);
 int32_t Synchronize(void* context, void* stream, int streamNum, Logger& mLogger);
 bool IsStreamIdle(void* stream);
-void DestoryStream(void* stream, void* context, int32_t deviceID, int32_t mStreamNum);
+void DestroyStream(void* stream, void* context, int32_t deviceID, int32_t mStreamNum);
 aclTensor* AtTensorToAclTensorShared(at::Tensor& tensor);
 aclDataType GetAclDataType(at::ScalarType dtype);
 void ReleaseAclTensor(aclTensor* tensor);

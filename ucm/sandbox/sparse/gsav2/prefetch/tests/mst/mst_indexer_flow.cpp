@@ -4,7 +4,7 @@
  * MST: cross-module flow for the indexer offload path (IndexerInitLoad,
  * SetIndexerMap, UpdateIndexerMap, AddIndexerMap, DeleteIndexerMap).  These
  * tie together GSAPrefetchEngineC's indexer bookkeeping maps, the UCM store
- * (LoadToDevice via mock) and the ACL memcpy path (aclrtMemcpy via stub).
+ * (Load + Wait via mock) and the ACL memcpy path (aclrtMemcpy via stub).
  */
 #include <cstring>
 #include <gtest/gtest.h>
@@ -164,7 +164,7 @@ TEST(IndexerFlow, IndexerInitLoadLoadsUcmBlocksViaStore)
     f.engine->IndexerInitLoad(blockTable, slabIdx, "req1");
     bool hasLoad = false;
     for (const auto& c : f.store->calls) {
-        if (c.name == "LoadToDevice") { hasLoad = true; }
+        if (c.name == "Load") { hasLoad = true; }
     }
     EXPECT_TRUE(hasLoad);
     f.TearDown();
@@ -188,14 +188,16 @@ TEST(IndexerFlow, IndexerInitLoadStoreFailureIsLoggedNotCrashed)
     IndexerFixture f;
     f.Setup();
     f.SeedBlocksMap(2);
-    f.store->loadToDeviceFails = true;
+    /* After the ddr-load refactor the indexer load path is Load + Wait. A Load
+     * failure returns false internally and is logged, not crashed. */
+    f.store->loadFails = true;
     std::vector<std::vector<int>> blockTable(f.layerNum, {0, 1});
     std::vector<std::vector<int>> slabIdx(f.layerNum, {0, 1});
     // Should return false internally and not crash.
     f.engine->IndexerInitLoad(blockTable, slabIdx, "req1");
     bool hasLoad = false;
     for (const auto& c : f.store->calls) {
-        if (c.name == "LoadToDevice") { hasLoad = true; }
+        if (c.name == "Load") { hasLoad = true; }
     }
     EXPECT_TRUE(hasLoad);
     f.TearDown();

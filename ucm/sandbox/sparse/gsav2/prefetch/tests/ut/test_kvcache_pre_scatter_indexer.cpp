@@ -143,9 +143,9 @@ TEST_F(ScatterIndexerTest, LoadIndexerLayerDrivesLoadIndexerRequest)
                                      MakeBlockId(4), MakeBlockId(5), MakeBlockId(6)};
     size_t total = 0;
     EXPECT_TRUE(engine->LoadIndexerLayer(0, total));
-    // task non-empty (1 UCM shard) -> LoadIndexerTask -> mock LoadToDevice.
-    ASSERT_EQ(store->calls.size(), 1u);
-    EXPECT_EQ(store->calls[0].name, "LoadToDevice");
+    // task non-empty (1 UCM shard) -> LoadIndexerTask -> mock Load (Load+Wait path).
+    ASSERT_EQ(store->calls.size(), 2u);  // Load + Wait
+    EXPECT_EQ(store->calls[0].name, "Load");
     EXPECT_EQ(total, 1u);
     ReleaseIndexer(1);
 }
@@ -208,7 +208,7 @@ TEST_F(ScatterIndexerTest, LoadIndexerRequestReturnsTrueWhenTaskEmpty)
     std::uint8_t base[64] = {};
     size_t total = 0;
     EXPECT_TRUE(engine->LoadIndexerRequest(reqID, {0}, 0, base, total));
-    ASSERT_EQ(store->calls.size(), 1u);
+    ASSERT_EQ(store->calls.size(), 2u);  // Load + Wait
     ReleaseIndexer(1);
 }
 
@@ -324,13 +324,13 @@ TEST_F(ScatterIndexerTest, LoadIndexerTaskSucceedsAndAccumulatesTotal)
     size_t total = 0;
     EXPECT_TRUE(engine->LoadIndexerTask("req1", 0, task, total));
     EXPECT_EQ(total, 2u);
-    ASSERT_EQ(store->calls.size(), 1u);
+    ASSERT_EQ(store->calls.size(), 2u);  // Load + Wait
 }
 
 TEST_F(ScatterIndexerTest, LoadIndexerTaskReturnsFalseWhenStoreFails)
 {
     engine = MakeEngine(/*layerNum=*/1);
-    store->loadToDeviceFails = true;
+    store->loadFails = true;
     UC::Detail::TaskDesc task;
     task.resize(1);
     size_t total = 0;
@@ -370,8 +370,8 @@ TEST_F(ScatterIndexerTest, UCMIndexerLoadAsyncDrivesLoadIndexerLayer)
     // Use the engine's own mContext (set up by InitAclRuntime).
     ASSERT_NE(engine->mContext, nullptr);
     engine->UCMIndexerLoadAsync(engine->mContext, /*stream=*/nullptr);
-    ASSERT_EQ(store->calls.size(), 1u);
-    EXPECT_EQ(store->calls[0].name, "LoadToDevice");
+    ASSERT_EQ(store->calls.size(), 2u);  // Load + Wait
+    EXPECT_EQ(store->calls[0].name, "Load");
     ReleaseIndexer(1);
 }
 

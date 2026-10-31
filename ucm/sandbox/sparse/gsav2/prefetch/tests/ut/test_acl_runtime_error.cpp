@@ -62,14 +62,14 @@ protected:
 
 /* ---- InitAclRuntime: aclrtGetCurrentContext failure ---- */
 // The engine ctor calls InitAclRuntime; when getCurrentContextFails is set,
-// the error-logging branch is exercised.  The engine still constructs
-// successfully (the error is logged, not fatal).
+// the error is logged and InitAclRuntime throws std::runtime_error (the engine
+// cannot be constructed without a valid ACL context). Verify the throw and that
+// the stub's failure switch was actually consulted.
 
-TEST_F(AclRuntimeErrorTest, InitAclRuntimeLogsErrorOnGetCurrentContextFailure)
+TEST_F(AclRuntimeErrorTest, InitAclRuntimeThrowsOnGetCurrentContextFailure)
 {
     acl_stub::Stub().getCurrentContextFails = true;
-    auto engine = MakeEngine();
-    EXPECT_NE(engine->mContext, nullptr);
+    EXPECT_THROW({ auto engine = MakeEngine(); (void)engine; }, std::runtime_error);
     EXPECT_GT(acl_stub::Stub().getCurrentContextCount.load(), 0);
 }
 
