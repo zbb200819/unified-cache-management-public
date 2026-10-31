@@ -80,9 +80,13 @@ public:
 
     int32_t UCMLoadSSD(const std::vector<UC::Detail::BlockId>& blockIds)
     {
-        if (mStoreV1_ == nullptr) { return PrefetchStatus::GSA_STORE_EMPTY; }
+        if (mStoreV1_ == nullptr) {
+            return static_cast<int32_t>(PrefetchStatus::GSA_STORE_EMPTY);
+        }
 
-        if (blockIds.empty()) { return PrefetchStatus::GSA_BLOCKID_EMPTY; }
+        if (blockIds.empty()) {
+            return static_cast<int32_t>(PrefetchStatus::GSA_BLOCKID_EMPTY);
+        }
         UC::Detail::TaskDesc task;
         task.reserve(blockIds.size() * mLayerNum);
 
@@ -92,8 +96,10 @@ public:
             }
         }
         auto loadHandle = mStoreV1_->Load(std::move(task));
-        if (!loadHandle) { return PrefetchStatus::GSA_HANDLE_ERROR; }
-        return PrefetchStatus::GSA_PREFETCH_DONE;
+        if (!loadHandle) {
+            return static_cast<int32_t>(PrefetchStatus::GSA_HANDLE_ERROR);
+        }
+        return static_cast<int32_t>(PrefetchStatus::GSA_PREFETCH_DONE);
     }
 
     std::vector<uint8_t> UCMLookup(const std::vector<UC::Detail::BlockId>& blockIds)
