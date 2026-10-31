@@ -85,9 +85,13 @@ public:
     }
 
     UC::Expected<ssize_t> LookupOnPrefix(const UC::Detail::BlockId*, size_t num) override
-    { return static_cast<ssize_t>(num) - 1; }
+    {
+        return static_cast<ssize_t>(num) - 1;
+    }
     UC::Expected<ssize_t> LookupOnReverse(const UC::Detail::BlockId*, size_t num) override
-    { return num == 0 ? ssize_t(-1) : ssize_t(num - 1); }
+    {
+        return num == 0 ? ssize_t(-1) : ssize_t(num - 1);
+    }
 
     void Prefetch(const UC::Detail::BlockId*, size_t) override { /* no-op */ }
 
@@ -106,7 +110,10 @@ public:
          * store fills the caller-provided DDR staging slots. */
         for (std::size_t i = 0; i < task.size(); ++i) {
             void* addr = nullptr;
-            for (const auto& a : task[i].addrs) { addr = a; break; }
+            for (const auto& a : task[i].addrs) {
+                addr = a;
+                break;
+            }
             if (addr != nullptr && bytesPerBlock_ > 0) {
                 std::memset(addr, static_cast<int>((i + 1) & 0xFF), bytesPerBlock_);
             }

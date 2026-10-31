@@ -19,7 +19,9 @@ Logger kLog{};  // disabled
 
 template <typename F>
 void ExpectThrow(F&& f)
-{ EXPECT_THROW(f(), std::runtime_error); }
+{
+    EXPECT_THROW(f(), std::runtime_error);
+}
 
 }  // namespace
 

@@ -285,8 +285,8 @@ TEST_F(PreLogicTest, BuildUCMMergeBlockContextsGroupsTokensByBlockAndOwnedShards
     UC::Detail::TaskDesc task;
     std::map<int, std::vector<size_t>> blockIdxToTokenIdx;
     engine->BuildUCMMergeBlockContexts(/*layerID=*/0, reqID, /*requestIndex=*/0, blockContexts,
-                                       task, blockIdxToTokenIdx,
-                                       engine->mUCMMergeLoadBuffer, engine->mShardSize);
+                                       task, blockIdxToTokenIdx, engine->mUCMMergeLoadBuffer,
+                                       engine->mShardSize);
     // Two blocks: 0 (tokens 0,1) and 2 (token 2).
     EXPECT_EQ(blockContexts.size(), 2u);
     EXPECT_EQ(blockIdxToTokenIdx.size(), 2u);
@@ -543,9 +543,9 @@ TEST_F(PreLogicTest, LoadUCMMergeHostAddressSucceedsAndPopulatesAddresses)
     EXPECT_EQ(addr.addresses.size(), 2u);
     EXPECT_NE(addr.addresses[0], nullptr);
     /* Addresses are spaced mShardSize apart in the staging buffer. */
-    EXPECT_EQ(engine->mShardSize, static_cast<size_t>(
-        static_cast<const std::byte*>(addr.addresses[1]) -
-        static_cast<const std::byte*>(addr.addresses[0])));
+    EXPECT_EQ(engine->mShardSize,
+              static_cast<size_t>(static_cast<const std::byte*>(addr.addresses[1]) -
+                                  static_cast<const std::byte*>(addr.addresses[0])));
 }
 
 TEST_F(PreLogicTest, LoadUCMMergeHostAddressReturnsFalseWhenStoreNull)
@@ -1188,10 +1188,9 @@ TEST_F(PreLogicTest, LoadLastChunkSourcesSucceedsAndPopulatesSourceBlocks)
     EXPECT_NE(sourceBlocks[0].kBase, nullptr);
     EXPECT_NE(sourceBlocks[0].vBase, nullptr);  // !mISSPAC8
     /* kBase points at the staging buffer; vBase = kBase + kBlockBytes. */
-    EXPECT_EQ(sourceBlocks[0].vBase,
-              static_cast<const std::byte*>(sourceBlocks[0].kBase) +
-                  static_cast<size_t>(engine->mBlockSize) *
-                  static_cast<size_t>(engine->mKVSizeBytesToken));
+    EXPECT_EQ(sourceBlocks[0].vBase, static_cast<const std::byte*>(sourceBlocks[0].kBase) +
+                                         static_cast<size_t>(engine->mBlockSize) *
+                                             static_cast<size_t>(engine->mKVSizeBytesToken));
 }
 
 /* ---------------- CopyLastChunkTokens ---------------- */

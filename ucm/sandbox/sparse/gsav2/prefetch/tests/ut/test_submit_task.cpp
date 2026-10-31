@@ -55,9 +55,13 @@ protected:
     }
 
     static torch::Tensor Make2DTensor(int s, int t, int d)
-    { return torch::zeros({s, t, d}, torch::dtype(torch::kFloat32)); }
+    {
+        return torch::zeros({s, t, d}, torch::dtype(torch::kFloat32));
+    }
     static torch::Tensor Make1DIndexTensor(int s, int t)
-    { return torch::zeros({s, t}, torch::dtype(torch::kInt64)); }
+    {
+        return torch::zeros({s, t}, torch::dtype(torch::kInt64));
+    }
 
     void SetupEngine()
     {

@@ -33,7 +33,9 @@ BlockId MakeBlock(uint8_t v)
 }
 
 torch::Tensor MakeDsaSBT(int layers, int sparseLen)
-{ return torch::zeros({layers, sparseLen}, torch::dtype(torch::kInt32)); }
+{
+    return torch::zeros({layers, sparseLen}, torch::dtype(torch::kInt32));
+}
 
 struct IndexerFixture {
     int layerNum = 2;

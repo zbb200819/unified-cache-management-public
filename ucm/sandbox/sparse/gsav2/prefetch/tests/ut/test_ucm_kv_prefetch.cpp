@@ -36,10 +36,10 @@ UC::Detail::BlockId MakeBlockId(uint8_t v)
 /* PrefetchStatus enum values returned as int32_t by UCMLoadSSD.
  * (The enum is private inside UCMKVPrefetch, so the int values are used.) */
 namespace {
-constexpr int32_t kStatusPrefetchDone = 0;    // GSA_PREFETCH_DONE
-constexpr int32_t kStatusStoreEmpty = 1;      // GSA_STORE_EMPTY
-constexpr int32_t kStatusBlockIdEmpty = 2;    // GSA_BLOCKID_EMPTY
-constexpr int32_t kStatusHandleError = 3;     // GSA_HANDLE_ERROR
+constexpr int32_t kStatusPrefetchDone = 0;  // GSA_PREFETCH_DONE
+constexpr int32_t kStatusStoreEmpty = 1;    // GSA_STORE_EMPTY
+constexpr int32_t kStatusBlockIdEmpty = 2;  // GSA_BLOCKID_EMPTY
+constexpr int32_t kStatusHandleError = 3;   // GSA_HANDLE_ERROR
 }  // namespace
 
 TEST(UCMKVPrefetch, StoreInitRejectsNullPointer)
@@ -180,7 +180,9 @@ TEST(UCMKVPrefetch, UCMLookupReturnsEmptyOnSizeMismatch)
      * size. UCMLookup now returns an empty vector instead of throwing. */
     struct ShortStore : MockStoreV1 {
         UC::Expected<std::vector<uint8_t>> Lookup(const UC::Detail::BlockId*, size_t num) override
-        { return std::vector<uint8_t>(num + 1, 1u); }
+        {
+            return std::vector<uint8_t>(num + 1, 1u);
+        }
     } store;
     UCMKVPrefetch p;
     p.StoreInit(reinterpret_cast<uintptr_t>(&store), /*layerNum=*/78);

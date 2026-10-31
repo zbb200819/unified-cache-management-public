@@ -69,7 +69,12 @@ protected:
 TEST_F(AclRuntimeErrorTest, InitAclRuntimeThrowsOnGetCurrentContextFailure)
 {
     acl_stub::Stub().getCurrentContextFails = true;
-    EXPECT_THROW({ auto engine = MakeEngine(); (void)engine; }, std::runtime_error);
+    EXPECT_THROW(
+        {
+            auto engine = MakeEngine();
+            (void)engine;
+        },
+        std::runtime_error);
     EXPECT_GT(acl_stub::Stub().getCurrentContextCount.load(), 0);
 }
 
