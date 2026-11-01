@@ -43,7 +43,7 @@ else:
     get_ascend_device_type = None
 
 # 新增类的import
-from ucm.integration.vllm.ucm_connector import RequestHasher
+from ucm.integration.vllm.ucm_connector import RequestHasher, build_kv_hash_meta
 from ucm.logger import init_logger
 from ucm.sandbox.sparse.gsav2.gsa_log import GSALogger, Logger
 from ucm.sandbox.sparse.gsav2.gsa_shared_memory import (
@@ -222,7 +222,7 @@ class GSAReqStat:
             kv_transfer_config.is_kv_producer and kv_transfer_config.is_kv_consumer
         )
 
-        self.request_hasher = RequestHasher(vllm_config, 0)
+        self.request_hasher = RequestHasher(build_kv_hash_meta(vllm_config, 0))
 
         if IS_INDEXER_OFFLOAD:
             max_block_len = math.ceil(

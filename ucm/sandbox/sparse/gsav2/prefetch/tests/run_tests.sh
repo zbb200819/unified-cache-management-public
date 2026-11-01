@@ -115,8 +115,10 @@ info "  测试源码  : ${#TEST_SOURCES[@]} 个"
 # 2. 公共编译 / 链接参数
 # ============================================================================
 COV_FLAGS=""
+COV_DEF=""
 if [[ $DO_COV -eq 1 ]]; then
     COV_FLAGS="--coverage -fprofile-arcs -ftest-coverage"
+    COV_DEF="-DUCM_PREFETCH_COVERAGE"
 fi
 
 # fmt: torch 自带的 fmt 头文件以 FMT_API 导出 vformat（需要链接 libfmt）。
@@ -152,7 +154,7 @@ INCLUDES=(
 )
 
 CXX_FLAGS=(
-    -std=c++17 -fopenmp $COV_FLAGS $FMT_FLAG
+    -std=c++17 -fopenmp $COV_FLAGS $COV_DEF $FMT_FLAG
     -DKV_CACHE_PRE_TEST_PRIVATE_AS_PUBLIC
     "${INCLUDES[@]}"
     -include "$SCRIPT_DIR/common/pch.h"

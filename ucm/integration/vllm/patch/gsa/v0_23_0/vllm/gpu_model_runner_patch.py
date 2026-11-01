@@ -1604,13 +1604,13 @@ def maybe_execute_ucm_sparse_begin(
     ucm_sparse.execute_begin(scheduler_output, attn_metadata)
 
 
-def maybe_execute_ucm_sparse_finished(self):
+def maybe_execute_ucm_sparse_finished(self, rec_result=None):
     from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
 
     if not has_ucm_sparse():
         return
     ucm_sparse = get_ucm_sparse()
-    ucm_sparse.execute_finished()
+    ucm_sparse.execute_finished(rec_result)
 
 
 def ucm_sparse_request_finished_in_worker(self, request_id: str | int):
