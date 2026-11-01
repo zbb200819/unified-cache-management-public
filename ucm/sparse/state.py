@@ -175,7 +175,7 @@ def maybe_execute_sparse_attention_begin(
         decode_ql_nope,
         decode_q_pe,
         has_indexer,
-        use_li_c8,
+        use_li_c8
     )
 
 
@@ -208,5 +208,5 @@ def maybe_execute_sparse_attention_finished(
         forward_context,
         phase,
         has_indexer,
-        use_li_c8,
+        use_li_c8
     )
