@@ -185,7 +185,19 @@ def execute_sparse_flash_attention_process(
     )
 
 
-def indexer_select_post_process(
+# NOTE: A3 (BaseDeviceAdaptor) and A5 (A5DeviceAdaptor) intentionally use
+# different indexer implementations. The function above (the first
+# ``indexer_select_post_process``) is the A3/DSV3.2 path: it routes through
+# ``torch.ops._C_ascend.*`` to avoid graph compilation issues observed when
+# using ``torch_npu.npu_lightning_indexer`` on A3. The function below is the
+# A5 path, which goes through ``torch_npu.*`` directly.
+#
+# They MUST keep distinct names. If both are named
+# ``indexer_select_post_process`` the second ``def`` shadows the first at
+# module import time, so ``_patch`` (which looks up the function by its
+# module-level name) would always bind the A5 variant onto every adaptor,
+# including BaseDeviceAdaptor on A3 -- which is the bug this rename fixes.
+def indexer_select_post_process_a5(
     sfa_impl,
     q_li: torch.Tensor,
     q_li_scale: torch.Tensor | None,
@@ -232,7 +244,6 @@ def indexer_select_post_process(
 
         if q_li_scale is not None:
             q_li_scale = q_li_scale.view(q_li_shape_ori[:-1])
-            key_dequant_scale = kv_cache[indexer_scale_cache_idx].squeeze(2)
 
             topk_indices = torch_npu.npu_quant_lightning_indexer(
                 query=q_li.view(q_li_shape_ori),
@@ -318,14 +329,17 @@ def _patch(mod):
         )
 
     if hasattr(mod.A5DeviceAdaptor, "indexer_select_post_process"):
+        # A5 keeps the torch_npu-based implementation; do NOT use the
+        # module-level ``indexer_select_post_process`` here, which after the
+        # rename above resolves to the A3 (_C_ascend) variant.
         _patched = FunctionType(
-            indexer_select_post_process.__code__,
+            indexer_select_post_process_a5.__code__,
             vars(mod),
-            name=indexer_select_post_process.__name__,
-            argdefs=indexer_select_post_process.__defaults__,
-            closure=indexer_select_post_process.__closure__,
+            name=indexer_select_post_process_a5.__name__,
+            argdefs=indexer_select_post_process_a5.__defaults__,
+            closure=indexer_select_post_process_a5.__closure__,
         )
-        _patched.__annotations__ = indexer_select_post_process.__annotations__
-        _patched.__kwdefaults__ = indexer_select_post_process.__kwdefaults__
+        _patched.__annotations__ = indexer_select_post_process_a5.__annotations__
+        _patched.__kwdefaults__ = indexer_select_post_process_a5.__kwdefaults__
         patch_or_inject(mod.A5DeviceAdaptor, "indexer_select_post_process", _patched)
         logger.info("UCM GSA A5DeviceAdaptor.indexer_select_post_process patch applied")
