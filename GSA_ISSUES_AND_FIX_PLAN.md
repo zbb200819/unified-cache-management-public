@@ -33,6 +33,8 @@
 | E5 | `attention_finished` gate 反转(行为回归) | P2 | PD 分离 D 节点 | gsa.py:1660 | 否(死代码) | ✅ 已修复 |
 | F5 | `init_kvcache_ptrs` 无判空直接索引 | P2 | kv_cache 为 None/空 | gsa.py:2771-2782 | **是** | ✅ 已修复 |
 | G1 | 跨文件隐式常量约定 | P2 | 修改任一常量 | sparse/utils.py:64-65 | **是** | ✅ 已修复 |
+| H1 | `KVPackAbort` 无日志裸调用 → 静默死亡 + 跨 rank 半死 | P1 | 8 处无前置日志的 abort 点触发 | kvcache_pre_detail.h:56-64 + scatter:316/410/421 + pre:538/1581-1607 | **是** | 待修复 |
+| H2 | `mStoreV1_->Wait` 无界阻塞 → 预取链路/Python 主线程挂死 | **P0** | store 实现无超时或超时失效(psync 卡死 IO / dram future.get / timeout_ms=0) | kvcache_pre.cpp:1184,1279 | **是** | 待修复 |
 
 > 注意:**A/B/C/D/F/G 类问题与是否开启 PD 分离无关,PD-mix 日常部署同样暴露在风险之下**;E 类仅在 PD 分离部署时进入执行路径(PD-mix 下 agent 不创建,是死代码)。
 
@@ -648,7 +650,111 @@ MAX_SLOTS_BLOCK_NUM = 12000
 
 ---
 
-# 八、修复顺序建议
+# 八、H 类:致命错误路径的可观测性 / 阻塞无界(第二轮审查发现)
+
+> 本类为 21 项原清单修复完成后、针对致命错误路径(`KVPackAbort`)与 store 同步等待(`Wait`)的专项审查结论。H2 评为 P0:在 dram store / psync 卡死 IO / `timeout_ms=0` 任一条件下,**Python 主线程与预取线程的挂死是确定性的**,且无任何超时兜底。
+
+## H1【P1】`KVPackAbort` 无日志裸调用 → 静默死亡 + 跨 rank 半死
+
+**定义**(`ucm/sandbox/sparse/gsav2/prefetch/include/kvcache_pre_detail.h:56-64`):
+
+```cpp
+[[noreturn]] inline void KVPackAbort(SharedKVPackHeader* header)
+{
+    if (header != nullptr) { header->fatalError.store(-1, std::memory_order_release); }
+    std::abort();   // 立即终止进程:不走异常、不析构、不刷 stdio
+}
+```
+
+**机制评估**:设计意图是"fail-loud + 跨 rank 传播"(置共享内存标志 + 终止进程)。配合 `mLogger` 每条日志 `flush()`(kvcache_log.h:77),**有前置 `mLogger.log(ERROR)` 的调用点现场可靠落盘,不静默**;`std::abort` 在 omp 并行区内调用合法(无需栈展开)。问题在两处:**部分调用点零日志** + **fatalError 的消费面太窄、Python 完全不感知**。
+
+**8 处无前置日志的裸 abort 点**(死亡时 kvcache_pre 日志文件里没有死因):
+
+| 位置 | 触发条件 | 备注 |
+|---|---|---|
+| scatter:316-318 | `mMissGlobalToken.size() != mLoadSlot.size()` 或超 `mMaxLoadNum`(**omp 16 线程区内**) | 不变式破坏无上下文 |
+| scatter:410 | `BeginKVPackSlot` 失败(含 **KVPackWait 30s 超时,超时本身也不打日志**——哪个 rank 卡住永远丢失) | H2 的下游死亡点 |
+| scatter:421 | `FinishKVPack` 失败 | 同上,无 stage 上下文 |
+| pre:1581-1582 | missGlobalIds/missSlots size 不匹配 | ValidateUCMMergeRequest 内 |
+| pre:1585-1587 | `mAllBlocksHash`/`mReqUseBlockTable` 缺请求条目 | 同上 |
+| pre:1590-1592 | finalLoadNum 超缓冲容量 | 同上 |
+| pre:1607 | `missGlobalIds[i] < 0` | BuildUCMMergeBlockContexts 内 |
+| pre:538 | `mPrefetchResultShm == nullptr` | **`KVPackAbort(nullptr)` 连 fatalError 都不置**——跨 rank 零信号 |
+
+**静默死亡的三个维度**:
+
+1. **文件日志无死因**:上述 8 点死亡时,kvcache_pre 日志无记录,stderr 只有 shell 层 `Aborted (core dumped)`;mLogger 只写文件不写 stderr;
+2. **Python 零感知**:`pybinds.cpp` 没有任何 fatal 查询接口,Python 不轮询 fatalError、无 SIGABRT 处理 → vLLM 日志层面只有"EngineCore 进程意外死亡/无响应",无死因;
+3. **跨 rank 半死**:fatalError 只有三个消费点——`KVPackWait` 轮询(pre:82)、非 rank0 版本号等待(scatter:264,**仅 10000×100μs ≈ 1s 窗口**)、`KVPackFail` 后续 Wait 立即失败。其他 rank 若阻塞在别处(等新任务 / Python 侧 / NCCL 集合通信)→ **不跟随 abort,挂着** → TP 组等一个死掉的 rank → NCCL watchdog 超时(默认 10 分钟)或永久 hang。
+
+**附带发现**(与可观测性同源):
+
+1. `kvcache_log.h:26` **逻辑反了**:`if (mLogFile.is_open())` 时打印 "Fail to open log file"——打开**成功**反而报失败(stderr 噪声);打开**失败**反而无声,此后所有日志被 `:42` 的 `!is_open()` 早退**静默吞掉**(另一条日志静默丢失途径);
+2. `pre:1573-1576` `ValidateUCMMergeRequest`:`mStoreV1_` 为空只 log **不 return**,继续用空 store 走 `LoadUCMMergeHostAddress` → 未定义行为(此点与 H2 修复同点,一并处理)。
+
+**修复建议**:
+1. `KVPackAbort` 增加带上下文重载(接收 `Logger&` + `const char* stage`):abort 前用 `write(2, ...)`(绕过缓冲直接写 stderr)+ mLogger ERROR 落盘;
+2. 给上述 8 个裸点补上下文日志;`pre:538` 改传 `mKVPackControl` 并补日志;
+3. `KVPackWait` 超时返回前打日志(rank、等待对象、耗时);
+4. pybinds 暴露 `has_fatal_error()`,Python 侧 `execute_begin` 步级检查,fatal 时抛 Python 异常(vLLM 正常报错链路接管,消除半死 hang);
+5. 修复 Logger:26 反逻辑;`ValidateUCMMergeRequest` 补 `return false`。
+
+## H2【P0】`mStoreV1_->Wait` 无界阻塞 → 预取链路 / Python 主线程挂死
+
+**位置**(两条独立路径到达同一个无界阻塞点):
+
+1. **预取工作线程**:`CallPrefetchProcess`(scatter:205,★持 `mMutexUseToken`)→ :222 每层 `MergeAndCopyPrefetchLayer` → :408 每请求 `UCMTensorMerge` → :1550 `LoadUCMMergeHostAddress`(pre:1249)→ **:1279 `mStoreV1_->Wait(loadHandle)`**;
+2. **Python 主线程**(更直接):`SetTokensMap`(pre:677,每步调用)→ :711 `LastChunkMove` → **:1184 `mStoreV1_->Wait(loadHandle)`**。
+
+**接口契约无超时**(`ucm/store/ucmstore_v1.h:171-177`):`Wait` 是纯虚接口,语义 "Block until the specified task completes"——**无超时参数**。
+
+**超时能力按 store 实现分层**(实测):
+
+| store 实现 | Wait 实现 | 超时能力 |
+|---|---|---|
+| posix + AIO | `TaskWrapper::Wait`(task_wrapper.h:95)→ `Latch::WaitFor(timeoutMs_)`,默认 **30s**(posix/cc/global_config.h:45);超时 `Cancel`→`ForceComplete`→`w->Abort()` 强制放行 | ✅ 干净超时,返回 `Timeout` → `LoadUCMMergeHostAddress` 返回 false → 零填充兜底(`FillFailedUCMMerge`),**正常降级** |
+| posix + psync | 超时后 `Cancel = queue_.Cancel`(io_engine_psync.h:99)只能取消**排队中**的任务,无法中断正在 `pread/pwrite` 的卡死 IO(NFS/fuse hang)→ drain 循环 `while (!w->WaitForDuration(2000))`(task_wrapper.h:100-102)**无限死等** | ⚠️ 半残:超时检测能触发,drain 循环照样挂死 |
+| **dram** | `TaskManager::WaitTransfer` → **`future.get()`**(dram/cc/task_manager.cc:162)——`std::future` 无超时等待,无限期阻塞 | ❌ **完全无超时** |
+| 通用陷阱 | `timeout_ms` 配置为 0 时 `Latch::WaitFor(0)` **退化为无限期 `Wait()` 且返回 true**(shared/infra/thread/latch.h:85-88) | ❌ 配置项可整体禁用超时 |
+
+**Wait 永不返回后的连锁后果**:
+
+1. **`mMutexUseToken` 永不释放**(预取线程路径):Python 主线程下一次 `SetTokensMap` → 永久阻塞 → **worker 进程假死**;而路径 2 更直接——`LastChunkMove` 的 Wait 本身就在 Python 主线程上;
+2. **`mIsPrefetchRunning` 永为 true**:尾部的复位永远不执行;`DelBlocksMap` 的 `if (!GetPrefetchStatus() ...) DelReqIDRun()` 永远走延迟分支 → `mDelSeqIds` 无限增长、已删请求 map 永不释放;B2 修复的墓碑检查让**所有**后续预取请求被跳过 → 预取整体停摆;
+3. **跨 rank 半死**:卡死 rank 已过 `BeginKVPackSlot` 但永不 `MarkKVH2DDone`(pre:240)→ 其他 rank 下一步 `BeginKVPackSlot`(pre:215-223,等全部 TP rank 的 `h2dDoneEpoch`)→ **KVPackWait 30s 超时 → scatter:410 `KVPackAbort`——即 H1 的无日志静默 abort 点** → 其他 rank 进程死亡;卡死 rank 本身没人能打断,继续 hang。最终 TP 组一半静默 abort、一半永久 hang,现场混合且几乎无线索;
+4. **B1 的 `mStopPrefetch` 挡不住**:自旋只在 `CallPrefetchProcess` 入口,对已在 Wait 里卡死的任务无效。
+
+**修复建议**:
+1. `LoadUCMMergeHostAddress`/`LastChunkMove` 的 `Wait` 改为**引擎侧有界等待**:循环 `Check()`(接口已存在,非阻塞轮询)+ 引擎级 deadline(如 30s),超时返回 false → 复用现成的 `FillFailedUCMMerge` 零填充兜底,把"挂死"降级为"该层预取缺数据"(可接受的降级,与 posix+AIO 超时行为对齐);
+2. `TaskWrapper::Wait` 的 drain 循环加上限(N×2s 后放弃并返回,宁可泄漏 waiter 也不挂死调用方);
+3. dram 的 `future.get()` 改为轮询 + 超时;
+4. `timeout_ms` 拒绝 0(配置校验;或 `Latch::WaitFor(0)` 语义改为立即超时——当前"0=永不超时"是陷阱);
+5. 与 H1-建议 4 联动:pybinds 暴露 fatal 状态供 Python 步级检查,半死状态尽早显式化。
+
+---
+
+# 九、修复顺序建议
+
+1. **第一批(P0,确定性崩溃/踩写)**:
+   - E1(P 节点启动崩溃,改动最小:一处加 gate)
+   - A1 + A2(`CopyPreSwapTokens` 边界检查 + dim 口径修正)
+   - F1(补丁框架钩子丢失——影响所有补丁可靠性)
+   - F2(同步 `_a5` 改名,一处)
+2. **第二批(P1,条件性崩溃/静默损坏)**:
+   - E2 + E4(一并修:`_ensure_store_injected` 返回状态 + `_load_kv_dram` 包异常)
+   - E3(超时 fail-fast)
+   - B1(激活互斥闸,生产代码两处调用)
+   - F3、F4(判空,改动小)
+3. **第三批(P1,需要设计的)**:
+   - B2(块所有权 epoch)
+   - C1(统一加锁,注意预取线程性能)
+   - D1(负索引过滤)
+   - B3(keepalive 清单)
+   - A3(老引擎接口安全化)
+4. **第四批(P2)**:E5、F5、G1。
+5. **第五批(第二轮审查,H 类)**:
+   - **H2 优先**(P0,确定性挂死):引擎侧有界等待 + dram/psync 超时修复——`Wait` 挂死是 H1 静默 abort 的上游触发源(scatter:410),先修 H2 能大幅减少 H1 的触发面;
+   - H1(可观测性):`KVPackAbort` 带上下文 + 8 个裸点补日志 + pybinds fatal 接口 + Python 步级检查。
 
 1. **第一批(P0,确定性崩溃/踩写)**:
    - E1(P 节点启动崩溃,改动最小:一处加 gate)
@@ -674,4 +780,5 @@ MAX_SLOTS_BLOCK_NUM = 12000
 - **B 类**(设备侧):ascend 越界检测工具跑图捕获/回放;预取与 forward 并发压测 + KV 数值比对
 - **E 类**:PD 分离双节点启动冒烟(P 节点不崩)+ 首请求长 prompt(D 节点 store 未注入路径)
 - **F 类**:补丁单测(两个 when_imported 钩子先后注册同模块,断言都执行);warmup/profile 阶段冒烟
+- **H 类**(第二轮审查):H2 用故障注入——dram store 对端不回复 / psync 挂起 IO 模拟(NFS 停摆)——断言引擎在有界时间内走零填充兜底而非挂死,且 Python 侧收到显式异常/日志;H1 用单测构造不变式破坏,断言 abort 前日志含 stage 上下文,`has_fatal_error()` 在 abort 后(其他进程视角)可查询
 - **回归**:无 MTP 常规 decode、PD-mix 全链路,确认修复不引入性能/行为回归
