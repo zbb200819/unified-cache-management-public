@@ -285,6 +285,15 @@ void GSAPrefetchEngineC::ProcessPrefetchRequest(const TaskInfo& taskInfo, size_t
 {
     std::string oneReqID = taskInfo.reqIdList[i];
     int oneTopkLen = taskInfo.topkLenList[i];
+    // [B2] 墓碑校验:请求已被 DelBlocksMap 标记(vLLM 已完成/抢占,device 块
+    // 可能已重新分配),本请求不再组装任何预取数据,直接跳过。
+    if (IsReqDeleted(oneReqID)) {
+        mLogger.log(LogLevel::DEBUG,
+                    "Decode step: %u, |KVCache Prefetch| skip deleted req_id: %s "
+                    "(block ownership may have changed)\n",
+                    mDecodeStep, oneReqID.c_str());
+        return;
+    }
     if (oneTopkLen <= 0) {
         mLogger.log(LogLevel::ERROR,
                     "Decode step: %u, |KVCache Prefetch| topk len is zero: "
@@ -404,7 +413,9 @@ void GSAPrefetchEngineC::MergeAndCopyPrefetchLayer(const TaskInfo& taskInfo, Thr
     for (size_t i = 0; i < oneRunBsLen; i++) {
         std::string oneReqID = taskInfo.reqIdList[i];
         int oneTopkLen = taskInfo.topkLenList[i];
-        if (oneTopkLen <= 0) { continue; }
+        // [B2] 墓碑校验(DMA 聚合的最后请求粒度拦截点):该层开始组装前请求
+        // 已被标记删除 → 跳过本层,不让其块表进入 H2D 缓冲与 scatter。
+        if (oneTopkLen <= 0 || IsReqDeleted(oneReqID)) { continue; }
         UCMTensorMerge(layerID, streamIdx, hbmSlotIndex, oneReqID, static_cast<uint32_t>(i));
     }
     if (FinishKVPack(streamIdx, epoch) != 0) { KVPackAbort(mKVPackControl); }
@@ -533,6 +544,15 @@ int GSAPrefetchEngineC::IndexerLoadProcess(const TaskInfo& taskInfo, ThreadInfo&
             mLogger.log(LogLevel::ERROR,
                         "Decode step: %u, |KVCache Prefetch| topk len is zero: %d\n", mDecodeStep,
                         taskInfo.topkLenList[i]);
+            continue;
+        }
+        // [B2] 墓碑校验(本函数已持 mUpdateReqMutex,直接查):请求已删除 →
+        // 不为其组装 indexer 加载块,跳过。
+        if (mDelSeqIds.find(taskInfo.reqIdList[i]) != mDelSeqIds.end()) {
+            mLogger.log(LogLevel::DEBUG,
+                        "Decode step: %u, |KVCache Prefetch| skip deleted req_id in "
+                        "indexer load: %s\n",
+                        mDecodeStep, taskInfo.reqIdList[i].c_str());
             continue;
         }
         allMissIdxs.insert({taskInfo.reqIdList[i], std::vector<std::vector<int>>(mLayerNum)});
@@ -1387,6 +1407,17 @@ void GSAPrefetchEngineC::DelBlocksMap(std::string reqID)
     // so that the shared per-request maps are not erased mid-update.
     if (!GetPrefetchStatus() && !GetIndexerStatus()) { DelReqIDRun(); }
     mUpdateReqMutex.unlock();
+}
+
+bool GSAPrefetchEngineC::IsReqDeleted(const std::string& reqID)
+{
+    // [B2] 墓碑查询:DelBlocksMap 只置 mDelSeqIds + 延迟删 map——撤不回已提交的
+    // DMA,但后续层/阶段的设备侧数据组装必须停止为该请求服务。vLLM 在请求
+    // 完成/被抢占时会将其 device 块归还分配器并可能立刻重新分配给其他请求,
+    // 此时旧块表上的任何 scatter 写都会与新所有者的 prefill kernel 并发踩写。
+    // 临界区仅为一次 set 查找。
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+    return mDelSeqIds.find(reqID) != mDelSeqIds.end();
 }
 
 void GSAPrefetchEngineC::DelReqIDRun()

@@ -21,7 +21,7 @@
 | F1 | `when_imported` 单次触发保护静默丢弃后续补丁钩子 | **P0** | 同一模块注册两个补丁 | patch/utils.py:96-100 | **是** | ✅ 已修复 |
 | F2 | `indexer_select_post_process` 重复定义相互覆盖 | **P0** | v0.23.0_pmr 补丁生效时 | v0.23.0_pmr/.../device_op_patch.py:13,188 | **是** | ✅ 已修复 |
 | A3 | 老引擎 freeBlockPtr 裸写无界 | P1 | 行宽与表大小错配 | sparse/gsa/.../kvcache_pre.cpp:432 | 是(老引擎) | ✅ 已修复 |
-| B2 | 块 ID 陈旧 → 跨请求并发踩写 | P1 | 请求抢占/完成时 DMA 在途 | kvcache_pre_scatter.cpp:1305-1313 | **是** | 待修复 |
+| B2 | 块 ID 陈旧 → 跨请求并发踩写 | P1 | 请求抢占/完成时 DMA 在途 | kvcache_pre_scatter.cpp:1305-1313 | **是** | ✅ 已修复(窗口收窄) |
 | B3 | 裸指针 use-after-free 风险 | P1 | Python 张量先于 C++ 释放 | pybinds.cpp:143-148 + gsa.py:1544-1546 | **是** | ✅ 已修复 |
 | C1 | C++ map 跨线程并发读写无锁 | P1 | Python 写 API 与预取线程同时活跃 | kvcache_pre_scatter.cpp:1167-1171 附近 | **是** | ✅ 已修复 |
 | D1 | `-1` 槽位索引可达设备侧 scatter | P1 | aclgraph 捕获/回放 | sfa_kv_transfer_patch.py:387-392 | **是** | ✅ 已修复 |
@@ -215,6 +215,21 @@ dstTensor = mKCacheAcl[layerID];   // ← SetKvTensor 注册的 vLLM KV cache �
 **原因**:预取目标 block id 来自**上一步**的 topk/自由块表。请求在 DMA 在途时被抢占或完成后,vLLM 分配器会把这些 device 块**重新分配给其他请求**(其 prefill 正在计算流上写这些块)→ DMA 与 kernel 并发写同一 KV 块 → 静默 KV 数据损坏。`DelBlocksMap` 只是延迟删 map,**撤不回已提交的 DMA**。
 
 **修复建议**:预取任务携带块所有权 epoch,提交前/DMA 前校验所有权未变化;或预取目标块从专用保留池分配(不与 vLLM 分配器混用)。
+
+### ✅ 修复记录(B2,窗口显著收窄;彻底关闭需保留池,列为后续项)
+
+- **修复内容**(墓碑校验,epoch 的轻量等价物——`mDelSeqIds` 本身就是"请求所有权已变"的墓碑,缺的只是执行路径对它的检查):
+  1. 新增 `bool GSAPrefetchEngineC::IsReqDeleted(const std::string& reqID)`(`kvcache_pre.h` 声明 + scatter 实现):持 `mUpdateReqMutex` 查 `mDelSeqIds`,临界区仅为一次 set 查找;
+  2. **三个请求粒度拦截点**(覆盖全部设备侧 DMA 组装路径):
+     - `ProcessPrefetchRequest` 开头:请求已删 → 跳过本层准备(rank0 计算路径,含 omp 区内——omp+mutex 合法,临界区极短);
+     - `MergeAndCopyPrefetchLayer` 逐请求循环(**DMA 聚合的最后请求粒度拦截点**):已删请求的块表不进入 H2D 缓冲、不参与 `KVCacheInplaceScatter`;非 rank0 的 scatter 路径同样经此拦截;
+     - `IndexerLoadProcess` 逐请求循环(该函数已持 `mUpdateReqMutex`,直接内联查 `mDelSeqIds`):indexer 加载路径同样跳过。
+- **修复原因**:
+  - `DelBlocksMap` 只置 `mDelSeqIds` + 延迟删 map(任务运行中不删,避免 mid-update erase)——但任务执行路径**从不检查墓碑**:`ProcessPrefetchRequest`/`UCMTensorMerge` 聚合照常消费已删请求的 `mDocsTables` 块表并提交 scatter;而 vLLM 在请求完成/抢占时**立刻**把 device 块归还分配器并可能重新分配给新请求 → DMA 与新所有者的 prefill kernel 并发写同一块(静默 KV 损坏);
+  - 检查后窗口从"整个任务生命周期(数十层全程)"收窄到"单层内 check 与 scatter 提交之间"(毫秒级);配合 B1 的步间串行化(检查/提交都发生在步间窗口,forward 未运行),冲突方仅剩 vLLM 调度器线程的块重分配。
+- **锁序分析**(新增 `mMutexUseToken → mUpdateReqMutex` 嵌套):`CallPrefetchProcess`(持 mMutexUseToken)内经 `IsReqDeleted` 取 mUpdateReqMutex;反向路径逐一核对——`SetTokensMap`(唯一持 mMutexUseToken 的 Python 接口)内部调用的 `ProcessTokensMapTopk`/`LastChunkMove` 均无锁;其余 mUpdateReqMutex 持有者不调用 mMutexUseToken 路径 → 单向顺序,无死锁。
+- **遗留(后续项,彻底解)**:已提交给 ACL 流的单次 DMA 仍无法撤回——单层内 check 之后、scatter 完成之前删除的请求,该层 DMA 照旧执行。彻底关闭需要:(a) 预取目标块从专用保留池分配(不与 vLLM 分配器混用,数据流改动大),或 (b) 逐块 epoch(块粒度世代号,Python 侧每次块表更新时递增,scatter 前逐块校验)。两者都需要跨 Python/C++ 的接口扩展,超出本轮"最小安全修复"范围。
+- **验证**:需随 C++ 构建跑;用例为"请求完成瞬间有在途预取任务"的压测(长 prompt + 高频完成),观察 DEBUG 日志出现 "skip deleted req_id" 且不再有完成请求块上的预取写。
 
 ---
 

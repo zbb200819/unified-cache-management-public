@@ -138,6 +138,11 @@ public:
     // Trigger deletion
     void DelBlocksMap(std::string reqID);
 
+    // [B2] 请求墓碑查询:请求进入 mDelSeqIds(DelBlocksMap 置入,vLLM 已完成/
+    // 抢占该请求、其 device 块可能已被分配器重新分配给其他请求)后,预取任务
+    // 不再为它组装/提交任何设备侧 DMA。
+    bool IsReqDeleted(const std::string& reqID);
+
     void DelReqIDRun();
 
     // Task assignment and execution
