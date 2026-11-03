@@ -1695,7 +1695,15 @@ class GSA(UcmSparseBase):
         has_indexer: Optional[bool] = True,
         use_li_c8: Optional[bool] = False,
     ) -> None:
-        if not PTOPK_PREFETCH_ENABLE or not self.is_pd_mix:
+        # [E5 修复] gate 从 is_pd_mix 改为 is_decode_node,与同数据链其它环节对齐:
+        # dump 的输入准备(_calc_prefill_slot_mapping/_copy_dsa_input_to_npu,经
+        # build_sparse_meta, gate=is_decode_node)与下游消费(attention_begin 内
+        # _prefetch_k_blocks/_prefetch_indexer_blocks, gate=is_decode_node)在
+        # PD 分离 D 节点(is_pd_mix=False, is_decode_node=True)上照常执行,
+        # 唯独本拷贝环节被 is_pd_mix 拦截 → indexer 缓存(dsa_k_cache)缺失
+        # dump 数据 → indexer topk 计算静默退化(非崩溃的行为回归)。
+        # P 节点(is_decode_node=False)依旧被拦截,行为不变;PD-mix 不变。
+        if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
             return
         if IS_PERFORMANCE_LOG:
             start = time.perf_counter()

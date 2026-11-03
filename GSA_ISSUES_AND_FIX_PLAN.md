@@ -30,7 +30,7 @@
 | E4 | `_ensure_store_injected` 非异常静默失败 | P1 | connector/store 未就绪 | gsa.py:955-974 | 否(死代码) | ✅ 已修复 |
 | F3 | `req_sparsed_slots=None` 无判空 | P1 | 非 GSA 调度路径构造的 SchedulerOutput | sched_output_patch.py:20-23 | **是** | ✅ 已修复 |
 | F4 | `list(kv_cache)` 无判空 | P1 | warmup/profile 阶段 kv_cache=None | sfa_kv_transfer_patch.py:643,649 | **是** | ✅ 已修复 |
-| E5 | `attention_finished` gate 反转(行为回归) | P2 | PD 分离 D 节点 | gsa.py:1660 | 否(死代码) | 待修复 |
+| E5 | `attention_finished` gate 反转(行为回归) | P2 | PD 分离 D 节点 | gsa.py:1660 | 否(死代码) | ✅ 已修复 |
 | F5 | `init_kvcache_ptrs` 无判空直接索引 | P2 | kv_cache 为 None/空 | gsa.py:2771-2782 | **是** | 待修复 |
 | G1 | 跨文件隐式常量约定 | P2 | 修改任一常量 | sparse/utils.py:64-65 | **是** | 待修复 |
 
@@ -476,6 +476,16 @@ if not PTOPK_PREFETCH_ENABLE or not self.is_pd_mix:   # ← 新增 not self.is_p
 **原因**:PD 分离的 D 节点(`is_pd_mix=False`)不再执行 indexer dump 路径。若该路径承担 indexer 数据落盘/上报职责,属于静默功能缺失。
 
 **修复建议**:确认 D 节点是否需要 dump;需要则去掉 `not self.is_pd_mix` 条件。
+
+### ✅ 修复记录(E5)
+
+- **修复内容**(`gsa.py` `attention_finished`,:1698):gate 从 `if not PTOPK_PREFETCH_ENABLE or not self.is_pd_mix` 改为 `... or not self.is_decode_node`,并在注释中说明原因。
+- **修复原因(数据链一致性论证)**:
+  - dump 链路三段:①输入准备——`_calc_prefill_slot_mapping` 填 dump ids、`_copy_dsa_input_to_npu` 设 `indexer_pc_dump_num/index`(经 `build_sparse_meta`,gate=`is_decode_node`);②**拷贝执行——本函数的 `gsa_gather_copy` 把 vLLM KV 命中块 dump 进 indexer 专用缓存(gate=`is_pd_mix`)**;③下游消费——`attention_begin` 内 `_prefetch_k_blocks`/`_prefetch_indexer_blocks`(gate=`is_decode_node`);
+  - PD 分离 D 节点上(`is_pd_mix=False, is_decode_node=True`):①③照常执行,**唯独②被拦截** → dump 链路断裂,indexer 缓存(dsa_k_cache)缺失数据 → indexer topk 计算静默退化(选块错误 → 预取/稀疏注意力质量下降,非崩溃的行为回归);
+  - dump 缓冲(`indexer_pc_dump_tmp` 等,`_init_prefetch_buffers`)在 `__init__` 的 worker 块内分配(gate=`is_decode_node`),D 节点上全部就绪,②执行无前置缺失。
+- **影响面**:P 节点(`is_decode_node=False`)依旧被拦截,行为不变;PD-mix(`is_decode_node=True, is_pd_mix=True`)行为不变;仅 PD 分离 D 节点从"跳过 dump"变为"执行 dump"(补齐断裂的链路)。
+- **验证**:`ast.parse` 语法通过;PD 分离双节点部署冒烟,确认 D 节点日志出现 dump 路径执行记录 + indexer topk 命中率恢复正常(与 PD-mix 对比)。
 
 ---
 
