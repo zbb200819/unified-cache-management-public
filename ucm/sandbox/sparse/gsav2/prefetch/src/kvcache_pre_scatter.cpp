@@ -315,7 +315,16 @@ void GSAPrefetchEngineC::ProcessPrefetchRequest(const TaskInfo& taskInfo, size_t
                                                          mLoadSlot[oneReqID][layerID], mLogger);
     if (mMissGlobalToken[oneReqID][layerID].size() != mLoadSlot[oneReqID][layerID].size() ||
         mMissGlobalToken[oneReqID][layerID].size() > static_cast<size_t>(mMaxLoadNum)) {
-        KVPackAbort(mKVPackControl);
+        // [H1] omp 并行区内不变式破坏:补日志(mLogger 逐条 flush 且线程安全)
+        // + reason 直写 stderr 后再 abort,死亡现场可定位。
+        mLogger.log(LogLevel::ERROR,
+                    "|KVPack| invariant broken in ProcessPrefetchRequest, decodeStep=%u "
+                    "layerID=%d reqID=%s missSize=%zu loadSlotSize=%zu mMaxLoadNum=%d\n",
+                    mDecodeStep, layerID, oneReqID.c_str(),
+                    mMissGlobalToken[oneReqID][layerID].size(),
+                    mLoadSlot[oneReqID][layerID].size(), mMaxLoadNum);
+        KVPackAbortWithReason(
+            mKVPackControl, "[KVPack] fatal: miss/loadSlot size invariant broken");
     }
     mAvgHitRate[layerID].emplace_back(mHBMMangers[oneReqID][layerID]->mHitRate);
     mLogger.log(LogLevel::DEBUG,
@@ -407,7 +416,16 @@ void GSAPrefetchEngineC::MergeAndCopyPrefetchLayer(const TaskInfo& taskInfo, Thr
     mLoadNum[layerID] = 0;
     int streamIdx = layerID % mStreamNum;
     const uint64_t epoch = (uint64_t(mPrefetchResultVersion.load()) << 32) | uint64_t(layerID + 1);
-    if (BeginKVPackSlot(streamIdx, epoch) != 0) { KVPackAbort(mKVPackControl); }
+    if (BeginKVPackSlot(streamIdx, epoch) != 0) {
+        // [H1] KVPackWait 30s 超时:等待其它 TP rank 的 h2dDoneEpoch 失败,
+        // 多为某个 rank 卡死或已死亡(此前该点零日志,哪个 rank 卡住永远丢失)。
+        mLogger.log(LogLevel::ERROR,
+                    "|KVPack| BeginKVPackSlot timeout, decodeStep=%u layerID=%d streamIdx=%d "
+                    "epoch=%llu rank=%d tpSize=%zu (a peer rank stuck or dead)\n",
+                    mDecodeStep, layerID, streamIdx, static_cast<unsigned long long>(epoch),
+                    mRank, mTpSize);
+        KVPackAbortWithReason(mKVPackControl, "[KVPack] fatal: BeginKVPackSlot timeout");
+    }
     std::vector<uint64_t> hbmSlotIndex;
     auto cpuStart = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < oneRunBsLen; i++) {
@@ -418,7 +436,16 @@ void GSAPrefetchEngineC::MergeAndCopyPrefetchLayer(const TaskInfo& taskInfo, Thr
         if (oneTopkLen <= 0 || IsReqDeleted(oneReqID)) { continue; }
         UCMTensorMerge(layerID, streamIdx, hbmSlotIndex, oneReqID, static_cast<uint32_t>(i));
     }
-    if (FinishKVPack(streamIdx, epoch) != 0) { KVPackAbort(mKVPackControl); }
+    if (FinishKVPack(streamIdx, epoch) != 0) {
+        // [H1] KVPackWait 30s 超时:等待其它 TP rank 的 packedEpoch 失败,
+        // 同 BeginKVPackSlot 超时——某个 rank 卡死或已死亡。
+        mLogger.log(LogLevel::ERROR,
+                    "|KVPack| FinishKVPack timeout, decodeStep=%u layerID=%d streamIdx=%d "
+                    "epoch=%llu rank=%d tpSize=%zu (a peer rank stuck or dead)\n",
+                    mDecodeStep, layerID, streamIdx, static_cast<unsigned long long>(epoch),
+                    mRank, mTpSize);
+        KVPackAbortWithReason(mKVPackControl, "[KVPack] fatal: FinishKVPack timeout");
+    }
     auto cpuEnd = std::chrono::high_resolution_clock::now();
     timing.cpuMove +=
         std::chrono::duration_cast<std::chrono::microseconds>(cpuEnd - cpuStart).count();

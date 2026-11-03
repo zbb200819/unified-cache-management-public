@@ -535,7 +535,16 @@ void GSAPrefetchEngineC::InitPrefetchResultShm(std::vector<int>& modelInfo)
     } else {
         AttachPrefetchResultShm();
     }
-    if (mPrefetchResultShm == nullptr) { KVPackAbort(nullptr); }
+    if (mPrefetchResultShm == nullptr) {
+        // [H1] 此前 KVPackAbort(nullptr) 连共享 fatalError 都不置(跨 rank
+        // 零信号),且无任何日志。改传 mKVPackControl(构造期它通常尚未
+        // 懒初始化、为 null,行为不差于旧版;若已初始化则可正确置位)。
+        mLogger.log(LogLevel::ERROR,
+                    "|KVPack| prefetch result shm is null after create/attach, rank=%d\n",
+                    mRank);
+        KVPackAbortWithReason(
+            mKVPackControl, "[KVPack] fatal: mPrefetchResultShm is null in InitPrefetchResultShm");
+    }
     if (mRank == 0) {
         __atomic_store_n(static_cast<uint32_t*>(mPrefetchResultShm), uint32_t(0), __ATOMIC_RELEASE);
     }
@@ -1610,23 +1619,40 @@ bool GSAPrefetchEngineC::ValidateUCMMergeRequest(int layerID, const std::string&
     if (!mStoreV1_) {
         mLogger.log(LogLevel::ERROR, "|UCMTensorMerge| mStoreV1_ is nullptr reqID=%s\n",
                     reqID.c_str());
+        // [H1c] 此前只 log 不 return,继续用空 store 走 LoadUCMMergeHostAddress
+        // → 未定义行为。改为显式失败(UCMTensorMerge 已有失败兜底路径)。
+        return false;
     }
     int curTopkIndex = mTopkLayerMap[layerID];
     const auto& missGlobalIds = mMissGlobalToken[reqID][curTopkIndex];
     const auto& missSlots = mLoadSlot[reqID][curTopkIndex];
     if (missGlobalIds.empty()) { return false; }
     if (missGlobalIds.size() != missSlots.size() || mBlockSize <= 0) {
-        KVPackAbort(mKVPackControl);
+        mLogger.log(LogLevel::ERROR,
+                    "|KVPack| ValidateUCMMergeRequest invariant broken, layerID=%d reqID=%s "
+                    "missSize=%zu slotSize=%zu blockSize=%d\n",
+                    layerID, reqID.c_str(), missGlobalIds.size(), missSlots.size(), mBlockSize);
+        KVPackAbortWithReason(mKVPackControl,
+                              "[KVPack] fatal: miss/slot size mismatch in ValidateUCMMergeRequest");
     }
     const auto hashIt = mAllBlocksHash.find(reqID);
     if (hashIt == mAllBlocksHash.end() ||
         mReqUseBlockTable.find(reqID) == mReqUseBlockTable.end()) {
-        KVPackAbort(mKVPackControl);
+        mLogger.log(LogLevel::ERROR,
+                    "|KVPack| missing req entry in allBlocksHash/reqUseBlockTable, "
+                    "layerID=%d reqID=%s\n",
+                    layerID, reqID.c_str());
+        KVPackAbortWithReason(mKVPackControl,
+                              "[KVPack] fatal: missing req block table entry");
     }
     const size_t finalLoadNum = mLoadNum[layerID] + missGlobalIds.size();
     if (finalLoadNum > static_cast<size_t>(mLoadIndexBufferLen) ||
         finalLoadNum > static_cast<size_t>(mKVBufferLen)) {
-        KVPackAbort(mKVPackControl);
+        mLogger.log(LogLevel::ERROR,
+                    "|KVPack| load index over capacity, layerID=%d reqID=%s finalLoadNum=%zu "
+                    "mLoadIndexBufferLen=%d mKVBufferLen=%d\n",
+                    layerID, reqID.c_str(), finalLoadNum, mLoadIndexBufferLen, mKVBufferLen);
+        KVPackAbortWithReason(mKVPackControl, "[KVPack] fatal: finalLoadNum over buffer capacity");
     }
     return true;
 }
@@ -1641,7 +1667,13 @@ void GSAPrefetchEngineC::BuildUCMMergeBlockContexts(
     const auto& missGlobalIds = mMissGlobalToken[reqID][mTopkLayerMap[layerID]];
 
     for (size_t i = 0; i < missGlobalIds.size(); ++i) {
-        if (missGlobalIds[i] < 0) { KVPackAbort(mKVPackControl); }
+        if (missGlobalIds[i] < 0) {
+            mLogger.log(LogLevel::ERROR,
+                        "|KVPack| negative missGlobalIds, layerID=%d reqID=%s index=%zu "
+                        "value=%d\n",
+                        layerID, reqID.c_str(), i, missGlobalIds[i]);
+            KVPackAbortWithReason(mKVPackControl, "[KVPack] fatal: negative missGlobalIds");
+        }
         blockIdxToTokenIdx[missGlobalIds[i] / mBlockSize].push_back(i);
     }
 

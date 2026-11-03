@@ -5,6 +5,7 @@
  * `average` / `average2d` defined in src/kvcache_pre.cpp.
  */
 #include <cmath>
+#include <csignal>
 #include <gtest/gtest.h>
 #include <stdexcept>
 #include "kvcache_pre.h"
@@ -38,6 +39,27 @@ TEST(KVPackDetail, KVPackAbortWithNullHeaderDoesNotSetFlag)
      * cannot call it directly. We assert that it is declared [[noreturn]]. */
     static_assert(noexcept(false), "KVPackAbort is not noexcept-tagged");
     SUCCEED();
+}
+
+/* ---- KVPackAbortWithReason (H1) ---- */
+
+TEST(KVPackDetailDeath, KVPackAbortWithReasonWritesReasonAndAborts)
+{
+    /* [H1] 死亡测试:abort 前把 reason 直写 stderr(write(2) 绕过用户态缓冲,
+     * 进程 stdio 缓冲不 flush 也不丢);进程以 SIGABRT 终止,fatalError 置位
+     * 语义与 KVPackAbort 相同(单行 atomic store,由代码审读保证)。 */
+    SharedKVPackHeader header;
+    header.fatalError.store(0, std::memory_order_relaxed);
+    EXPECT_EXIT(KVPackAbortWithReason(&header, "[KVPackUT] fatal: injected reason"),
+                ::testing::KilledBySignal(SIGABRT), "\\[KVPackUT\\] fatal: injected reason");
+}
+
+TEST(KVPackDetailDeath, KVPackAbortWithReasonWithNullHeaderStillAborts)
+{
+    /* [H1] header 为 null 时不解引用(与旧 KVPackAbort(nullptr) 一致),
+     * reason 仍先落 stderr,随后 SIGABRT。 */
+    EXPECT_EXIT(KVPackAbortWithReason(nullptr, "[KVPackUT] fatal: null header"),
+                ::testing::KilledBySignal(SIGABRT), "\\[KVPackUT\\] fatal: null header");
 }
 
 /* ---- structs default-init ---- */

@@ -22,8 +22,12 @@ public:
     {
         if (enable) {
             mLogFile.open(fileName, std::ios::app);
-            if (mLogFile.is_open()) {
-                std::cerr << "|KVCache Prefetch| Fail to open log file: " << fileName << std::endl;
+            // [H1c] 此前条件反了:打开成功反而报"Fail to open"(stderr 噪声),
+            // 打开失败反而无声——此后所有日志被 log() 的 !is_open() 早退静默
+            // 吞掉,整条日志途径无声失效。改为仅在真正打开失败时报错。
+            if (!mLogFile.is_open()) {
+                std::cerr << "|KVCache Prefetch| Fail to open log file: " << fileName
+                          << std::endl;
             }
         }
     }

@@ -33,7 +33,7 @@
 | E5 | `attention_finished` gate 反转(行为回归) | P2 | PD 分离 D 节点 | gsa.py:1660 | 否(死代码) | ✅ 已修复 |
 | F5 | `init_kvcache_ptrs` 无判空直接索引 | P2 | kv_cache 为 None/空 | gsa.py:2771-2782 | **是** | ✅ 已修复 |
 | G1 | 跨文件隐式常量约定 | P2 | 修改任一常量 | sparse/utils.py:64-65 | **是** | ✅ 已修复 |
-| H1 | `KVPackAbort` 无日志裸调用 → 静默死亡 + 跨 rank 半死 | P1 | 8 处无前置日志的 abort 点触发 | kvcache_pre_detail.h:56-64 + scatter:316/410/421 + pre:538/1581-1607 | **是** | 待修复 |
+| H1 | `KVPackAbort` 无日志裸调用 → 静默死亡 + 跨 rank 半死 | P1 | 8 处无前置日志的 abort 点触发 | kvcache_pre_detail.h:56-64 + scatter:316/410/421 + pre:538/1581-1607 | **是** | 🔧 修复中(H1a/H1c 已修复,H1b fatal 感知链下一 commit) |
 | H2 | `mStoreV1_->Wait` 无界阻塞 → 预取链路/Python 主线程挂死 | **P0** | store 实现无超时或超时失效(psync 卡死 IO / dram future.get / timeout_ms=0) | kvcache_pre.cpp:1184,1279 + scatter:844,1082 | **是** | ✅ 已修复 |
 
 > 注意:**A/B/C/D/F/G 类问题与是否开启 PD 分离无关,PD-mix 日常部署同样暴露在风险之下**;E 类仅在 PD 分离部署时进入执行路径(PD-mix 下 agent 不创建,是死代码)。
@@ -698,6 +698,22 @@ MAX_SLOTS_BLOCK_NUM = 12000
 3. `KVPackWait` 超时返回前打日志(rank、等待对象、耗时);
 4. pybinds 暴露 `has_fatal_error()`,Python 侧 `execute_begin` 步级检查,fatal 时抛 Python 异常(vLLM 正常报错链路接管,消除半死 hang);
 5. 修复 Logger:26 反逻辑;`ValidateUCMMergeRequest` 补 `return false`。
+
+### ✅ 修复记录(H1a+H1c,可观测性与致命路径加固)
+
+- **修复内容**(建议 1/2/3/5;建议 4 的 fatal 感知链为 H1b,下一 commit 单独提交):
+  - `kvcache_pre_detail.h`:新增 `KVPackAbortWithReason(header, reason)`(保留原 `KVPackAbort` 不动,已有前置日志的调用点零改动)——abort 前把 reason 用 `write(STDERR_FILENO, ...)` 直写 stderr(绕过一切用户态缓冲,进程 stdio 不 flush 也不丢),fatalError 置位语义与原版一致;补 `#include <unistd.h>/<cstring>`;
+  - **8 个裸点全部补齐上下文日志并改调 `KVPackAbortWithReason`**:
+    - scatter `ProcessPrefetchRequest` omp 区内不变式(miss/loadSlot size 失配或超 mMaxLoadNum):补 mLogger ERROR(decodeStep/layerID/reqID/两个 size/mMaxLoadNum;mLogger 逐条 flush 且内部有 mutex,omp 区内调用线程安全);
+    - scatter `MergeAndCopyPrefetchLayer` 的 `BeginKVPackSlot`/`FinishKVPack` 失败(**即建议 3 的 KVPackWait 超时日志**——该两处是全部调用方):补日志注明"30s 超时,某 peer rank 卡死或已死亡",附 decodeStep/layerID/streamIdx/epoch/rank/tpSize,补齐"哪个 rank 在等谁"的诊断信息;
+    - pre `ValidateUCMMergeRequest` 三处不变式(miss/slot size 失配、缺 allBlocksHash/reqUseBlockTable 条目、finalLoadNum 超容量):各补 ERROR 带具体数值;
+    - pre `BuildUCMMergeBlockContexts` 负 missGlobalIds:补 ERROR 带索引与值;
+    - pre `InitPrefetchResultShm`(:538):`KVPackAbort(nullptr)` 改为 `KVPackAbortWithReason(mKVPackControl, ...)` + ERROR 日志——修复"连 fatalError 都不置"(`mKVPackControl` 懒初始化于首次 SubmitTask,构造期通常为 null,此时行为不差于旧版;已初始化则正确置位跨 rank 标志);
+  - `kvcache_log.h`:**反逻辑修复**——`if (mLogFile.is_open())` 改为 `if (!mLogFile.is_open())`,仅在真正打开失败时向 stderr 报文件名(原逻辑打开成功反报失败、打开失败反而无声,后者会让全部日志被 `log()` 的 `!is_open()` 早退静默吞掉);
+  - pre `ValidateUCMMergeRequest`:`mStoreV1_` 为空补 `return false;`(原先只 log 不 return,继续用空 store 走 `LoadUCMMergeHostAddress` → 未定义行为;`UCMTensorMerge` 对 false 返回已有失败兜底)。
+- **修复效果**:8 个死亡点现场三处可见——kvcache_pre 日志文件(死因+上下文)、stderr(reason 直写)、共享内存 fatalError(跨 rank);死亡不再静默,跨 rank 半死现场可定位。
+- **验证**:C++ 无法本地编译;新增 2 个 gtest death test(`KVPackAbortWithReason` 带/不带 header,断言 SIGABRT + stderr 匹配 reason 文本)及全部既有 UT 需随构建跑(death test 依赖 gtest fork 模式,Linux 标准支持)。
+
 
 ## H2【P0】`mStoreV1_->Wait` 无界阻塞 → 预取链路 / Python 主线程挂死
 

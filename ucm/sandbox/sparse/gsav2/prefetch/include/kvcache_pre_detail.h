@@ -9,7 +9,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 #include "ucmstore_v1.h"
@@ -55,6 +57,30 @@ extern "C" void __gcov_dump(void);
 
 [[noreturn]] inline void KVPackAbort(SharedKVPackHeader* header)
 {
+    if (header != nullptr) { header->fatalError.store(-1, std::memory_order_release); }
+#if defined(UCM_PREFETCH_COVERAGE)
+    // Flush coverage data before abort so death-test lines are counted.
+    __gcov_dump();
+#endif
+    std::abort();
+}
+
+// [H1] 带上下文的终止:abort 前先把 reason 直写 stderr——write(2) 绕过一切
+// 用户态缓冲,进程 stdio 缓冲不 flush 也不会丢;mLogger 只写文件不写 stderr,
+// 裸 abort 点原先死亡时现场两处(日志文件/stderr)都没有死因。fatalError
+// 置位语义与 KVPackAbort 一致(跨 rank 可见)。原 KVPackAbort 保留不动,
+// 已有前置日志的调用点零改动。
+[[noreturn]] inline void KVPackAbortWithReason(SharedKVPackHeader* header, const char* reason)
+{
+    if (reason != nullptr) {
+        const size_t len = std::strlen(reason);
+        if (len > 0) {
+            ssize_t written = ::write(STDERR_FILENO, reason, len);
+            (void)written;
+            written = ::write(STDERR_FILENO, "\n", 1);
+            (void)written;
+        }
+    }
     if (header != nullptr) { header->fatalError.store(-1, std::memory_order_release); }
 #if defined(UCM_PREFETCH_COVERAGE)
     // Flush coverage data before abort so death-test lines are counted.
