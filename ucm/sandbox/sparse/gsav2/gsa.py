@@ -2865,6 +2865,18 @@ class GSA(UcmSparseBase):
             )
 
     def init_kvcache_ptrs(self, kv_cache, indexer_cache, indexer_scale, layer_id):
+        # [F5 修复] warmup/profile 阶段 vLLM 以 kv_cache=None 调用(与 F4 同源),
+        # None[0]/len(None) 会抛 TypeError;判空跳过本层注册(kv_caches 保持
+        # None,后续真实 kv_cache 到达时正常注册)。用模块级 logger,避免依赖
+        # 仅 D 节点存在的 self.log。
+        if kv_cache is None or len(kv_cache) < 2:
+            logger.info(
+                "[GSA] init_kvcache_ptrs: skip layer %s (kv_cache is None or "
+                "len=%s < 2, warmup/profile phase?)",
+                layer_id,
+                None if kv_cache is None else len(kv_cache),
+            )
+            return
         if self.kv_caches[layer_id] is None:
             self.kv_caches[layer_id] = kv_cache
             self.indexer_k_cache_sparse[layer_id] = indexer_cache

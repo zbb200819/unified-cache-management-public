@@ -31,7 +31,7 @@
 | F3 | `req_sparsed_slots=None` 无判空 | P1 | 非 GSA 调度路径构造的 SchedulerOutput | sched_output_patch.py:20-23 | **是** | ✅ 已修复 |
 | F4 | `list(kv_cache)` 无判空 | P1 | warmup/profile 阶段 kv_cache=None | sfa_kv_transfer_patch.py:643,649 | **是** | ✅ 已修复 |
 | E5 | `attention_finished` gate 反转(行为回归) | P2 | PD 分离 D 节点 | gsa.py:1660 | 否(死代码) | ✅ 已修复 |
-| F5 | `init_kvcache_ptrs` 无判空直接索引 | P2 | kv_cache 为 None/空 | gsa.py:2771-2782 | **是** | 待修复 |
+| F5 | `init_kvcache_ptrs` 无判空直接索引 | P2 | kv_cache 为 None/空 | gsa.py:2771-2782 | **是** | ✅ 已修复 |
 | G1 | 跨文件隐式常量约定 | P2 | 修改任一常量 | sparse/utils.py:64-65 | **是** | 待修复 |
 
 > 注意:**A/B/C/D/F/G 类问题与是否开启 PD 分离无关,PD-mix 日常部署同样暴露在风险之下**;E 类仅在 PD 分离部署时进入执行路径(PD-mix 下 agent 不创建,是死代码)。
@@ -610,6 +610,13 @@ self.prefetch_engine.prefetch_engine_c.set_kvTensor_Layer(
 ```
 
 **修复建议**:入口断言 `kv_cache is not None and len(kv_cache) >= 2`。
+
+### ✅ 修复记录(F5)
+
+- **修复内容**(`gsa.py` `init_kvcache_ptrs`,:2867):入口新增判空——`kv_cache is None or len(kv_cache) < 2` 时 `logger.info`(模块级,不依赖仅 D 节点存在的 `self.log`)+ return,跳过本层注册。
+- **修复原因**:vLLM 在 warmup/profile/dummy run 阶段以 `kv_cache=None` 调用 attention 层初始化钩子(与 F4 同源);旧代码无条件 `kv_cache[0]`/`kv_cache[1]` → `None[0]` 抛 `TypeError` → 启动/预热期崩溃。跳过后 `kv_caches[layer_id]` 保持 None,后续真实 kv_cache 到达时正常注册(`if self.kv_caches[layer_id] is None` 条件依旧成立),无状态残留。
+- **与 F4 的关系**:同根因(vLLM 原生对 None 的处理是跳过 cache 相关逻辑),F4 守护 `list(kv_cache)` 调用点,F5 守护本注册入口,两者互补。
+- **验证**:`ast.parse` 语法通过;warmup/profile 冒烟(此前必崩路径)。
 
 ---
 
