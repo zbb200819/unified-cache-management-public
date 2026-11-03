@@ -161,7 +161,10 @@ def forward(
     )[0]
 
     del o_proj_input
-    maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+    # [F4 修复] warmup/profile 阶段 vLLM 传入 kv_cache=None,
+    # list(None) 会抛 TypeError;None 时跳过保存。
+    if kv_cache is not None:
+        maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
     return output_padded
 
 

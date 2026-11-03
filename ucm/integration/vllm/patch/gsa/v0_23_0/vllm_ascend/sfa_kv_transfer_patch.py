@@ -640,13 +640,18 @@ def forward(
             should_shard_weight=full_gather_o_proj_enabled,
         )
         if not require_o_proj_forward:
-            maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+            # [F4 修复] warmup/profile 阶段 vLLM 传入 kv_cache=None,
+            # list(None) 会抛 TypeError;None 时跳过保存(与 vLLM 原生行为一致)。
+            if kv_cache is not None:
+                maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
             return result
         attn_output = result
 
     output[...] = self.o_proj(attn_output)[0]
 
-    maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+    # [F4 修复] 同上:kv_cache 为 None 时跳过。
+    if kv_cache is not None:
+        maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
     return output_padded
 

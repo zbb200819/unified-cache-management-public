@@ -29,7 +29,7 @@
 | E3 | `_load_kv_dram` 超时静默 KV 空洞 + 阻塞 hang | P1 | PD 分离 D 节点 + lookup 超时 | gsa.py:2575-2587 | 否(死代码) | ✅ 已修复 |
 | E4 | `_ensure_store_injected` 非异常静默失败 | P1 | connector/store 未就绪 | gsa.py:955-974 | 否(死代码) | ✅ 已修复 |
 | F3 | `req_sparsed_slots=None` 无判空 | P1 | 非 GSA 调度路径构造的 SchedulerOutput | sched_output_patch.py:20-23 | **是** | ✅ 已修复 |
-| F4 | `list(kv_cache)` 无判空 | P1 | warmup/profile 阶段 kv_cache=None | sfa_kv_transfer_patch.py:643,649 | **是** | 待修复 |
+| F4 | `list(kv_cache)` 无判空 | P1 | warmup/profile 阶段 kv_cache=None | sfa_kv_transfer_patch.py:643,649 | **是** | ✅ 已修复 |
 | E5 | `attention_finished` gate 反转(行为回归) | P2 | PD 分离 D 节点 | gsa.py:1660 | 否(死代码) | 待修复 |
 | F5 | `init_kvcache_ptrs` 无判空直接索引 | P2 | kv_cache 为 None/空 | gsa.py:2771-2782 | **是** | 待修复 |
 | G1 | 跨文件隐式常量约定 | P2 | 修改任一常量 | sparse/utils.py:64-65 | **是** | 待修复 |
@@ -496,6 +496,16 @@ maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))   # ← 无条件�
 **原因**:补丁后的 MLA/SFA forward 里,两处无条件 `list(kv_cache)`。vLLM 在 warmup / profile / dummy run 阶段传入 `kv_cache=None` → `list(None)` 抛 `TypeError: 'NoneType' object is not iterable` → 启动/预热期崩溃。函数内无 `kv_cache is None` 保护(已 grep 确认)。
 
 **修复建议**:`if kv_cache is None: return`(或提前早退整段 GSA 逻辑)。
+
+### ✅ 修复记录(F4)
+
+- **修复内容**(守在调用点——`list(kv_cache)` 在函数调用前求值,函数内部判空救不了):
+  1. `v0_23_0/vllm_ascend/sfa_kv_transfer_patch.py`:补丁后 forward 内两处调用点(`:643` o_proj 分支早退处、`:649` 函数尾部)各包一层 `if kv_cache is not None`;
+  2. `v0.23.0_pmr/vllm_ascend/sfa_kv_transfer_patch.py`:同样两处;
+  3. `v0.23.0_pmr/vllm_ascend/mla_v1_patch.py:164`:同款一处。
+- **修复原因**:vLLM 在 warmup / profile / dummy run 阶段以 `kv_cache=None` 调用 attention 层(vLLM 原生 forward 对 None 的处理就是跳过 cache 写);补丁后的 forward 无条件 `list(kv_cache)` → `list(None)` 抛 `TypeError: 'NoneType' object is not iterable` → 启动/预热期崩溃。跳过保存与 vLLM 原生语义一致(无 cache 即无 KV 可存)。
+- **验证**:三个文件 `ast.parse` 语法通过;warmup/profile 冒烟(此前必崩路径)。
+- **备注**:未改动 `maybe_save_kv_layer_to_connector` 本体签名(其余调用方均传 list);如后续希望函数自防御,可加 `if not kv_cache_layer: return` 前置,但调用点的 `list(None)` 崩溃仍需调用点判空,故以调用点为准。
 
 ---
 
