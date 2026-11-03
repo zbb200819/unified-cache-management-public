@@ -20,7 +20,7 @@
 | E1 | P 节点 `init_dsa_data` AttributeError 启动崩溃 | **P0** | PD 分离 P 节点 | gsa.py:1892-1905 | 否(死代码) | ✅ 已修复 |
 | F1 | `when_imported` 单次触发保护静默丢弃后续补丁钩子 | **P0** | 同一模块注册两个补丁 | patch/utils.py:96-100 | **是** | ✅ 已修复 |
 | F2 | `indexer_select_post_process` 重复定义相互覆盖 | **P0** | v0.23.0_pmr 补丁生效时 | v0.23.0_pmr/.../device_op_patch.py:13,188 | **是** | ✅ 已修复 |
-| A3 | 老引擎 freeBlockPtr 裸写无界 | P1 | 行宽与表大小错配 | sparse/gsa/.../kvcache_pre.cpp:432 | 是(老引擎) | 待修复 |
+| A3 | 老引擎 freeBlockPtr 裸写无界 | P1 | 行宽与表大小错配 | sparse/gsa/.../kvcache_pre.cpp:432 | 是(老引擎) | ✅ 已修复 |
 | B2 | 块 ID 陈旧 → 跨请求并发踩写 | P1 | 请求抢占/完成时 DMA 在途 | kvcache_pre_scatter.cpp:1305-1313 | **是** | 待修复 |
 | B3 | 裸指针 use-after-free 风险 | P1 | Python 张量先于 C++ 释放 | pybinds.cpp:143-148 + gsa.py:1544-1546 | **是** | ✅ 已修复 |
 | C1 | C++ map 跨线程并发读写无锁 | P1 | Python 写 API 与预取线程同时活跃 | kvcache_pre_scatter.cpp:1167-1171 附近 | **是** | ✅ 已修复 |
@@ -159,6 +159,18 @@ if (change_len <= mtpToken - 1) {     // ← 只处理"过小"
 **原因**:写入长度上限完全依赖 Python 侧 freeBlock 张量行宽与 `mDocsTables[reqID][i]` 表大小的隐式一致,任何尺寸错配即静默越界。
 
 **修复建议**:传入 freeBlock 行容量并在循环内断言;或改写为带长度参数的安全接口。
+
+### ✅ 修复记录(A3)
+
+- **修复内容**(`sparse/gsa/prefetch/src/kvcache_pre.cpp` `RunOneBsPrefetch`,:404 omp 循环内):
+  1. 循环体开头取真实行容量:`const int64_t freeBlockCapacity = mFreeBlock[i][bsIndex].numel()`(不依赖任何外部常量,Python 侧行宽怎么构造都对);
+  2. 写入 `freeBlockPtr[oneFreeBlockIndex]` 前校验 `oneFreeBlockIndex >= freeBlockCapacity` → `mLogger.log(ERROR, ...)`(带 layer/bsIndex/docs 表大小/容量上下文)+ `std::abort()`。
+- **修复原因**:
+  - 写入循环的长度上限完全由 `mDocsTables[reqID][i]` 遍历决定(排除 hit 块后的剩余块数),对 `mFreeBlock` 行宽零校验——行宽与表大小错配时每多写一个元素踩 4 字节宿主内存,且在 **16 线程 omp 并行区内**(同时越界写多层),堆损坏极难归因;
+  - 读取方 `RunPrefetchH2D`(:374-382)以 `mFreeBlockLen` 为上界、语义自洽,错配只会发生在写入侧;
+  - **风格选择**:omp 区内抛异常是 UB,老引擎既定风格是 `mLogger.log(ERROR) + std::abort()`(同文件 `CheckInputIndex` :188-196 一致);abort 带上下文优于 clamp——clamp 会掩盖错配并让后续层继续用错误数据。
+- **影响面**:正常运行(docs 表未 hit 块数 ≤ 行宽)校验恒不触发,零行为变化;仅错配场景从"静默堆踩写"变为"带上下文立即中止"。
+- **验证**:需随 C++ 构建跑(老引擎 `sparse/gsa` 独立编译);单测可构造 docs 表大于行宽的用例断言 abort(仿 `test_abort_paths` 风格)。
 
 ---
 

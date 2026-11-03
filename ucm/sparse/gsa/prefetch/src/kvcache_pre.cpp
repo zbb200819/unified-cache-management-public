@@ -405,6 +405,13 @@ void GSAPrefetchEngineC::RunOneBsPrefetch(std::string reqID, int topkLen, int bs
     for (int i = 0; i < mLayerNum; i++) {
         mLoadSuccessBlocks[i][bsIndex].fill_(0);
         int* freeBlockPtr = mFreeBlock[i][bsIndex].data_ptr<int>();
+        // [A3 防御] freeBlockPtr 行容量:本层本请求行最多可容纳的 free block 数。
+        // 写入循环以 mDocsTables 遍历为准、无上界;行宽(Python 侧按
+        // max_block_num 预留)与 docs 表大小错配时每多写一个元素踩 4 字节
+        // 宿主内存(16 线程并发越界写)。读取方 RunPrefetchH2D 以 mFreeBlockLen
+        // 为上界,写入方必须在容量处截断/中止。omp 区内不能抛异常,按本引擎
+        // CheckInputIndex 的既定风格 abort(带上下文,不静默 clamp 掩盖错配)。
+        const int64_t freeBlockCapacity = mFreeBlock[i][bsIndex].numel();
         std::unordered_set<int> hitBlocks;
         std::map<int, int> hitBlocksIdx;
         std::vector<int> missIdxs;
@@ -429,6 +436,16 @@ void GSAPrefetchEngineC::RunOneBsPrefetch(std::string reqID, int topkLen, int bs
             if (hitBlocksIdx.find(it->first) != hitBlocksIdx.end()) {
                 continue;
             } else {
+                if (oneFreeBlockIndex >= freeBlockCapacity) {
+                    mLogger.log(LogLevel::ERROR,
+                                 "Decode step: %u, Rank: %d, [ERROR] freeBlock row overflow: "
+                                 "layer %d, bsIndex %d, need >= %d free slots, capacity %d "
+                                 "(docs table larger than free_block row width?)\n",
+                                 mDecodeStep, mRank, i, bsIndex,
+                                 static_cast<int>(mDocsTables[reqID][i].size()),
+                                 static_cast<int>(freeBlockCapacity));
+                    std::abort();
+                }
                 freeBlockPtr[oneFreeBlockIndex] = it->second;
                 oneFreeBlockIndex += 1;
             }
