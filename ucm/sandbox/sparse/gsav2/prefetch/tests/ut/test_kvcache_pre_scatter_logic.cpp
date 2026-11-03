@@ -102,6 +102,9 @@ protected:
         // Allocate enough int32 storage for the block table result.
         engine->mIndexerLoadResultT[reqID] = torch::full(
             {static_cast<int64_t>(docsTableContents.size() + 8)}, -1, torch::dtype(torch::kInt32));
+        // [I11] Keep the global memcpy bound consistent with the seeded tensor
+        // size (production sets it in SetIndexerMap from dsaSBT.sizes()[1]).
+        engine->mIndexerSparseLen = static_cast<uint32_t>(docsTableContents.size() + 8);
     }
 };
 
@@ -346,6 +349,33 @@ TEST_F(ScatterLogicTest, FinishOneLayerPrefetchRefillsPrefetchIdxWithNonHits)
     EXPECT_EQ(refillIdx, (std::vector<int>{1, 3}));
 }
 
+TEST_F(ScatterLogicTest, FinishOneLayerPrefetchDegradesWhenHitsExceedCapacity)
+{
+    /* [I11] 增块路径(add-path)不扩容 mPrefetchBlockTableIdx / mIndexerLoadResultT:
+     * hit 数超过 mPrefetchBlockTableIdx 容量时只写前 capacity 个(此前 [pairIdx]
+     * 直接越界写 vector<int>);blockTableResult 超过 mIndexerSparseLen 时跳过
+     * memcpy(此前越界拷设备张量)。对齐 SetIndexerMapForLayer 初始化路径的
+     * 降级模式。 */
+    engine = MakeEngine(/*layerNum=*/1);
+    SeedBlockTables("req1", /*layerNum=*/1, /*docsTableContents=*/{100, 200, 300});
+    // Simulate the add-path state: fixed capacities smaller than the hit count.
+    engine->mPrefetchBlockTableIdx["req1"][0].resize(2);  // capacity 2
+    engine->mIndexerSparseLen = 2;  // result-tensor row capacity 2
+    std::map<int, int> hitBlocksIdx{
+        {0, 100},
+        {1, 200},
+        {2, 300}
+    };  // 3 hits > both capacities
+    std::vector<int> missIdxs;
+    engine->FinishOneLayerPrefetch("req1", /*layerID=*/0, hitBlocksIdx, missIdxs);
+    // Only the first 2 (of 3) hits are written into the capacity-2 vector.
+    EXPECT_EQ(engine->mPrefetchBlockTableIdx["req1"][0], (std::vector<int>{0, 1}));
+    // memcpy skipped: the seeded tensor keeps its -1 fill.
+    auto result = engine->mIndexerLoadResultT["req1"].clone();
+    EXPECT_EQ(result[0].item<int>(), -1);
+    EXPECT_EQ(result[1].item<int>(), -1);
+}
+
 /* ---------------- SetTopkIndices ---------------- */
 
 TEST_F(ScatterLogicTest, SetTopkIndicesStoresTensorPerReqID)
@@ -397,6 +427,32 @@ TEST_F(ScatterLogicTest, GetSparseSeqLenReturnsZeroForUnknownReqID)
     engine = MakeEngine(/*layerNum=*/1);
     // operator[] default-constructs an int = 0 for unknown keys.
     EXPECT_EQ(engine->GetSparseSeqLen("ghost"), 0);
+}
+
+TEST_F(ScatterLogicTest, GetAccessorsReturnDefaultsForUnknownReqIDAndLayer)
+{
+    /* [I12] Get* 此前完全无锁 + operator[](缺键时向 map 插入空容器,
+     * 随后 [layerID] 越界 / 解引用空 unique_ptr)。现在:缺 reqID 或越界
+     * layerID 一律返回缺省值,且不在 map 中残留空条目(find-only)。 */
+    engine = MakeEngine(/*layerNum=*/2);
+    engine->mHBMMangers["req1"].push_back(std::make_unique<HBMManager>());
+    // Unknown reqID: all accessors return defaults.
+    EXPECT_EQ(engine->GetTokenBlockMap(0, "ghost"), (std::vector<int>{}));
+    EXPECT_EQ(engine->GetBlockTokenMap(0, "ghost"), (std::vector<int>{}));
+    EXPECT_TRUE(engine->GetIndexerTokensMap(0, "ghost").empty());
+    EXPECT_TRUE(engine->GetIndexerBlockMap(0, "ghost").empty());
+    EXPECT_EQ(engine->GetReqUseBlockTable("ghost"), (std::vector<int>{}));
+    EXPECT_EQ(engine->GetSparseSeqLen("ghost"), 0);
+    // find-only: the ghost key must not be inserted into any map.
+    EXPECT_EQ(engine->mHBMMangers.count("ghost"), 0u);
+    EXPECT_EQ(engine->mSparseSeqLen.count("ghost"), 0u);
+    EXPECT_EQ(engine->mReqUseBlockTable.count("ghost"), 0u);
+    // Out-of-range / negative layerID on an existing reqID: defaults,
+    // no OOB access on the (short) per-layer vector.
+    EXPECT_EQ(engine->GetTokenBlockMap(5, "req1"), (std::vector<int>{}));
+    EXPECT_EQ(engine->GetTokenBlockMap(-1, "req1"), (std::vector<int>{}));
+    EXPECT_EQ(engine->GetBlockTokenMap(5, "req1"), (std::vector<int>{}));
+    EXPECT_TRUE(engine->GetIndexerTokensMap(5, "req1").empty());
 }
 
 /* ---------------- DelReqIDRun integration ---------------- */

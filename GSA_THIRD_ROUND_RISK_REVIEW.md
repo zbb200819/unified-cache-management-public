@@ -20,13 +20,13 @@
 | I3 | preempt 路径先 free 后 drain,与正常路径顺序相反 | P1 | 抢占时预取任务在飞 + 块被重分配 | gsa.py:1779-1786 | ✅ 已修复 |
 | I4 | cal_indexer_topk_blocks 覆写与 indexer 线程共享的 numpy 视图 | P1 | IS_INDEXER_OFFLOAD + 加载跨步 | gsa.py:2133-2135 / 2208-2210 | ✅ 已修复 |
 | I5 | "仅日志不拦截"链:脏 token → 越界 slot → 设备索引越界 | P1 | mRealTimeIdx 过期 / topk 脏数据 | pre:900-915 + hbm_manger:101-108 | ✅ 已修复 |
-| I6 | TokenIndexMapInter 无锁读 mRealTimeIdx/mSeqLen(C1 只修写侧) | P1 | 预取任务运行中 SubmitTask/DelReqIDRun 并发 | pre:892-917 vs scatter:1226-1228 | 待修复 |
-| I7 | mAllTopkIndicesTensor 跨锁域:worker memcpy vs SetTopkIndices 替换 | P1 | 新请求接入时预取在飞 | scatter:342 vs 1290-1291 | 待修复 |
-| I8 | mAllBlocksHash/mLastKVBlockAddress 跨锁域:find/at vs 重赋值 | P1 | SetBlocksMap 与预取并发 | pre:1383/1666 vs 649-656 | 待修复 |
-| I9 | SetKvTensor/SetKvBuffer 无锁替换张量 + aclTensor 覆盖泄漏 | P1 | KV cache 重分配时任务在飞 | scatter:1114-1137 | 待修复 |
-| I10 | 预取结果 shm 偏移无 i < mMaxBs 校验 → OOB 写共享内存 | P1 | batch 超配置 mMaxBs | scatter:352 / pre:531 | 待修复 |
-| I11 | 增块路径写 mPrefetchBlockTableIdx/mIndexerLoadResultT 无容量校验 | P1 | 活跃块数增长超初始容量 | scatter:667 / 671-672 | 待修复 |
-| I12 | Get* 访问器无锁 + operator[] 插入 + 空指针解引用 | P1 | 任务在飞或请求已删时 Python 查询 | scatter:1498-1523 | 待修复 |
+| I6 | TokenIndexMapInter 无锁读 mRealTimeIdx/mSeqLen(C1 只修写侧) | P1 | 预取任务运行中 SubmitTask/DelReqIDRun 并发 | pre:892-917 vs scatter:1226-1228 | ✅ 已修复 |
+| I7 | mAllTopkIndicesTensor 跨锁域:worker memcpy vs SetTopkIndices 替换 | P1 | 新请求接入时预取在飞 | scatter:342 vs 1290-1291 | ✅ 已修复 |
+| I8 | mAllBlocksHash/mLastKVBlockAddress 跨锁域:find/at vs 重赋值 | P1 | SetBlocksMap 与预取并发 | pre:1383/1666 vs 649-656 | ✅ 已修复 |
+| I9 | SetKvTensor/SetKvBuffer 无锁替换张量 + aclTensor 覆盖泄漏 | P1 | KV cache 重分配时任务在飞 | scatter:1114-1137 | ✅ 已修复 |
+| I10 | 预取结果 shm 偏移无 i < mMaxBs 校验 → OOB 写共享内存 | P1 | batch 超配置 mMaxBs | scatter:352 / pre:531 | ✅ 已修复 |
+| I11 | 增块路径写 mPrefetchBlockTableIdx/mIndexerLoadResultT 无容量校验 | P1 | 活跃块数增长超初始容量 | scatter:667 / 671-672 | ✅ 已修复 |
+| I12 | Get* 访问器无锁 + operator[] 插入 + 空指针解引用 | P1 | 任务在飞或请求已删时 Python 查询 | scatter:1498-1523 | ✅ 已修复 |
 | I13 | get_model_input 静默 del 旧 stat:池 slot 永久泄漏 + C++ map 残留 | P2 | 同 req_id 重调度残留旧条目 | gsa.py:459-461 | 待修复 |
 | I14 | set_modelrunning_status(True) 无 try/finally,异常路径闸门永久卡死 | P2 | begin→finished 之间任何异常 | gsa.py:1834 / 2334 | 待修复 |
 | I15 | MTP + rec_result=None 时陈旧 topk 静默提交 | P2 | spec>1 且调用方未传 rec_result | gsa.py:2389-2412 | 待修复 |
@@ -140,6 +140,19 @@ worker             → 取走 B 立即执行(B 全程标志为 false,无人再�
 **修复方向**:三处改为 fail-loud(抛异常/abort)或 fail-safe(跳过该 token 并计数);最低成本:①② 在越界时 `continue` 跳过该 token,③ 越界时写 -1(下游已有负值过滤)。
 
 ## I6【P1】TokenIndexMapInter 无锁读 mRealTimeIdx/mSeqLen(C1 修复的读侧缺口)
+
+> **✅ I6~I12 修复记录(第三批 P1:并发 UB,统一锁序 token→mMutexUseToken → req→mUpdateReqMutex)**
+>
+> - **I6(读侧持锁)**:`TokenIndexMapInter` 重写——临界区内 `find` 定位 `mRealTimeIdx[reqID][layerID]` 并**拷贝**本地副本 + 读 `mSeqLen`(find 替代 operator[],缺键不残留空条目;出锁后使用本地副本,避免 DelReqIDRun erase 造成悬挂引用);缺 reqID/layerID 时 realTimeIdx 为空 → 全部 token 走 I5 越界分支置 -1。临界区仅 map 查找与 vector 拷贝(omp 多层并行下的串行化开销可接受);
+> - **I7(SetTopkIndices 双锁)**:新增 `mMutexUseToken`(token→req 双锁)——worker omp 区内 memcpy 与 Python 整体赋值替换(旧 Tensor 引用计数归零立即释放,UAF)串行化;
+> - **I8(SetBlocksMap/SetLastIndexerBlock 双锁)**:二函数在既有 `mUpdateReqMutex` 之外新增 `mMutexUseToken`(C1 只对齐了 indexer 线程,主预取 worker 的 `mAllBlocksHash.at`/`mLastKVBlockAddress.find` 读路径仍跨锁域;unordered_map 重赋值/插入可引发 rehash 使 worker 迭代器失效);
+> - **I9(KV 张量替换三函数)**:`SetKvTensor`/`SetKvTensorIndex`/`SetKvBuffer` 均加 `mMutexUseToken`(与 KVCacheInplaceScatter/H2D 拷贝路径的 worker 串行);`SetKvTensor` 覆盖前 `ReleaseAclTensor` 旧 `mKCacheAcl`/`mVCacheAcl`(对齐 PrepareScatterAclTensor 先 Release 模式;V 侧仅在 `!mISSPAC8` 时 Release——`mVCacheAcl` 只在该模式 resize,避免 c8 下越界访问);
+> - **I10(SubmitTask fail-loud)**:入口校验 `reqIDList.size() <= mMaxBs`,超限记 ERROR 日志并抛 `std::out_of_range`(pybind 上抛 Python 可见),不再带着越界 shm 偏移走完预取链;
+> - **I11(增块路径容量校验)**:`FinishOneLayerPrefetch` 对齐初始化路径(pre:841-859)降级模式——`mPrefetchBlockTableIdx` 逐元素带容量检查(超限跳过写 + 一次性 ERROR 日志);`mIndexerLoadResultT` memcpy 前校验 `blockTableResult.size() <= mIndexerSparseLen`,超限只打日志不拷贝;
+> - **I12(Get* 访问器加固)**:六个访问器统一双锁 + `find` + 判空,缺 reqID/越界 layerID 返回缺省值(空容器/0)且不在 map 残留空条目;`mHBMMangers` 路径另加 `unique_ptr` 判空;
+> - **死锁论证**:本批所有新增加锁遵循全局锁序 token→req;`TokenIndexMapInter` 的调用链(worker 持 token → 取 req)、Python 各 Set*/Get* 入口(无嵌套)方向一致,无锁环;`LastChunkMove`(SetTokensMap 临界区内读 `mLastKVBlockAddress`)与双锁化的 SetBlocksMap 经 token 锁互斥;
+> - **测试**:新增 4 个 UT——`SubmitTaskRejectsBatchExceedingMaxBs`(I10,MakeEngine maxBs=2 传 3 req 断言 throw)、`FinishOneLayerPrefetchDegradesWhenHitsExceedCapacity`(I11,容量 2 + 3 hits 断言只写前 2 个且 memcpy 跳过)、`GetAccessorsReturnDefaultsForUnknownReqIDAndLayer`(I12,ghost reqID/越界 layerID 返回缺省 + find-only 不残留);SeedBlockTables 补设 `mIndexerSparseLen`(与 seeded tensor 尺寸一致,保持既有测试走正常 memcpy 分支)。
+> - **验证**:C++ 无法本地编译,UT 需随构建跑;TSAN 下高频 SubmitTask + SetBlocksMap/SetTopkIndices/Get* 并发打锁域窗口。
 
 C1 修复只覆盖了写侧(SubmitTask 持 mUpdateReqMutex 拷贝,scatter:1226-1228)。读侧在预取 worker(仅持 mMutexUseToken)经 `ProcessPrefetchRequest`→`TokenIndexMapInter`(omp 并行区内)读 `mRealTimeIdx[reqID][layerID]` 与 `mSeqLen[reqID]`,与写方(SubmitTask)、删方(DelReqIDRun,持 mUpdateReqMutex)均无公共锁 → 并发 std::map 读写 UB。修复方向:读侧同样持 mUpdateReqMutex(临界区仅为 vector 读取,开销可接受),或随 I1 统一锁域。
 

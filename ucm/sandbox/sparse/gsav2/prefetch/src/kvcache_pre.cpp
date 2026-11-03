@@ -647,6 +647,12 @@ void GSAPrefetchEngineC::SetBlocksMap(const std::string& reqID,
     // (UCMIndexerLoadAsync,IndexerLoadProcess 持 mUpdateReqMutex)与 DelReqIDRun
     // (worker 线程持 mUpdateReqMutex)并发访问,Python 线程写入必须持同一把锁,
     // 否则 std::map 一边遍历一边插入/删除是 UB(堆损坏)。
+    // [I8] 主预取 worker(持 mMutexUseToken)在 GetHitAndMissBlock/UCM merge 等
+    // 路径读 mAllBlocksHash.at/mLastKVBlockAddress.find,与本写路径(仅持
+    // mUpdateReqMutex)无公共锁——unordered_map 重赋值/插入可引发 rehash,
+    // 使 worker 的迭代器失效。双锁(锁序 token→req,同全局约定)与 worker
+    // 及 indexer 两侧均串行。
+    std::lock_guard<std::mutex> tokenLock(mMutexUseToken);
     std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     if (blockIdxs.size() != kAddrs.size()) {
         mLogger.log(LogLevel::ERROR, "|SetBlocksMap| kAddrs size mismatch\n");
@@ -672,6 +678,9 @@ void GSAPrefetchEngineC::SetLastIndexerBlock(const std::string& reqID,
 {
     if (!mOpenIndexerOffload) { return; }
     // [C1 修复] 同 SetBlocksMap:mLastKVBlockAddress 与 indexer 工作线程并发访问。
+    // [I8] 双锁(锁序 token→req):主预取 worker(持 mMutexUseToken)在 UCM merge /
+    // LastChunkMove 路径读 mLastKVBlockAddress.find,与本写路径无公共锁。
+    std::lock_guard<std::mutex> tokenLock(mMutexUseToken);
     std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     if (blockIdxs.size() != indexerAddrs.size()) {
         mLogger.log(LogLevel::ERROR, "[ERROR] SetLastIndexerBlocks size mismatch, reqID=%s\n",
@@ -903,29 +912,48 @@ void GSAPrefetchEngineC::TokenIndexMapInter(std::vector<int>& oneTopkList, int b
                                             int topkLen, std::string reqID)
 {
     if (!mOpenIndexerOffload) { return; }
+    // [I6] 读侧持 mUpdateReqMutex:写方(SubmitTask 拷贝 mRealTimeIdx/mSeqLen、
+    // SetIndexerMap clear、UpdateIndexerMap emplace/pop)与删方(DelReqIDRun,
+    // 双锁)均持本锁;本函数此前运行于预取 worker(仅持 mMutexUseToken),
+    // 与写方/删方无公共锁,并发 std::map 读写是 UB(C1 只修了写侧)。
+    // find 替代 operator[](缺键不再残留空条目);vector 在临界区内完成拷贝,
+    // 出锁后使用本地副本——DelReqIDRun 的 erase 会使 map 节点引用失效。
+    // 缺 reqID/layerID 时 realTimeIdx 为空 → 全部 token 走 [I5] 越界分支置 -1。
+    std::vector<int> realTimeIdx;
+    int seqLen = 0;
+    {
+        std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+        auto reqIt = mRealTimeIdx.find(reqID);
+        if (reqIt != mRealTimeIdx.end() && layerID >= 0 &&
+            static_cast<size_t>(layerID) < reqIt->second.size()) {
+            realTimeIdx = reqIt->second[layerID];
+        }
+        auto seqIt = mSeqLen.find(reqID);
+        if (seqIt != mSeqLen.end()) { seqLen = seqIt->second; }
+    }
     for (int j = 0; j < topkLen; j++) {
         int ori = oneTopkList[j];
         int slot = oneTopkList[j] % mBlockSize;
         uint32_t revIdx = oneTopkList[j] / mBlockSize;
-        if (revIdx >= mRealTimeIdx[reqID][layerID].size()) {
+        if (revIdx >= realTimeIdx.size()) {
             mLogger.log(LogLevel::ERROR,
                         "[ERROR] revIdx >= mRealTimeIdx[reqID][layerID].size()!!! "
                         "req_id: %s, layer_id %d, ori token %d, revIdx %d, mRealTimeIdx size %d\n",
-                        reqID.c_str(), layerID, ori, revIdx, mRealTimeIdx[reqID][layerID].size());
+                        reqID.c_str(), layerID, ori, revIdx, realTimeIdx.size());
             // [I5] fail-safe:越界索引不再继续下标访问(std::vector operator[]
             // 无检查,OOB 读 UB 且拿到垃圾 idx 污染后续链路),置 -1 交给下游
             // 过滤(HBMManager 对 gid<0 记日志跳过;buildTopkOutput 对负值跳过)。
             oneTopkList[j] = -1;
             continue;
         }
-        int idx = mRealTimeIdx[reqID][layerID][oneTopkList[j] / mBlockSize];
+        int idx = realTimeIdx[oneTopkList[j] / mBlockSize];
         oneTopkList[j] = idx * mBlockSize + slot;
-        if (oneTopkList[j] < 0 || oneTopkList[j] >= mSeqLen[reqID]) {
+        if (oneTopkList[j] < 0 || oneTopkList[j] >= seqLen) {
             mLogger.log(LogLevel::ERROR,
                         "[ERROR] Decode step: %u Trans topk is < 0 !!! "
                         "layer_id %d, ori token %d, new token %d, block_index %d, "
                         "idx: %d seq_len: %d for reqID %s\n",
-                        mDecodeStep, layerID, ori, oneTopkList[j], revIdx, idx, mSeqLen[reqID],
+                        mDecodeStep, layerID, ori, oneTopkList[j], revIdx, idx, seqLen,
                         reqID.c_str());
             // [I5] fail-safe:脏 token 置 -1 交给下游过滤,不再继续传播(越界
             // gid 会在 HBMManager 走 pinned 分支得到越界 slot 值并传到设备索引)。

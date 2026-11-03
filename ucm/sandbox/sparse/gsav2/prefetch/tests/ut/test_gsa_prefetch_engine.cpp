@@ -7,6 +7,7 @@
  * init is driven with rank 0 and a unique dp-rank per test.
  */
 #include <gtest/gtest.h>
+#include <stdexcept>
 #include <thread>
 #include "../common/mock_store_v1.h"
 #include "../common/test_fixture.h"
@@ -390,6 +391,27 @@ TEST_F(GSAEngineTest, FinishPrefetchTaskRunsDeferredDeletionAndResetsCount)
     EXPECT_EQ(engine_->mPrefetchTaskCount.load(), 0);
     EXPECT_FALSE(engine_->mIsPrefetchRunning.load());
     EXPECT_EQ(engine_->mSparseSeqLen.count("req1"), 0u);  // deferred delete ran
+}
+
+/* ---- SubmitTask batch bound (I10) ---- */
+
+TEST_F(GSAEngineTest, SubmitTaskRejectsBatchExceedingMaxBs)
+{
+    /* [I10] fail-loud:单步 batch 超过配置 mMaxBs(MakeEngine 用 maxBs=2)时
+     * 拒绝提交——预取结果 shm 偏移 (i * mTopkIndexerNum + layerID) * totalSize
+     * 中 i 无上界校验,越界 batch 会 memcpy 越出 mmap 区踩踏相邻映射。
+     * 此前无任何校验。 */
+    engine_ = MakeEngine();
+    std::vector<int> topkLensInput = {1, 1, 1};
+    std::vector<int> bsIndexInput = {0, 1, 2};
+    std::vector<std::string> reqIDList = {"r1", "r2", "r3"};
+    torch::Tensor topkLists = torch::zeros({1, 3, 4});
+    std::vector<bool> isIndexerOffload = {false, false, false};
+    std::vector<int> seqLens = {16, 16, 16};
+    EXPECT_THROW(
+        engine_->SubmitTask(topkLensInput, bsIndexInput, reqIDList, topkLists, isIndexerOffload,
+                            seqLens, /*stepTime=*/1),
+        std::out_of_range);
 }
 
 TEST_F(GSAEngineTest, IndexerStatusFlagReflectsAtomic)

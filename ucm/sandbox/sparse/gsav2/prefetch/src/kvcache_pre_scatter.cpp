@@ -661,15 +661,36 @@ void GSAPrefetchEngineC::FinishOneLayerPrefetch(const std::string& reqID, int la
     }
     std::sort(sortResult.begin(), sortResult.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
+    // [I11] 增块路径容量校验(对齐 SetIndexerMapForLayer 初始化路径 pre:841-859
+    // 的降级模式):mPrefetchBlockTableIdx[reqID][layerID] 容量固定为 SetIndexerMap
+    // 初始化时的 oneDsaSparseBlock.size(),增块路径(update_indexer_map("add") /
+    // AddIndexerMap)不扩容;超限部分打日志跳过,避免越界写 vector<int>(堆损坏)。
+    const size_t blockTableIdxCapacity = mPrefetchBlockTableIdx[reqID][layerID].size();
     int32_t pairIdx = 0;
     for (auto onePair : sortResult) {
         blockTableResult.emplace_back(onePair.second);
-        mPrefetchBlockTableIdx[reqID][layerID][pairIdx] = onePair.first;
+        if (static_cast<size_t>(pairIdx) < blockTableIdxCapacity) {
+            mPrefetchBlockTableIdx[reqID][layerID][pairIdx] = onePair.first;
+        } else if (static_cast<size_t>(pairIdx) == blockTableIdxCapacity) {
+            mLogger.log(LogLevel::ERROR,
+                        "[ERROR] hit blocks %lu exceed mPrefetchBlockTableIdx capacity %lu, "
+                        "layer_id %d, reqID %s (add-path does not grow capacity)\n",
+                        sortResult.size(), blockTableIdxCapacity, layerID, reqID.c_str());
+        }
         pairIdx += 1;
     }
     LoadKVToHBM(allNeedLoadBlock[reqID][layerID], missIdxs, layerID, reqID);
-    std::memcpy(mIndexerLoadResultT[reqID][layerID].data_ptr(), blockTableResult.data(),
-                successIndex * sizeof(int));
+    // [I11] mIndexerLoadResultT[reqID][layerID] 容量固定为 mIndexerSparseLen,
+    // 同样不在增块路径扩容;超限降级(日志、不 memcpy),避免越界写设备张量。
+    if (static_cast<size_t>(mIndexerSparseLen) < blockTableResult.size()) {
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] mIndexerLoadResultT greater than mIndexerSparseLen !!! "
+                    "layer_id %d, mIndexerSparseLen: %u, loadResult size %lu\n",
+                    layerID, mIndexerSparseLen, blockTableResult.size());
+    } else {
+        std::memcpy(mIndexerLoadResultT[reqID][layerID].data_ptr(), blockTableResult.data(),
+                    blockTableResult.size() * sizeof(int));
+    }
     mPrefetchIdx[reqID][layerID].clear();
     for (auto it = mDocsTables[reqID][layerID].begin(); it != mDocsTables[reqID][layerID].end();
          it++) {
@@ -1115,8 +1136,24 @@ void GSAPrefetchEngineC::SetKvTensor(torch::Tensor kCachesTensor, torch::Tensor 
                                      torch::Tensor lastChunkKBuffer, torch::Tensor lastChunkvBuffer,
                                      int layerID)
 {
+    // [I9] 此前无锁替换:主预取 worker(持 mMutexUseToken)在 KVCacheInplaceScatter
+    // 正持有旧 mKCacheAcl[layerID]/mKcachePtr 时,整体替换使旧存储引用计数归零
+    // 立即释放 → 设备侧 UAF;旧 aclTensor 覆盖前不 Release → 每层泄漏。持
+    // mMutexUseToken 与 worker 串行,覆盖前先 Release 旧 aclTensor(对齐
+    // PrepareScatterAclTensor 的先 Release 模式)。
+    std::lock_guard<std::mutex> lock(mMutexUseToken);
     // init token an block tensor size
     if (mKVHBMBlockLen == 0) { mKVHBMBlockLen = kCachesTensor.sizes()[0]; }
+    if (mKCacheAcl[layerID] != nullptr) {
+        ReleaseAclTensor(mKCacheAcl[layerID]);
+        mKCacheAcl[layerID] = nullptr;
+    }
+    if (!mISSPAC8 && mVCacheAcl[layerID] != nullptr) {
+        // 仅非 c8 模式才创建过 V 侧 aclTensor(InitBufferContainers 只在
+        // !mISSPAC8 时 resize mVCacheAcl),Release 也只在该分支执行。
+        ReleaseAclTensor(mVCacheAcl[layerID]);
+        mVCacheAcl[layerID] = nullptr;
+    }
     mKcacheTensor[layerID] = kCachesTensor;
     mKcachePtr[layerID] = reinterpret_cast<uint64_t>(kCachesTensor.data_ptr());
     at::Tensor kCachesTensorND = kCachesTensor.view({-1, mKDim});
@@ -1139,6 +1176,10 @@ void GSAPrefetchEngineC::SetKvTensor(torch::Tensor kCachesTensor, torch::Tensor 
 void GSAPrefetchEngineC::SetKvTensorIndex(int layerID, torch::Tensor indexCache)
 {
     if (!mOpenIndexerOffload) { return; }
+    // [I9] mIndexerTensor/mIndexerPtr 被主预取 worker(持 mMutexUseToken)读取
+    // (DealLessPrefetchBlock / indexer merge 路径),无锁替换与之并发;
+    // 持 mMutexUseToken 串行化。
+    std::lock_guard<std::mutex> lock(mMutexUseToken);
     if (mDeviceIndexerLen == 0) {
         mDeviceIndexerLen = indexCache.sizes()[0];
         mIndexerSizeBytesBlock = indexCache[0].element_size() * indexCache[0].numel();
@@ -1168,6 +1209,10 @@ void GSAPrefetchEngineC::SetKvBuffer(torch::Tensor kBufferHost, torch::Tensor vB
                                      torch::Tensor kBufferDevice, torch::Tensor vBufferDevice,
                                      torch::Tensor loadIndexHost, torch::Tensor loadIndexDevice)
 {
+    // [I9] mKBufferHost/mH2DPtrInfo 等张量与裸指针表被主预取 worker(持
+    // mMutexUseToken)在 H2D 拷贝路径读取,无锁替换与之并发;持 mMutexUseToken
+    // 串行化。
+    std::lock_guard<std::mutex> lock(mMutexUseToken);
     mKBufferHost = kBufferHost;
     mKBufferDevice = kBufferDevice;
     mLoadIndexHost = loadIndexHost;
@@ -1211,6 +1256,20 @@ void GSAPrefetchEngineC::SubmitTask(std::vector<int>& topkLensInput, std::vector
                                     std::vector<bool>& isIndexerOffload, std::vector<int>& seqLens,
                                     uint32_t stepTime)
 {
+    // [I10] fail-loud:预取结果 shm 容量按 mMaxBs * mTopkIndexerNum * perReqPerLayer
+    // 建立(WritePrefetchResult 的偏移 (i * mTopkIndexerNum + layerID) * totalSize
+    // 中 i 无上界校验),单步 batch 超过配置 mMaxBs 时 memcpy 越出 mmap 区踩踏
+    // 相邻映射。超限直接拒绝提交(抛异常上抛 Python 可见),绝不带着越界偏移
+    // 走完整个预取链。
+    if (reqIDList.size() > mMaxBs) {
+        mLogger.log(LogLevel::ERROR,
+                    "|KVCache Prefetch| SubmitTask rejected: reqIDList.size() %lu exceeds "
+                    "mMaxBs %lu, decodeStep: %u\n",
+                    reqIDList.size(), mMaxBs, stepTime);
+        throw std::out_of_range("SubmitTask: reqIDList.size() " + std::to_string(reqIDList.size()) +
+                                " exceeds mMaxBs " + std::to_string(mMaxBs) +
+                                " (prefetch result shm would be written out of bounds)");
+    }
     auto start = std::chrono::high_resolution_clock::now();
     mDecodeStep = stepTime;
     TaskInfo inputInfo(totalTaskNum, -1, topkLists, topkLensInput, bsIndexInput, reqIDList);
@@ -1290,6 +1349,12 @@ void GSAPrefetchEngineC::SetTopkIndices(std::string reqID, torch::Tensor& topInd
     // [C1 修复] mAllTopkIndicesTensor 的插入与 DelReqIDRun(worker 线程持
     // mUpdateReqMutex)的 erase、主预取线程的写入并发;std::map 插入与删除
     // 并发是 UB,必须持锁。
+    // [I7] 主预取 worker(仅持 mMutexUseToken)在 WritePrefetchResult 的 omp 区内
+    // memcpy(mAllTopkIndicesTensor[reqID][layerID])——本函数整体赋值替换会使旧
+    // Tensor 引用计数归零立即释放,与 worker 正在使用的旧 data_ptr 并发(UAF);
+    // tensor 赋值替换与 map 插入(omp 区内多线程 operator[])同样 UB。
+    // 双锁(锁序 token→req,同全局约定)与 worker 串行化。
+    std::lock_guard<std::mutex> tokenLock(mMutexUseToken);
     std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     mAllTopkIndicesTensor[reqID] = topIndices;
 }
@@ -1530,30 +1595,73 @@ bool GSAPrefetchEngineC::HasFatalError() const
            mKVPackControl->fatalError.load(std::memory_order_acquire) != 0;
 }
 
+// [I12] Get* 访问器此前完全无锁,且用 operator[](缺键时向 map 插入空容器,
+// 随后 [layerID] 越界/解引用空 unique_ptr)。任务在飞时与 worker 并发撕裂拷贝,
+// 请求已删时插入残留空条目并崩溃。统一改为双锁(锁序 token→req,与
+// SetTokensMap[写 mHBMMangers/mReqUseBlockTable/mSparseSeqLen]、SetIndexerMap[写
+// mDocsTables/mBlocksMap]、DelReqIDRun[双锁 erase]全部串行)+ find + 判空,
+// 缺键返回缺省值(不修改 map)。
 std::vector<int> GSAPrefetchEngineC::GetTokenBlockMap(int layerID, std::string reqID)
 {
-    return mHBMMangers[reqID][layerID]->mGlobalToSlot;
+    std::lock_guard<std::mutex> tokenLock(mMutexUseToken);
+    std::lock_guard<std::mutex> reqLock(mUpdateReqMutex);
+    auto it = mHBMMangers.find(reqID);
+    if (it == mHBMMangers.end() || layerID < 0 ||
+        static_cast<size_t>(layerID) >= it->second.size() || !it->second[layerID]) {
+        return {};
+    }
+    return it->second[layerID]->mGlobalToSlot;
 }
 
 std::vector<int> GSAPrefetchEngineC::GetBlockTokenMap(int layerID, std::string reqID)
 {
-    return mHBMMangers[reqID][layerID]->mSlotToGlobal;
+    std::lock_guard<std::mutex> tokenLock(mMutexUseToken);
+    std::lock_guard<std::mutex> reqLock(mUpdateReqMutex);
+    auto it = mHBMMangers.find(reqID);
+    if (it == mHBMMangers.end() || layerID < 0 ||
+        static_cast<size_t>(layerID) >= it->second.size() || !it->second[layerID]) {
+        return {};
+    }
+    return it->second[layerID]->mSlotToGlobal;
 }
 
 std::map<int, int> GSAPrefetchEngineC::GetIndexerTokensMap(int layerID, std::string reqID)
 {
-    return mDocsTables[reqID][layerID];
+    std::lock_guard<std::mutex> tokenLock(mMutexUseToken);
+    std::lock_guard<std::mutex> reqLock(mUpdateReqMutex);
+    auto it = mDocsTables.find(reqID);
+    if (it == mDocsTables.end() || layerID < 0 ||
+        static_cast<size_t>(layerID) >= it->second.size()) {
+        return {};
+    }
+    return it->second[layerID];
 }
 
 std::map<int, int> GSAPrefetchEngineC::GetIndexerBlockMap(int layerID, std::string reqID)
 {
-    return mBlocksMap[reqID][layerID];
+    std::lock_guard<std::mutex> tokenLock(mMutexUseToken);
+    std::lock_guard<std::mutex> reqLock(mUpdateReqMutex);
+    auto it = mBlocksMap.find(reqID);
+    if (it == mBlocksMap.end() || layerID < 0 ||
+        static_cast<size_t>(layerID) >= it->second.size()) {
+        return {};
+    }
+    return it->second[layerID];
 }
 
 std::vector<int> GSAPrefetchEngineC::GetReqUseBlockTable(std::string reqID)
 {
-    return mReqUseBlockTable[reqID];
+    std::lock_guard<std::mutex> tokenLock(mMutexUseToken);
+    std::lock_guard<std::mutex> reqLock(mUpdateReqMutex);
+    auto it = mReqUseBlockTable.find(reqID);
+    return it == mReqUseBlockTable.end() ? std::vector<int>{} : it->second;
 }
 
-int GSAPrefetchEngineC::GetSparseSeqLen(std::string reqID) { return mSparseSeqLen[reqID]; }
+int GSAPrefetchEngineC::GetSparseSeqLen(std::string reqID)
+{
+    std::lock_guard<std::mutex> tokenLock(mMutexUseToken);
+    std::lock_guard<std::mutex> reqLock(mUpdateReqMutex);
+    auto it = mSparseSeqLen.find(reqID);
+    return it == mSparseSeqLen.end() ? 0 : it->second;
+}
 }  // namespace ucmprefetch
