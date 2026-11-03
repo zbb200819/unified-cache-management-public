@@ -624,6 +624,11 @@ void GSAPrefetchEngineC::SetBlocksMap(const std::string& reqID,
                                       const std::vector<uintptr_t>& kAddrs,
                                       const std::vector<uintptr_t>& vAddrs)
 {
+    // [C1 修复] mAllBlocksHash/mPromptLen/mLastKVBlockAddress 被 indexer 工作线程
+    // (UCMIndexerLoadAsync,IndexerLoadProcess 持 mUpdateReqMutex)与 DelReqIDRun
+    // (worker 线程持 mUpdateReqMutex)并发访问,Python 线程写入必须持同一把锁,
+    // 否则 std::map 一边遍历一边插入/删除是 UB(堆损坏)。
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     if (blockIdxs.size() != kAddrs.size()) {
         mLogger.log(LogLevel::ERROR, "|SetBlocksMap| kAddrs size mismatch\n");
         return;
@@ -647,6 +652,8 @@ void GSAPrefetchEngineC::SetLastIndexerBlock(const std::string& reqID,
                                              const std::vector<uintptr_t>& indexerAddrs)
 {
     if (!mOpenIndexerOffload) { return; }
+    // [C1 修复] 同 SetBlocksMap:mLastKVBlockAddress 与 indexer 工作线程并发访问。
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     if (blockIdxs.size() != indexerAddrs.size()) {
         mLogger.log(LogLevel::ERROR, "[ERROR] SetLastIndexerBlocks size mismatch, reqID=%s\n",
                     reqID.c_str());
@@ -835,6 +842,10 @@ void GSAPrefetchEngineC::SetIndexerMapForLayer(const std::string& reqID, int lay
 
 void GSAPrefetchEngineC::UpdateIndexerMap(std::string reqID, int idx, int blockID, std::string type)
 {
+    // [C1 修复] mUseBlockTableIdx/mIndexerSlot 与 indexer 工作线程
+    // (IndexerLoadProcess 持 mUpdateReqMutex)、SubmitTask/SubmitTaskIndexer
+    // (Python 线程)并发读写,必须持锁;否则 emplace_back/pop_back 与遍历并发是 UB。
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     mLogger.log(LogLevel::INFO,
                 "Decode step: %u, |KVCache Prefetch|Start new UpdateIndexerMap for type: %s "
                 "req_id: %s, idx: %d, blockID: %d\n",

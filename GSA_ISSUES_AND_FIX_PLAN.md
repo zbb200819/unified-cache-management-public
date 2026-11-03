@@ -23,7 +23,7 @@
 | A3 | 老引擎 freeBlockPtr 裸写无界 | P1 | 行宽与表大小错配 | sparse/gsa/.../kvcache_pre.cpp:432 | 是(老引擎) | 待修复 |
 | B2 | 块 ID 陈旧 → 跨请求并发踩写 | P1 | 请求抢占/完成时 DMA 在途 | kvcache_pre_scatter.cpp:1305-1313 | **是** | 待修复 |
 | B3 | 裸指针 use-after-free 风险 | P1 | Python 张量先于 C++ 释放 | pybinds.cpp:143-148 + gsa.py:1544-1546 | **是** | 待修复 |
-| C1 | C++ map 跨线程并发读写无锁 | P1 | Python 写 API 与预取线程同时活跃 | kvcache_pre_scatter.cpp:1167-1171 附近 | **是** | 待修复 |
+| C1 | C++ map 跨线程并发读写无锁 | P1 | Python 写 API 与预取线程同时活跃 | kvcache_pre_scatter.cpp:1167-1171 附近 | **是** | ✅ 已修复 |
 | D1 | `-1` 槽位索引可达设备侧 scatter | P1 | aclgraph 捕获/回放 | sfa_kv_transfer_patch.py:387-392 | **是** | 待修复 |
 | E2 | `_load_kv_dram` 未捕获 C++ throw | P1 | PD 分离 D 节点 + store 注入未就绪 | gsa.py:2576 | 否(死代码) | ✅ 已修复 |
 | E3 | `_load_kv_dram` 超时静默 KV 空洞 + 阻塞 hang | P1 | PD 分离 D 节点 + lookup 超时 | gsa.py:2575-2587 | 否(死代码) | ✅ 已修复 |
@@ -233,6 +233,20 @@ dstTensor = mKCacheAcl[layerID];   // ← SetKvTensor 注册的 vLLM KV cache �
 **原因**:预取线程(`CallPrefetchProcessFun`/`IndexerLoadProcess`)遍历 `mDocsTables`/`mBlocksMap`/`mAllTopkIndicesTensor` 的同时,Python 线程可并发调用上述写接口。`std::map` 一边遍历一边插入/删除是 UB,典型表现即堆损坏。另外 `RunOneBsPrefetch` 的 `#pragma omp parallel for` 16 线程循环体内写 `allNeedLoadBlock[reqID][layerID]`,依赖 `CallPrefetchProcessFun:560-561` **先**预插入外层 key 的脆弱顺序才安全。
 
 **修复建议**:统一给所有 map 写接口加 `mUpdateReqMutex`(与预取线程遍历互斥);`RunOneBsPrefetch` 改为循环外集中预分配。
+
+### ✅ 修复记录(C1)
+
+- **修复内容**(全部加既有的 `mUpdateReqMutex`,与头文件 `kvcache_pre.h:58-61` 注释声明的锁职责对齐,共 6 个接口):
+  1. `SetBlocksMap`(kvcache_pre.cpp:621 → :631 持锁):写 `mAllBlocksHash/mPromptLen/mLastKVBlockAddress`——读方为 indexer 工作线程(`UCMIndexerLoadAsync` 在 `IndexerLoadProcess` 持 `mUpdateReqMutex` 下运行)与 `DelReqIDRun`(持同锁);
+  2. `SetLastIndexerBlock`(:645 → :656 持锁):读写 `mLastKVBlockAddress`,同上;
+  3. `UpdateIndexerMap`(:836 → :848 持锁):`mUseBlockTableIdx` 的 emplace_back/pop_back 与工作线程遍历并发是 UB;
+  4. `SubmitTask`(scatter:1170 → 循环段 :1184 持锁):写 `mRealTimeIdx/mSeqLen`、读 `mUseBlockTableIdx`——临界区收窄为 map 拷贝循环(不含 `mTaskManger->SubmitTask` 提交);
+  5. `SubmitTaskIndexer`(:1210 → :1220 循环段持锁):memcpy 写 `mUseBlockTableIdx`;
+  6. `SetTopkIndices`(:1240 → :1251 持锁):`mAllTopkIndicesTensor` 的 map 插入与 `DelReqIDRun` 的 erase 并发是 UB。
+- **修复原因**:`std::map`/`std::unordered_map` 一边遍历一边插入/删除是 UB,典型表现为堆损坏(与 A 类越界写叠加时极难归因)。原有锁覆盖不完整:`SetTokensMap`(mMutexUseToken)、`SetIndexerMap`/`DelBlocksMap`/`DelReqIDRun`/`IndexerLoadProcess`(mUpdateReqMutex)已持锁,但上述 6 个 Python 线程入口完全裸奔。
+- **死锁分析**(已核对全部 14 处持锁点):无任何路径嵌套获取两把锁——`CallPrefetchProcess`(mMutexUseToken)调用的函数不含 mUpdateReqMutex;`IndexerLoadProcess`/`SetIndexerMap`(mUpdateReqMutex)调用的函数不含 mMutexUseToken;`MultiBSThreadFun` 在 `CallPrefetchProcess` 返回(锁已释放)后才取 mUpdateReqMutex;`SetIndexerMapForLayer` 仅被持锁的 `SetIndexerMap` 内部调用,无需加锁(避免了自死锁)。
+- **遗留(后续项)**:`RunOneBsPrefetch` 的 16 线程 omp 循环依赖调用方预插入外层 key 的脆弱顺序,本次未动(需要数据结构重构)。
+- **验证**:需随 C++ 构建跑;并发压测下 TSAN 或长期稳定性观察(`SubmitTask` 每步执行,锁竞争回归主要看每步耗时日志)。
 
 ---
 

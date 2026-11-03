@@ -1177,17 +1177,23 @@ void GSAPrefetchEngineC::SubmitTask(std::vector<int>& topkLensInput, std::vector
     TaskInfo inputInfo(totalTaskNum, -1, topkLists, topkLensInput, bsIndexInput, reqIDList);
     mIsPrefetchRunning.store(true, std::memory_order_release);
     mIsIndexerOffload = isIndexerOffload;
-    for (uint32_t i = 0; i < reqIDList.size(); i++) {
-        if (mOpenIndexerOffload && mIsIndexerOffload[i]) {
-            mRealTimeIdx[reqIDList[i]].clear();
-            mRealTimeIdx[reqIDList[i]] = mUseBlockTableIdx[reqIDList[i]];
-            mSeqLen[reqIDList[i]] = seqLens[i];
-            mLogger.log(LogLevel::DEBUG,
-                        "Decode step: %u, "
-                        "|KVCache Prefetch| SubmitTask mRealTimeIdx: %u, mUseBlockTableIdx: %u for "
-                        "req_id: %s\n",
-                        mDecodeStep, mRealTimeIdx[reqIDList[i]][0].size(),
-                        mUseBlockTableIdx[reqIDList[i]][0].size(), reqIDList[i].c_str());
+    {
+        // [C1 修复] mRealTimeIdx/mSeqLen 的写入与 mUseBlockTableIdx 的读取均与
+        // indexer 工作线程(IndexerLoadProcess/DelReqIDRun 持 mUpdateReqMutex)和
+        // SubmitTaskIndexer 并发,持锁完成拷贝与日志(临界区仅为 map 拷贝,保持短小)。
+        std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+        for (uint32_t i = 0; i < reqIDList.size(); i++) {
+            if (mOpenIndexerOffload && mIsIndexerOffload[i]) {
+                mRealTimeIdx[reqIDList[i]].clear();
+                mRealTimeIdx[reqIDList[i]] = mUseBlockTableIdx[reqIDList[i]];
+                mSeqLen[reqIDList[i]] = seqLens[i];
+                mLogger.log(LogLevel::DEBUG,
+                            "Decode step: %u, "
+                            "|KVCache Prefetch| SubmitTask mRealTimeIdx: %u, mUseBlockTableIdx: %u for "
+                            "req_id: %s\n",
+                            mDecodeStep, mRealTimeIdx[reqIDList[i]][0].size(),
+                            mUseBlockTableIdx[reqIDList[i]][0].size(), reqIDList[i].c_str());
+            }
         }
     }
     mTaskManger->SubmitTask(inputInfo, MultiBSThreadFun);
@@ -1207,11 +1213,17 @@ void GSAPrefetchEngineC::SubmitTaskIndexer(std::vector<int>& topkLensInput,
 {
     if (!mOpenIndexerOffload) { return; }
     auto start = std::chrono::high_resolution_clock::now();
-    for (uint32_t i = 0; i < reqIDList.size(); i++) {
-        for (int layerID = 0; layerID < mLayerNum; layerID++) {
-            std::memcpy(mUseBlockTableIdx[reqIDList[i]][layerID].data(),
-                        mPrefetchBlockTableIdx[reqIDList[i]][layerID].data(),
-                        topkLensInput[i] * sizeof(int));
+    {
+        // [C1 修复] mUseBlockTableIdx 的 memcpy 写入与 indexer 工作线程
+        // (IndexerLoadProcess 持 mUpdateReqMutex)、UpdateIndexerMap、SubmitTask
+        // 并发,持锁拷贝。
+        std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+        for (uint32_t i = 0; i < reqIDList.size(); i++) {
+            for (int layerID = 0; layerID < mLayerNum; layerID++) {
+                std::memcpy(mUseBlockTableIdx[reqIDList[i]][layerID].data(),
+                            mPrefetchBlockTableIdx[reqIDList[i]][layerID].data(),
+                            topkLensInput[i] * sizeof(int));
+            }
         }
     }
     mDecodeStep = stepTime;
@@ -1233,6 +1245,10 @@ void GSAPrefetchEngineC::SubmitTaskIndexer(std::vector<int>& topkLensInput,
 
 void GSAPrefetchEngineC::SetTopkIndices(std::string reqID, torch::Tensor& topIndices)
 {
+    // [C1 修复] mAllTopkIndicesTensor 的插入与 DelReqIDRun(worker 线程持
+    // mUpdateReqMutex)的 erase、主预取线程的写入并发;std::map 插入与删除
+    // 并发是 UB,必须持锁。
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     mAllTopkIndicesTensor[reqID] = topIndices;
 }
 
