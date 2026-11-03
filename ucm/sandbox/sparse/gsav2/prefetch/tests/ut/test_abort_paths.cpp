@@ -51,14 +51,9 @@ static std::unique_ptr<GSAPrefetchEngineC> MakeFullEngine(int dpRank, TempLogFil
     auto loadIdxHost = torch::zeros({1, 64}, torch::kInt64);
     auto loadIdxDevice = torch::zeros({1, 64}, torch::kInt64);
     engine->SetKvBuffer(kHost, vHost, kDevice, vDevice, loadIdxHost, loadIdxDevice);
-    /* The ddr-load refactor made BuildUCMMergeBlockContexts / UCMTensorMerge
-     * stage into the engine-owned mUCMMergeLoadBuffer (set by the shared-memory
-     * SetupKVPackSharedBuffers in production, which tests skip). Point it at
-     * the engine-allocated mLastChunkLoadBuffer so the merge / abort paths have
-     * a valid staging region without extra bookkeeping. */
-    if (engine->mUCMMergeLoadBuffer == nullptr && engine->mLastChunkLoadBuffer != nullptr) {
-        engine->mUCMMergeLoadBuffer = static_cast<std::byte*>(engine->mLastChunkLoadBuffer);
-    }
+    /* Token-level merge loads go through LoadOnToken, which splices owned UCM
+     * tokens directly into the shared staging buffers; no engine-owned merge
+     * staging buffer is involved any more. */
     return engine;
 }
 
@@ -223,12 +218,10 @@ TEST(AbortPaths, BuildUCMMergeBlockContextsAbortsOnNegativeMissGlobalId)
     engine->mMissGlobalToken[reqID].assign(engine->mTopkIndexerNum, {});
     engine->mMissGlobalToken[reqID][0] = {-1};  // negative -> KVPackAbort
     std::vector<ucmprefetch::UCMMergeBlockContext> blockContexts;
-    UC::Detail::TaskDesc task;
     std::map<int, std::vector<size_t>> blockIdxToTokenIdx;
-    EXPECT_DEATH(
-        engine->BuildUCMMergeBlockContexts(0, reqID, 0, blockContexts, task, blockIdxToTokenIdx,
-                                           engine->mUCMMergeLoadBuffer, engine->mShardSize),
-        "");
+    EXPECT_DEATH(engine->BuildUCMMergeBlockContexts(0, reqID, 0, blockContexts,
+                                                    blockIdxToTokenIdx),
+                 "");
 }
 
 }  // namespace

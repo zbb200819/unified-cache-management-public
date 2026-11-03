@@ -74,9 +74,9 @@ struct LastChunkFixture {
         CleanupShmFor(dpRank);
         logFile = std::make_unique<TempLogFile>();
         store = std::make_unique<MockStoreV1>();
-        // Each UCM host buffer must hold K+V for one block.
-        store->SetHostBufferPayload(static_cast<size_t>(kBlockBytes + vBlockBytes),
-                                    static_cast<size_t>(kBlockBytes));
+        /* LastChunkMove now splices tokens via LoadOnToken directly into the
+         * last-chunk staging buffers, so no per-block host payload config is
+         * needed (SetHostBufferPayload only affects plain Load). */
 
         auto model = MakeModelInfo(layerNum, /*maxBlockLen=*/4096,
                                    /*spaTopkLen=*/32, /*streamNum=*/1, /*sparseLen=*/16,
@@ -152,12 +152,12 @@ TEST(LastChunkMoveFlow, UcmAndNonUcmBlocksLandInCorrectHbmSlots)
 
     f.engine->LastChunkMove(/*layerID=*/0, "req1", moveMap);
 
-    // UCM block 0 -> HBM slot 10. Mock fills view[0] with 0x01.
+    // UCM block 0 -> HBM slot 10. Mock LoadOnToken fills its K-window 0x01.
     for (int i = 0; i < f.kBlockBytes; ++i) {
         EXPECT_EQ(f.kHbm[10 * f.kBlockBytes + i], 0x01u)
             << "K byte " << i << " mismatch for UCM block 0";
     }
-    // UCM block 1 -> HBM slot 20. Mock fills view[1] with 0x02.
+    // UCM block 1 -> HBM slot 20. Mock LoadOnToken fills its K-window 0x02.
     for (int i = 0; i < f.kBlockBytes; ++i) {
         EXPECT_EQ(f.kHbm[20 * f.kBlockBytes + i], 0x02u)
             << "K byte " << i << " mismatch for UCM block 1";
@@ -167,19 +167,27 @@ TEST(LastChunkMoveFlow, UcmAndNonUcmBlocksLandInCorrectHbmSlots)
         EXPECT_EQ(f.kHbm[30 * f.kBlockBytes + i], 0xABu)
             << "K byte " << i << " mismatch for non-UCM block 2";
     }
-    // V path (non-c8 mode): non-UCM V is 0xCD.
+    /* V path (non-c8 mode): UCM block 0 lands via the V leg of LoadOnToken
+     * (mock fills shard 0 / tensor 1 with (0+1+1)=0x02). */
+    for (int i = 0; i < f.vBlockBytes; ++i) {
+        EXPECT_EQ(f.vHbm[10 * f.vBlockBytes + i], 0x02u)
+            << "V byte " << i << " mismatch for UCM block 0";
+    }
+    // Non-UCM block 2 V source is 0xCD.
     for (int i = 0; i < f.vBlockBytes; ++i) { EXPECT_EQ(f.vHbm[30 * f.vBlockBytes + i], 0xCDu); }
-    /* After the ddr-load refactor LastChunkMove uses Load + Wait into the
-     * engine-owned mLastChunkLoadBuffer (no LoadToHostBuffer / ReleaseHostBuffer).
-     * The mock Load fills each UCM shard's staging slot with a per-shard byte
-     * pattern (shard 0 -> 0x01, shard 1 -> 0x02). */
-    bool hasLoad = false, hasWait = false, hasRelease = false;
+    /* After the LoadOnToken refactor LastChunkMove drives token loads through
+     * LoadOnToken + Wait (K and V legs), with the store splicing tokens
+     * directly into the last-chunk staging buffer; no LoadToHostBuffer /
+     * ReleaseHostBuffer round-trip remains. The mock's LoadOnToken fills each
+     * UCM shard's covered ranges with a per-shard/tensor byte pattern (K leg
+     * shard 0 -> 0x01, shard 1 -> 0x02). */
+    bool hasLoadOnToken = false, hasWait = false, hasRelease = false;
     for (const auto& c : f.store->calls) {
-        if (c.name == "Load") { hasLoad = true; }
+        if (c.name == "LoadOnToken") { hasLoadOnToken = true; }
         if (c.name == "Wait") { hasWait = true; }
         if (c.name == "ReleaseHostBuffer") { hasRelease = true; }
     }
-    EXPECT_TRUE(hasLoad);
+    EXPECT_TRUE(hasLoadOnToken);
     EXPECT_TRUE(hasWait);
     EXPECT_FALSE(hasRelease);  // no per-call release after the refactor
 
@@ -216,7 +224,7 @@ TEST(LastChunkMoveFlow, StoreLoadFailureAbortsBeforeCopy)
     LastChunkFixture f;
     f.Setup();
     f.SeedBlocksMap();
-    f.store->loadFails = true;
+    f.store->loadOnTokenFails = true;
     std::vector<int> moveMap = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
     f.engine->LastChunkMove(0, "req1", moveMap);
     // On load failure, LastChunkMove returns early; HBM stays untouched.

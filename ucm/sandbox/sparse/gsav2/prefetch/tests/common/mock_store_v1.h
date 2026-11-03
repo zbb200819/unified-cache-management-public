@@ -28,6 +28,9 @@ namespace ucmprefetch_test {
  * The prefetch code now drives loads through Load + Wait, with shards carrying
  * caller-provided DDR host addresses; the mock's Load honours that contract by
  * writing a deterministic per-shard payload into each shard's host address.
+ * Token-level loads (LastChunkMove / UCMTensorMerge) go through LoadOnToken +
+ * Wait instead: the mock splices each TokenFilter range into the shard's host
+ * address at range.dstOffset, mirroring CacheStore's DDR load-on-token path.
  */
 class MockStoreV1 : public UC::StoreV1 {
 public:
@@ -50,11 +53,13 @@ public:
     bool mismatchedViewCount{false};
     bool nullHostAddr{false};
 
-    /* Live switches for the surviving Load / Wait / Lookup interface. */
+    /* Live switches for the surviving Load / LoadOnToken / Wait / Lookup
+     * interface. */
     bool lookupFails{false};
     bool waitFails{false};
     bool checkFails{false};
     bool loadFails{false};
+    bool loadOnTokenFails{false};
     bool dumpFails{false};
 
     /* Configuration of canned per-shard payloads written into DDR addresses. */
@@ -116,6 +121,50 @@ public:
             }
             if (addr != nullptr && bytesPerBlock_ > 0) {
                 std::memset(addr, static_cast<int>((i + 1) & 0xFF), bytesPerBlock_);
+            }
+        }
+        return UC::Detail::TaskHandle{r.handle};
+    }
+
+    UC::Expected<UC::Detail::TaskHandle> LoadOnToken(
+        UC::Detail::TaskDesc task, const std::vector<UC::Detail::TokenFilter>& filter) override
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        CallRecord r{"LoadOnToken"};
+        r.task = task;
+        r.handle = NextHandle();
+        r.blockCount = task.size();
+        calls.push_back(std::move(r));
+        /* Mirror CacheStore::LoadOnToken argument validation. */
+        if (task.memoryType != UC::Detail::TaskDesc::MemoryType::DDR) {
+            return UC::Status::Error("load-on-token-requires-ddr");
+        }
+        if (filter.size() != task.size()) {
+            return UC::Status::Error("load-on-token-filter-size-mismatch");
+        }
+        for (const auto& shard : task) {
+            if (shard.addrs.size() != 1 || shard.addrs.front() == nullptr) {
+                return UC::Status::Error("load-on-token-requires-one-host-address");
+            }
+        }
+        if (loadOnTokenFails) { return UC::Status::Error("load-on-token-failed-injected"); }
+        /* Token splice contract (DDR): for each shard, memcpy the selected
+         * per-tensor TokenRanges from the (virtual) cache slot into
+         * dst + range.dstOffset, where dst is the shard's single host
+         * address. The mock cannot see the slot contents, so it fills each
+         * covered range with a deterministic payload: (shard index + tensor
+         * index + 1, mod 256). The K leg (ranges[0]) and V leg (ranges[1])
+         * of a shard thus get distinguishable bytes, letting tests verify
+         * the downstream merge pipeline. */
+        for (std::size_t i = 0; i < task.size(); ++i) {
+            auto* dst = static_cast<std::uint8_t*>(task[i].addrs.front());
+            const auto& tokenFilter = filter[i];
+            for (std::size_t t = 0; t < tokenFilter.ranges.size(); ++t) {
+                const int fill = static_cast<int>((i + t + 1) & 0xFF);
+                for (const auto& range : tokenFilter.ranges[t]) {
+                    if (range.length == 0) { continue; }
+                    std::memset(static_cast<void*>(dst + range.dstOffset), fill, range.length);
+                }
             }
         }
         return UC::Detail::TaskHandle{r.handle};

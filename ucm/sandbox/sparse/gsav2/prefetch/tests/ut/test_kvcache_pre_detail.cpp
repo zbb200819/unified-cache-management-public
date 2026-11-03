@@ -55,13 +55,22 @@ TEST(KVPackDetail, UCMMergeBlockContextFieldsDefault)
 {
     UCMMergeBlockContext c{};
     EXPECT_EQ(c.tokenIndices, nullptr);
-    EXPECT_EQ(c.viewIndex, 0u);
     EXPECT_EQ(c.tokenBase, 0u);
     EXPECT_FALSE(c.isnoUCMblock);
     EXPECT_EQ(c.blockIdx, 0);
     EXPECT_EQ(c.kSrc, nullptr);
     EXPECT_EQ(c.vSrc, nullptr);
     EXPECT_FALSE(c.owned);
+}
+
+TEST(KVPackDetail, TokenCopyTaskFieldsDefault)
+{
+    TokenCopyTask t{};
+    EXPECT_EQ(t.kSrc, nullptr);
+    EXPECT_EQ(t.vSrc, nullptr);
+    EXPECT_EQ(t.dstOffset, 0u);
+    EXPECT_EQ(t.hbmSlot, 0ull);
+    EXPECT_FALSE(t.localCopy);
 }
 
 TEST(KVPackDetail, PrefetchShmLayoutDefaultZero)

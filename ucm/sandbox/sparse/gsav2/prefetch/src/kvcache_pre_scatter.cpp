@@ -770,7 +770,7 @@ bool GSAPrefetchEngineC::ProcessIndexerInitLoadLayer(std::vector<std::vector<int
     const auto& hashVec = mAllBlocksHash.at(reqID);
     UC::Detail::TaskDesc task;
     task.reserve(number);
-    task.brief = "UCMIndexerInitLoadToDevice";
+    task.brief = "UCMIndexerInitLoad";
     size_t shardIndex = static_cast<size_t>(layerID);
     for (int i = 0; i < number; i++) {
         int deviceBlockId = blockTable[layerID][i];
@@ -815,11 +815,20 @@ bool GSAPrefetchEngineC::SubmitIndexerInitLoadTask(UC::Detail::TaskDesc& task,
         return false;
     }
     const size_t loadNumber = task.size();
-    auto status = mStoreV1_->LoadToDevice(std::move(task));
-    if (status.Failure()) {
-        const std::string error = status.ToString();
+    auto loadResult = mStoreV1_->Load(std::move(task));
+    if (!loadResult) {
+        const std::string error = loadResult.Error().ToString();
         mLogger.log(LogLevel::ERROR,
-                    "[ERROR] IndexerInitLoad LoadToDevice failed, "
+                    "[ERROR] IndexerInitLoad Load failed, "
+                    "reqID=%s layerID=%d loadNumber=%zu status=%s\n",
+                    reqID.c_str(), layerID, loadNumber, error.c_str());
+        return false;
+    }
+    auto waitStatus = mStoreV1_->Wait(loadResult.Value());
+    if (waitStatus.Failure()) {
+        const std::string error = waitStatus.ToString();
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] IndexerInitLoad Wait failed, "
                     "reqID=%s layerID=%d loadNumber=%zu status=%s\n",
                     reqID.c_str(), layerID, loadNumber, error.c_str());
         return false;
@@ -952,7 +961,7 @@ bool GSAPrefetchEngineC::LoadIndexerRequest(const std::string& reqID,
 
     UC::Detail::TaskDesc task;
     task.reserve(number);
-    task.brief = "UCMIndexerLoadToDevice";
+    task.brief = "UCMIndexerLoad";
     if (!BuildIndexerLoadTask(reqID, layerID, indexerBaseAddr, hbmBlockIDs, missBlockIdxs, hashVec,
                               task, totalNumber)) {
         return false;
@@ -1044,11 +1053,20 @@ bool GSAPrefetchEngineC::LoadIndexerTask(const std::string& reqID, int layerID,
         return false;
     }
     const size_t loadNumber = task.size();
-    auto status = mStoreV1_->LoadToDevice(std::move(task));
-    if (status.Failure()) {
-        const std::string error = status.ToString();
+    auto loadResult = mStoreV1_->Load(std::move(task));
+    if (!loadResult) {
+        const std::string error = loadResult.Error().ToString();
         mLogger.log(LogLevel::ERROR,
-                    "[ERROR] UCMIndexerLoadAsync LoadToDevice failed, "
+                    "[ERROR] UCMIndexerLoadAsync Load failed, "
+                    "reqID=%s layerID=%d loadNumber=%zu status=%s\n",
+                    reqID.c_str(), layerID, loadNumber, error.c_str());
+        return false;
+    }
+    auto waitStatus = mStoreV1_->Wait(loadResult.Value());
+    if (waitStatus.Failure()) {
+        const std::string error = waitStatus.ToString();
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] UCMIndexerLoadAsync Wait failed, "
                     "reqID=%s layerID=%d loadNumber=%zu status=%s\n",
                     reqID.c_str(), layerID, loadNumber, error.c_str());
         return false;

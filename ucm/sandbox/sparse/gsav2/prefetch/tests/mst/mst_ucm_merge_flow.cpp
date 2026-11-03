@@ -4,9 +4,9 @@
  * MST: cross-module flow for UCMTensorMerge.
  *
  * UCMTensorMerge ties together HBM miss-bookkeeping (mMissGlobalToken /
- * mLoadSlot), the UCM store (Load + Wait via mock), the multi-rank KVPack
- * shared staging buffers, and the CPU token-merge loop.  We drive it with a
- * mock store and the ACL stub, and verify both the success path
+ * mLoadSlot), the UCM store (LoadOnToken + Wait via mock), the multi-rank
+ * KVPack shared staging buffers, and the CPU token-merge loop.  We drive it
+ * with a mock store and the ACL stub, and verify both the success path
  * (hbmSlotIndex filled, loadNum advanced) and the failure fallback path
  * (FillFailedUCMMerge zeroes owned tokens while preserving all-rank indices).
  */
@@ -60,7 +60,8 @@ struct MergeFixture {
         CleanupShmFor(dpRank);
         logFile = std::make_unique<TempLogFile>();
         store = std::make_unique<MockStoreV1>();
-        store->SetHostBufferPayload(32, 16);  // 16 K + 16 V per block view
+        /* Token splices go through LoadOnToken, whose mock payload is
+         * per-shard/tensor and needs no per-block host payload config. */
         auto model = MakeModelInfo(kLayerNum, 4096, /*spaTopkLen=*/32,
                                    /*streamNum=*/1, /*sparseLen=*/16, 1, /*dpRank=*/dpRank,
                                    /*tpSize=*/1, /*indexerOffload=*/0, /*isSfaC8=*/0, /*maxBs=*/2);
@@ -72,14 +73,9 @@ struct MergeFixture {
                                                       /*cpuToBind=*/std::vector<int>{0},
                                                       topkLayerMap, logFile->Path());
         engine->SetStoreV1(store.get());
-        /* The ddr-load refactor made UCMTensorMerge stage into the engine-owned
-         * mUCMMergeLoadBuffer (set by SetupKVPackSharedBuffers in production,
-         * which tests skip). Alias it to mLastChunkLoadBuffer so the merge path
-         * has a valid staging region. The destructor frees mLastChunkLoadBuffer
-         * and never frees mUCMMergeLoadBuffer, so this is safe. */
-        if (engine->mUCMMergeLoadBuffer == nullptr && engine->mLastChunkLoadBuffer != nullptr) {
-            engine->mUCMMergeLoadBuffer = static_cast<std::byte*>(engine->mLastChunkLoadBuffer);
-        }
+        /* UCMTensorMerge now splices owned UCM tokens via LoadOnToken directly
+         * into the shared staging buffers below; no engine-owned merge staging
+         * buffer (mUCMMergeLoadBuffer) is involved any more. */
 
         // Shared K/V staging buffers (engine reads via mSharedKBufferHostPtr).
         sharedK.assign(64, 0xAA);
@@ -124,6 +120,10 @@ TEST(UCMMergeFlow, SuccessFillsHbmSlotIndexAndAdvancesLoadNum)
     MergeFixture f;
     f.Setup();
     f.SeedMissScenario();
+    /* Use in-range slots: slot/blockSize must stay below blockTable.size()=2
+     * inside CopyUCMMergeTokensSerial. The index encoding itself is asserted
+     * in the test below. */
+    f.engine->mLoadSlot["req1"][0] = {0, 1, 4, 5};
 
     std::vector<uint64_t> hbmSlotIndex;
     f.engine->UCMTensorMerge(/*layerID=*/0, /*streamIdx=*/0, hbmSlotIndex,
@@ -132,14 +132,16 @@ TEST(UCMMergeFlow, SuccessFillsHbmSlotIndexAndAdvancesLoadNum)
     // previousLoadNum=0 + 4 misses -> finalLoadNum=4.
     ASSERT_EQ(hbmSlotIndex.size(), 4u);
     EXPECT_EQ(f.engine->mLoadNum[0], 4u);
-
-    // Verify the hbm slot index encoding for the 4 tokens.
-    // token 0: slot 0 -> hbmIdx=blockTable[0/4]=10, hbmSlot=0%4=0 -> 10*4+0=40
-    // token 1: slot 1 -> hbmIdx=blockTable[0]=10, hbmSlot=1 -> 10*4+1=41
-    // token 2 (idx 4): slot 8 -> hbmIdx=blockTable[8/4=2]... but blockTable has
-    //   only 2 entries [10,20]. slot 8 -> 8/4=2 which is out of range for
-    //   blockTable.size()=2. This would crash CopyUCMMergeTokensSerial. So
-    //   pick slots that stay in range. Recreate with valid slots.
+    // Owned UCM tokens were spliced by the mock's LoadOnToken into the
+    // shared staging buffers (shard 0 -> 0x01, shard 1 -> 0x02).
+    for (int i = 0; i < 2 * 4; ++i) {
+        EXPECT_EQ(f.sharedK[i], 0x01u) << "shared K byte " << i;
+        EXPECT_EQ(f.sharedV[i], 0x02u) << "shared V byte " << i;
+    }
+    for (int i = 2 * 4; i < 4 * 4; ++i) {
+        EXPECT_EQ(f.sharedK[i], 0x02u) << "shared K byte " << i;
+        EXPECT_EQ(f.sharedV[i], 0x03u) << "shared V byte " << i;
+    }
     f.TearDown();
 }
 
@@ -172,7 +174,7 @@ TEST(UCMMergeFlow, StoreLoadFailureFallsBackToZeroedOwnedTokens)
     f.Setup();
     f.SeedMissScenario();
     f.engine->mLoadSlot["req1"][0] = {0, 1, 4, 5};
-    f.store->loadFails = true;
+    f.store->loadOnTokenFails = true;
     // Clear shared buffers so we can detect the zero-fill fallback.
     std::memset(f.sharedK.data(), 0xCC, f.sharedK.size());
     std::memset(f.sharedV.data(), 0xDD, f.sharedV.size());

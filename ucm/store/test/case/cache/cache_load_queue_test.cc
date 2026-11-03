@@ -332,7 +332,7 @@ TEST_F(UCCacheLoadQueueTest, DdrLoadOnTokenFillsCacheSlotWithoutSplicing)
     auto blockId = UC::Test::Detail::TypesHelper::MakeBlockId("d1b2c3d4e5f6789012345678901234ab");
     std::vector<UC::Detail::TokenFilter> filter(1);
     filter[0].ranges = {
-        {UC::Detail::TokenRange{0, tensorSize / 2}}
+        {UC::Detail::TokenRange{0, tensorSize / 2, 0}}
     };
 
     UC::Detail::TaskDesc miss;
