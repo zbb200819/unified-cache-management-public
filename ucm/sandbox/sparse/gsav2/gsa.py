@@ -1786,6 +1786,10 @@ class GSA(UcmSparseBase):
         """每步推理前的 GSA 预取准备：注入 store、处理请求、同步块表、构造输入"""
         if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
             return
+        # [B1] 暂停预取线程:本步前向即将执行,预取线程的 scatter 写
+        # 不得与计算流上的 attention kernel 并发读写 vLLM KV cache;
+        # 与 execute_finished 的 set_modelrunning_status(False) 配对。
+        self.prefetch_engine.prefetch_engine_c.set_modelrunning_status(True)
         if IS_PERFORMANCE_LOG:
             start_total = time.perf_counter()
         self.prefetch_engine.step_time += 1
@@ -2282,6 +2286,10 @@ class GSA(UcmSparseBase):
         """rec_result 代表当前每个 req 接受了多少个 token"""
         if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
             return
+        # [B1] 恢复预取线程:本步前向已结束(attention 对 KV 的读写完毕),
+        # 允许预取 DMA 在步间窗口执行;与 execute_begin 的
+        # set_modelrunning_status(True) 配对。
+        self.prefetch_engine.prefetch_engine_c.set_modelrunning_status(False)
         if IS_PERFORMANCE_LOG:
             time_prepare = 0
             time_submit = 0

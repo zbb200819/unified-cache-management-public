@@ -37,6 +37,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -194,6 +195,13 @@ void GSAPrefetchEngineC::RunInplaceScatter(const std::string& type, int layerID,
 
 int GSAPrefetchEngineC::CallPrefetchProcess(const TaskInfo& taskInfo, ThreadInfo& threadInfo)
 {
+    // [B1] 前向/预取互斥闸:模型前向执行期间(mStopPrefetch == true)暂停本线程,
+    // 避免预取线程在自己 ACL 流上 scatter 写 vLLM KV cache 时与计算流上的
+    // attention kernel 并发(无跨流事件依赖)。与 Python 侧 execute_begin(置 true)
+    // / execute_finished(置 false) 配对。
+    while (mStopPrefetch) {
+        std::this_thread::sleep_for(std::chrono::microseconds(2));
+    }
     std::lock_guard<std::mutex> lock(mMutexUseToken);
     auto start = std::chrono::high_resolution_clock::now();
     uint32_t oneRunBsLen = taskInfo.reqIdList.size();
@@ -509,6 +517,11 @@ void GSAPrefetchEngineC::TransferAndScatterPrefetchLayer(ThreadInfo& threadInfo,
 int GSAPrefetchEngineC::IndexerLoadProcess(const TaskInfo& taskInfo, ThreadInfo& threadInfo)
 {
     if (!mOpenIndexerOffload) { return 0; }
+    // [B1] 前向/预取互斥闸(同 CallPrefetchProcess):前向执行期间暂停 indexer 加载,
+    // 避免 indexer 写入与计算流并发。
+    while (mStopPrefetch) {
+        std::this_thread::sleep_for(std::chrono::microseconds(2));
+    }
     std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     auto start = std::chrono::high_resolution_clock::now();
     uint32_t runBsLen = taskInfo.reqIdList.size();

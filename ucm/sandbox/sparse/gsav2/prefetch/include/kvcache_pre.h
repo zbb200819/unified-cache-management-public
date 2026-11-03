@@ -60,7 +60,10 @@ public:
     // DelBlocksMap (Python thread), SetIndexerMap (Python thread) and
     // IndexerLoadProcess (indexer worker thread).
     std::mutex mUpdateReqMutex;
-    bool mStopPrefetch = false;
+    // [B1] 前向/预取互斥闸:Python 侧在 execute_begin 置 true(暂停预取线程)、
+    // execute_finished 置 false(恢复)。跨线程读写,必须为 atomic。
+    // 此前该标志从未被生产代码消费(仅单测),互斥闸是死代码。
+    std::atomic<bool> mStopPrefetch{false};
     std::atomic<bool> mIsPrefetchRunning{false};
     std::atomic<bool> mIsIndexerLoadRunning{false};
     int mRank = -1;

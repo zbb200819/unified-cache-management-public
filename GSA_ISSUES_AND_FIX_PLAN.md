@@ -16,7 +16,7 @@
 |---|---|---|---|---|---|---|
 | A1 | CopyPreSwapTokens 行索引越界写 | **P0** | MTP + 总 token 数 > dim1 | kvcache_pre_scatter.cpp:1235-1238 | **是** | ✅ 已修复 |
 | A2 | CopyPreSwapTokens 负偏移越界写 | **P0** | use_tokens 内容过期 | kvcache_pre_scatter.cpp:1239-1242 | **是** | ✅ 已修复 |
-| B1 | 前向/预取互斥闸是死代码 → 设备侧并发踩写 | **P0** | 预取块与前向读写块重叠 | kvcache_pre_scatter.cpp:51-88 | **是** | 待修复 |
+| B1 | 前向/预取互斥闸是死代码 → 设备侧并发踩写 | **P0** | 预取块与前向读写块重叠 | kvcache_pre_scatter.cpp:51-88 | **是** | ✅ 已修复 |
 | E1 | P 节点 `init_dsa_data` AttributeError 启动崩溃 | **P0** | PD 分离 P 节点 | gsa.py:1892-1905 | 否(死代码) | ✅ 已修复 |
 | F1 | `when_imported` 单次触发保护静默丢弃后续补丁钩子 | **P0** | 同一模块注册两个补丁 | patch/utils.py:96-100 | **是** | ✅ 已修复 |
 | F2 | `indexer_select_post_process` 重复定义相互覆盖 | **P0** | v0.23.0_pmr 补丁生效时 | v0.23.0_pmr/.../device_op_patch.py:13,188 | **是** | ✅ 已修复 |
@@ -180,6 +180,19 @@ dstTensor = mKCacheAcl[layerID];   // ← SetKvTensor 注册的 vLLM KV cache �
 把 host slab 数据 scatter 进 vLLM 的 KV cache,**与计算流上的 attention kernel 没有任何跨流事件依赖**(无 record/wait event)。安全性完全押在"预取的块 ≠ 当前前向正在读写的块"这一逻辑约定上,而该约定没有任何机制保证。
 
 **修复建议**:在每步 forward 前后真正调用 `set_modelrunning_status(True/False)`(生产代码激活死代码闸门);并给 DMA 目标块加 epoch/generation 校验(见 B2)。
+
+### ✅ 修复记录(B1)
+
+- **修复内容**(三层):
+  1. **C++ 消费点**(此前 `mStopPrefetch` 在 gsav2 中只有写入、**零读取**,连自旋等待都不存在):`CallPrefetchProcess` 与 `IndexerLoadProcess` 两个任务线程入口新增自旋等待 `while (mStopPrefetch) sleep 2us`(移植老引擎 `kvcache_pre.cpp:452` 的实现,在拿锁前执行);
+  2. **C++ 原子性**:`mStopPrefetch` 从 `bool` 改为 `std::atomic<bool>`(跨线程标志,原裸 bool 本身就是数据竞争;老引擎的同类问题不在本次范围);
+  3. **Python 配对调用**:`execute_begin`(步首,gate 之后)置 True 暂停预取;`execute_finished`(步末,由 `maybe_execute_ucm_sparse_finished` 在 forward 完成后调用)置 False 恢复。两处都在 `is_decode_node` gate 之后,保证仅 D 节点、且预取引擎一定存在。
+- **修复原因**:
+  - gsav2 预取线程在**自己的 ACL 流**上执行 `KVCacheInplaceScatter`(kvcache_pre_scatter.cpp:51-88)直写 vLLM KV cache 裸指针,与计算流上的 attention kernel **无任何跨流事件依赖**;互斥闸是唯一防护,却从未被生产代码调用(全仓 grep 仅单测调用);
+  - 选用 `execute_finished` 而非逐层调用的 `attention_finished` 解除暂停——后者每层触发一次,放在函数头会在**第一层**结束就放行预取、后续层仍在跑,配对错误;`execute_finished` 是真正的"步末"钩子。
+- **配对时序**:`execute_begin(pause) → forward → execute_finished(unpause + 提交预取任务) → 步间窗口(预取线程自由运行) → 下一 execute_begin(pause)`——预取从"与前向并发"变为"步间串行",消除设备侧并发写;代价是损失预取与前向的重叠(性能取舍,如需恢复重叠应实现 B2 的块所有权校验后再放开)。
+- **崩溃恢复性**:若某步在 pause 后异常退出,下一次 `execute_finished` 仍会恢复标志(配对最终一致),预取最多暂停到该异常步,不会永久卡死。
+- **验证**:Python 语法通过;C++ 需随构建跑;运行验证看日志中预取线程的步间执行窗口与并发压测下 KV 数值比对。
 
 ---
 
