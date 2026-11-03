@@ -28,7 +28,7 @@
 | E2 | `_load_kv_dram` 未捕获 C++ throw | P1 | PD 分离 D 节点 + store 注入未就绪 | gsa.py:2576 | 否(死代码) | ✅ 已修复 |
 | E3 | `_load_kv_dram` 超时静默 KV 空洞 + 阻塞 hang | P1 | PD 分离 D 节点 + lookup 超时 | gsa.py:2575-2587 | 否(死代码) | ✅ 已修复 |
 | E4 | `_ensure_store_injected` 非异常静默失败 | P1 | connector/store 未就绪 | gsa.py:955-974 | 否(死代码) | ✅ 已修复 |
-| F3 | `req_sparsed_slots=None` 无判空 | P1 | 非 GSA 调度路径构造的 SchedulerOutput | sched_output_patch.py:20-23 | **是** | 待修复 |
+| F3 | `req_sparsed_slots=None` 无判空 | P1 | 非 GSA 调度路径构造的 SchedulerOutput | sched_output_patch.py:20-23 | **是** | ✅ 已修复 |
 | F4 | `list(kv_cache)` 无判空 | P1 | warmup/profile 阶段 kv_cache=None | sfa_kv_transfer_patch.py:643,649 | **是** | 待修复 |
 | E5 | `attention_finished` gate 反转(行为回归) | P2 | PD 分离 D 节点 | gsa.py:1660 | 否(死代码) | 待修复 |
 | F5 | `init_kvcache_ptrs` 无判空直接索引 | P2 | kv_cache 为 None/空 | gsa.py:2771-2782 | **是** | 待修复 |
@@ -472,6 +472,16 @@ if module_name in sys.modules:
 **原因**:`SchedulerOutput` 若由未打 GSA 调度补丁的路径构造(或 GSA 调度器早退未填该字段),`req_sparsed_slots` 为 None → 消费点 `None[req_id]` → TypeError 运行时崩溃。
 
 **修复建议**:消费点统一判 `if not req_sparsed_slots: ...`(空 dict/None 同样处理,默认非 sparse)。
+
+### ✅ 修复记录(F3)
+
+- **修复内容**(统一模式:`scheduler_output.req_sparsed_slots or {}` + `.get(req_id, INVALID_SLOT)`,共 3 个文件、5 处消费点):
+  1. `v0_23_0/vllm_ascend/model_runner_v1_patch.py`:`_prepare_inputs` 内两处循环(`sparsed_positions` 填充、`optimistic_seq_lens_cpu` 填充);
+  2. `v0_23_0/vllm/gpu_model_runner_patch.py`:三处循环(req_data 遍历、`sparse_query_pos` 填充、`seq_lens.np` 填充);
+  3. `v0.23.0_pmr/vllm_ascend/model_runner_v1_patch.py` 与 `v0.23.0_pmr/vllm/gpu_model_runner_patch.py`:同样的三处模式(pmr 目录与 v0_23_0 是平行副本,一并修复)。
+- **修复原因**:`sched_output_patch.py:20-23` 中 `kwargs.pop("req_sparsed_slots", None)` 默认 None——`SchedulerOutput` 若由未打 GSA 调度补丁的路径构造(或 GSA 调度器早退未填字段),消费点 `None[req_id]` 抛 TypeError → 运行时崩溃。除 None 外,dict **缺 key**(部分填充)同样会 KeyError,故用 `.get(req_id, INVALID_SLOT)` 一并兜底——缺失语义即为"非 sparse 请求",与 `INVALID_SLOT` 判定天然一致。
+- **顺带核实**:`model_runner_v1_patch.py` 中 `:696/:707` 裸引用局部名 `req_sparsed_slots`(而非 `scheduler_output.` 前缀)——确认其定义 `:494` 在 `_prepare_inputs` 内无条件执行,同函数顺序流可达,**非 NameError**,本次不改写其结构。
+- **验证**:两个文件 `ast.parse` 通过;grep 确认全 patch 目录不再有非注释的 `req_sparsed_slots[req_id]` 直接下标访问。
 
 ---
 

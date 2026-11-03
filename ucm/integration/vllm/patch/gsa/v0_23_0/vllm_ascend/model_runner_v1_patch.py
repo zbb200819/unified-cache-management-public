@@ -491,9 +491,13 @@ def _prepare_inputs(
     )
 
     sparsed_positions = positions_np.copy()
-    req_sparsed_slots = scheduler_output.req_sparsed_slots
+    # [F3 修复] req_sparsed_slots 可能为 None(非 GSA 调度路径构造的 SchedulerOutput,
+    # sched_output_patch.py 中 kwargs.pop(..., None));None 或缺 key 的请求按
+    # "非 sparse 请求"处理(等价 INVALID_SLOT),不再 None[key] 崩溃。
+    req_sparsed_slots = scheduler_output.req_sparsed_slots or {}
     for req_id in self.input_batch.req_id_to_index:
-        is_sparsed_request = req_sparsed_slots[req_id] != INVALID_SLOT
+        sparsed_slot = req_sparsed_slots.get(req_id, INVALID_SLOT)
+        is_sparsed_request = sparsed_slot != INVALID_SLOT
         req_index = self.input_batch.req_id_to_index[req_id]
         offset = (
             0 if req_index == 0 else cu_num_tokens[req_index - 1]
@@ -503,7 +507,7 @@ def _prepare_inputs(
             # sparsed_positions[offset] = req_sparsed_slots[req_id] - 1
             sparsed_positions[offset:end] = list(
                 range(
-                    req_sparsed_slots[req_id] - end + offset, req_sparsed_slots[req_id]
+                    sparsed_slot - end + offset, sparsed_slot
                 )
             )
 
@@ -689,11 +693,14 @@ def _prepare_inputs(
     self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
 
     is_sparsed_np = np.zeros((num_reqs,), dtype=np.bool_)
+    # [F3 修复] 同上:req_sparsed_slots 为 None 时按"非 sparse 请求"处理。
+    req_sparsed_slots = scheduler_output.req_sparsed_slots or {}
     for req_id in self.input_batch.req_id_to_index:
-        is_sparsed_request = scheduler_output.req_sparsed_slots[req_id] != INVALID_SLOT
+        sparsed_slot = req_sparsed_slots.get(req_id, INVALID_SLOT)
+        is_sparsed_request = sparsed_slot != INVALID_SLOT
         req_index = self.input_batch.req_id_to_index[req_id]
         if is_sparsed_request:
-            self.optimistic_seq_lens_cpu[req_index] = req_sparsed_slots[req_id]
+            self.optimistic_seq_lens_cpu[req_index] = sparsed_slot
             is_sparsed_np[req_index] = True
 
     # Fill unused with -1. Needed for reshape_and_cache in attention_cp

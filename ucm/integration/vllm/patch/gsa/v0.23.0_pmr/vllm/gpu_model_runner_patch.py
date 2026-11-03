@@ -683,7 +683,9 @@ def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None
     if self.use_async_spec_decode:
         self.prev_num_draft_tokens.np.fill(0)
 
-    req_sparsed_slots = scheduler_output.req_sparsed_slots
+    # [F3 修复] req_sparsed_slots 可能为 None(非 GSA 调度路径构造的 SchedulerOutput);
+    # None 或缺 key 的请求按"非 sparse 请求"处理(等价 INVALID_SLOT)。
+    req_sparsed_slots = scheduler_output.req_sparsed_slots or {}
     for i, req_id in enumerate(req_data.req_ids):
         req_state = self.requests[req_id]
         num_computed_tokens = req_data.num_computed_tokens[i]
@@ -691,7 +693,7 @@ def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None
         resumed_from_preemption = req_id in req_data.resumed_req_ids
         num_output_tokens = req_data.num_output_tokens[i]
         req_index = self.input_batch.req_id_to_index.get(req_id)
-        is_sparsed_request = req_sparsed_slots[req_id] != INVALID_SLOT
+        is_sparsed_request = req_sparsed_slots.get(req_id, INVALID_SLOT) != INVALID_SLOT
 
         if req_state.prev_num_draft_len and self.use_async_scheduling:
             # prev_num_draft_len is used in async scheduling mode with
@@ -1112,9 +1114,11 @@ def _prepare_inputs(
     req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
 
     self.sparse_query_pos.np[:] = self.query_pos.np.copy()
-    req_sparsed_slots = scheduler_output.req_sparsed_slots
+    # [F3 修复] 同前:req_sparsed_slots 为 None/缺 key 时按"非 sparse 请求"处理。
+    req_sparsed_slots = scheduler_output.req_sparsed_slots or {}
     for req_id in self.input_batch.req_id_to_index:
-        is_sparsed_request = req_sparsed_slots[req_id] != INVALID_SLOT
+        sparsed_slot = req_sparsed_slots.get(req_id, INVALID_SLOT)
+        is_sparsed_request = sparsed_slot != INVALID_SLOT
         req_index = self.input_batch.req_id_to_index[req_id]
         offset = (
             0 if req_index == 0 else cu_num_tokens[req_index - 1]
@@ -1123,7 +1127,7 @@ def _prepare_inputs(
         if is_sparsed_request:
             self.sparse_query_pos.np[offset:end] = list(
                 range(
-                    req_sparsed_slots[req_id] - end + offset, req_sparsed_slots[req_id]
+                    sparsed_slot - end + offset, sparsed_slot
                 )
             )
 
@@ -1142,10 +1146,11 @@ def _prepare_inputs(
 
     is_sparsed_np = np.zeros((num_reqs,), dtype=np.bool_)
     for req_id in self.input_batch.req_id_to_index:
-        is_sparsed_request = scheduler_output.req_sparsed_slots[req_id] != INVALID_SLOT
+        # [F3 修复] 同前:req_sparsed_slots 为 None/缺 key 时按"非 sparse 请求"处理。
+        is_sparsed_request = req_sparsed_slots.get(req_id, INVALID_SLOT) != INVALID_SLOT
         req_index = self.input_batch.req_id_to_index[req_id]
         if is_sparsed_request:
-            self.seq_lens.np[req_index] = req_sparsed_slots[req_id]
+            self.seq_lens.np[req_index] = req_sparsed_slots.get(req_id, INVALID_SLOT)
             is_sparsed_np[req_index] = True
 
     self.seq_lens[num_reqs:].fill_(0)
