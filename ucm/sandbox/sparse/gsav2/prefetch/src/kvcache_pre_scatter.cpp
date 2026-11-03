@@ -1257,6 +1257,9 @@ void GSAPrefetchEngineC::CopyPreSwapTokens(uintptr_t useTokenBase, uintptr_t spa
             void* spaCpuPtr = reinterpret_cast<void*>(
                 spaTokenBase + (size_t)(layerID * spaMaxBs + index) * sparseLen * sizeof(int32_t));
             std::memcpy(spaCpuPtr, usePtr, sparseLen * sizeof(int32_t));
+            // [A2] 尾部追加段:数学不变量 appendOffset + appendLen == sparseLen,
+            // 且 appendOffset/appendLen >= 0 由 PreSwapTokens 处的
+            // change_len ∈ [mtpToken, sparseLen] 校验保证(omp 区外已断言)。
             std::memcpy(reinterpret_cast<uint32_t*>(spaCpuPtr) + sparseLen - changeLen + mtpToken -
                             1 - index % mtpToken,
                         needAppend.data(),
@@ -1286,6 +1289,12 @@ void GSAPrefetchEngineC::PreSwapTokens(std::vector<uintptr_t>& useTokenPtrs,
     }
     uint64_t max_tokens_time = 0;
     uint64_t cpu_copy_time = 0;
+    // [A2 防御] mtpToken >= 1:CopyPreSwapTokens 循环内有 index % mtpToken,
+    // mtpToken 为 0 会除零;num_spec_tokens 在 Python 侧恒 >= 1,此处防御性断言。
+    if (mtpToken < 1) {
+        throw std::out_of_range("PreSwapTokens: mtpToken must be >= 1, got " +
+                                std::to_string(mtpToken));
+    }
     for (size_t bs = 0; bs < useTokenPtrs.size(); bs++) {
         auto start_max = std::chrono::high_resolution_clock::now();
         const int32_t* data = reinterpret_cast<const int32_t*>(useTokenPtrs[bs]);
@@ -1299,6 +1308,24 @@ void GSAPrefetchEngineC::PreSwapTokens(std::vector<uintptr_t>& useTokenPtrs,
                         "[ERROR] PreSwapTokens change len < 0 !!!!!! start %d, end %d\n", start,
                         end);
             change_len = mtpToken;
+        }
+        // [A2 防御] 上界校验(必须在 omp 并行区外,循环内抛异常是 UB):
+        // change_len = seqLens[bs] + mtpToken - 1 - (maxID + 1),而 maxID 取自跨步保留的
+        // use_tokens 缓冲;内容过期(请求抢占恢复、use_tokens/prefetch_use_token 指针互换
+        // 后未刷新)时 maxID 偏小 → change_len 可达序列长度量级(> sparseLen)→
+        // CopyPreSwapTokens 第二处 memcpy 的偏移 sparseLen - changeLen + ... 变负,
+        // 写到本行起始地址之前,覆盖前一个请求/前一层的行(向前越界写)。
+        // 数学上 change_len ∈ [mtpToken, sparseLen] 时:
+        //   appendOffset = sparseLen - change_len + mtpToken - 1 - index%mtpToken ≥ 0
+        //   appendLen    = change_len - mtpToken + 1 + index%mtpToken ≥ 1
+        //   appendOffset + appendLen == sparseLen(恰好贴齐行尾)
+        // 故在 omp 区外一次校验即可保证循环内全部写操作不越界。
+        if (change_len > sparseLen) {
+            throw std::out_of_range(
+                "PreSwapTokens: change_len " + std::to_string(change_len) +
+                " exceeds sparseLen " + std::to_string(sparseLen) + " (maxID=" +
+                std::to_string(maxID) + ", start=" + std::to_string(start) + ", end=" +
+                std::to_string(end) + "; stale use_tokens making maxID too small?)");
         }
         mLogger.log(
             LogLevel::DEBUG,

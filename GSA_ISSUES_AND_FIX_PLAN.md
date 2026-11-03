@@ -15,7 +15,7 @@
 | 编号 | 标题 | 严重度 | 触发条件 | 主要位置 | PD-mix 是否触发 | 状态 |
 |---|---|---|---|---|---|---|
 | A1 | CopyPreSwapTokens 行索引越界写 | **P0** | MTP + 总 token 数 > dim1 | kvcache_pre_scatter.cpp:1235-1238 | **是** | ✅ 已修复 |
-| A2 | CopyPreSwapTokens 负偏移越界写 | **P0** | use_tokens 内容过期 | kvcache_pre_scatter.cpp:1239-1242 | **是** | 待修复 |
+| A2 | CopyPreSwapTokens 负偏移越界写 | **P0** | use_tokens 内容过期 | kvcache_pre_scatter.cpp:1239-1242 | **是** | ✅ 已修复 |
 | B1 | 前向/预取互斥闸是死代码 → 设备侧并发踩写 | **P0** | 预取块与前向读写块重叠 | kvcache_pre_scatter.cpp:51-88 | **是** | 待修复 |
 | E1 | P 节点 `init_dsa_data` AttributeError 启动崩溃 | **P0** | PD 分离 P 节点 | gsa.py:1892-1905 | 否(死代码) | ✅ 已修复 |
 | F1 | `when_imported` 单次触发保护静默丢弃后续补丁钩子 | **P0** | 同一模块注册两个补丁 | patch/utils.py:96-100 | **是** | 待修复 |
@@ -126,6 +126,22 @@ if (change_len <= mtpToken - 1) {     // ← 只处理"过小"
 上界完全不设防;同目录现成的 `CheckInputIndex()` 没有被使用。
 
 **修复建议**:`change_len` 加上界校验(≤ sparseLen),并校验最终偏移 ≥ 0、偏移+长度 ≤ sparseLen,违例 abort 带上下文(而非默默 clamp)。
+
+### ✅ 修复记录(A2)
+
+- **修复内容**(`kvcache_pre_scatter.cpp` `PreSwapTokens`,全部在 **omp 并行区外**——循环内抛异常是 UB):
+  1. 入口新增 `mtpToken >= 1` 断言(防御 `CopyPreSwapTokens` 循环内 `index % mtpToken` 除零);
+  2. 在既有下界 clamp(`change_len <= mtpToken - 1` 时置为 mtpToken,**保留原行为**)之后,新增上界校验:`change_len > sparseLen` 时抛 `std::out_of_range`,错误信息带 maxID/start/end 与提示 "stale use_tokens making maxID too small?";
+  3. `CopyPreSwapTokens` 第二处 memcpy 旁新增不变量注释:`appendOffset + appendLen == sparseLen` 恒等,非负性由调用方校验保证。
+- **修复原因(为何在调用方一次校验即可)**:
+  - 偏移/长度都是 `changeLen, mtpToken, index%mtpToken, sparseLen` 的函数,数学上 `change_len ∈ [mtpToken, sparseLen]` 时:
+    `appendOffset = sparseLen - change_len + mtpToken - 1 - index%mtpToken ≥ sparseLen - change_len ≥ 0`;
+    `appendLen = change_len - mtpToken + 1 + index%mtpToken ≥ 1`;
+    `appendOffset + appendLen == sparseLen`(尾部恰好贴齐,不越界);
+  - 因此在 omp 区外一次校验 `change_len` 区间即可**证明**循环内全部写操作安全,无需在 8 线程循环体内逐次校验;
+  - 上界违例(use_tokens 过期 → maxID 偏小 → change_len 达序列长度量级)时:旧行为是偏移为负、每行向前覆盖写;新行为是进入拷贝前即抛出带上下文的异常。
+- **影响面**:`change_len` 正常时(≤ sparseLen)零行为变化;下界 clamp 路径保留原样。
+- **验证**:需随 C++ 构建跑;单测可构造 maxID 偏小的 use_tokens 断言 throw(仿 `test_abort_paths.cpp` 风格);线上用例为抢占-恢复场景压测。
 
 ---
 
