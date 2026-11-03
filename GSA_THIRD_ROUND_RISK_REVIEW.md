@@ -17,9 +17,9 @@
 |---|---|---|---|---|---|
 | I1 | 双锁域无公共互斥:DelReqIDRun erase 与 Python 写路径并发 | **P0** | 稳态每步存在窗口 | pre:293-295 / scatter:1421-1429 | ✅ 已修复 |
 | I2 | mIsPrefetchRunning 生命周期缺陷:背靠背任务的假空闲窗口 | **P0** | 任务积压 + 恰逢 DelBlocksMap | scatter:1217 / pre:296 / task_manger:79-90 | ✅ 已修复 |
-| I3 | preempt 路径先 free 后 drain,与正常路径顺序相反 | P1 | 抢占时预取任务在飞 + 块被重分配 | gsa.py:1779-1786 | 待修复 |
-| I4 | cal_indexer_topk_blocks 覆写与 indexer 线程共享的 numpy 视图 | P1 | IS_INDEXER_OFFLOAD + 加载跨步 | gsa.py:2133-2135 / 2208-2210 | 待修复 |
-| I5 | "仅日志不拦截"链:脏 token → 越界 slot → 设备索引越界 | P1 | mRealTimeIdx 过期 / topk 脏数据 | pre:900-915 + hbm_manger:101-108 | 待修复 |
+| I3 | preempt 路径先 free 后 drain,与正常路径顺序相反 | P1 | 抢占时预取任务在飞 + 块被重分配 | gsa.py:1779-1786 | ✅ 已修复 |
+| I4 | cal_indexer_topk_blocks 覆写与 indexer 线程共享的 numpy 视图 | P1 | IS_INDEXER_OFFLOAD + 加载跨步 | gsa.py:2133-2135 / 2208-2210 | ✅ 已修复 |
+| I5 | "仅日志不拦截"链:脏 token → 越界 slot → 设备索引越界 | P1 | mRealTimeIdx 过期 / topk 脏数据 | pre:900-915 + hbm_manger:101-108 | ✅ 已修复 |
 | I6 | TokenIndexMapInter 无锁读 mRealTimeIdx/mSeqLen(C1 只修写侧) | P1 | 预取任务运行中 SubmitTask/DelReqIDRun 并发 | pre:892-917 vs scatter:1226-1228 | 待修复 |
 | I7 | mAllTopkIndicesTensor 跨锁域:worker memcpy vs SetTopkIndices 替换 | P1 | 新请求接入时预取在飞 | scatter:342 vs 1290-1291 | 待修复 |
 | I8 | mAllBlocksHash/mLastKVBlockAddress 跨锁域:find/at vs 重赋值 | P1 | SetBlocksMap 与预取并发 | pre:1383/1666 vs 649-656 | 待修复 |
@@ -92,6 +92,18 @@ worker             → 取走 B 立即执行(B 全程标志为 false,无人再�
 ---
 
 # 二、P1:条件性崩溃 / 静默数据损坏
+
+> **✅ I3 + I4 + I5 修复记录(第二批 P1:静默数据损坏)**
+
+- **I3(preempt 顺序对齐)**:`build_gsa_metadata` 的 preempted 循环重排为 **drain(prefetch + indexer)→ `_release_preempted_gsa_stats`(free 池/发布空闲数)→ `del_finish_meta`(墓碑)**,与正常结束路径 `request_finished_in_worker`(先 drain 再 free)一致。消除 drain 窗口内"scheduler 已重分配被抢占块、in-flight DMA 仍 scatter 写入"的跨请求 KV 污染;
+- **I4(numpy 视图深拷贝)**:`set_indexer_topk_blocks_decode` 提交的 `topk_lists` 由 numpy 视图改为 `.copy()` 深拷贝,切断与下一步 `cal_indexer_topk_blocks` 覆写(发生在 `execute_finished`、indexer 线程已恢复、无状态等待)的共享——C++ indexer 工作线程异步撕读消除;
+- **I5(三处 fail-safe 置 -1,交给下游既有负值过滤链)**:
+  - `TokenIndexMapInter` revIdx 越界(`revIdx >= mRealTimeIdx[reqID][layerID].size()`):原样保留 ERROR 日志,但不再执行 `operator[]` OOB 读,置 -1 + `continue`;
+  - `TokenIndexMapInter` 转换后脏 token(`< 0 || >= mSeqLen[reqID]`):置 -1 + `continue`,不再继续传播;
+  - `HBMManager::collectTopkHitsAndMisses` 越界 pinned slot(`transformedSlot >= mMaxTotalSlots`):置 -1(原写 `transformedSlot` 越界值);
+  - **下游安全闭环已核实**:`processTopkWithDebug:228` 将 `topkSlotIds` 初始化为全 -1;`collectTopkHitsAndMisses` 对 gid<0 记日志跳过(保持 -1);`buildTopkOutput:205` 跳过负值并由 LRU 补齐至 `mHbmImmutableSize`(= mSpaTopkLen,经 `ProcessTokensMapTopk:743` init 参数映射确认)→ `ProcessPrefetchRequest:326` 的 `mSpaTopkLen != useBlockTable.size()` 检查不会因补齐尺寸变化误触发 KVPackAbort;
+- **测试**:新增 4 个 UT——`TokenIndexMapInter` 组 2 个(`SanitizesRevIdxOutOfRangeToMinusOne`、`SanitizesDirtyTokenToMinusOne`,各带合法 token 对照);`HBMManagerTopkSanitize` 组 2 个(直接调 `collectTopkHitsAndMisses` 断言越界 pinned 置 -1 且不创建 pinned slot;经 `processTopkWithDebug` 端到端断言 output 尺寸 128 不受影响且不含越界 slot 值)。gsa.py 经 `ast.parse` 语法验证。
+- **验证**:C++ 无法本地编译,UT 需随构建跑;抢占-重分配场景 e2e 断言无跨请求 KV 污染(I3)。
 
 ## I3【P1】preempt 释放路径先 free 后 drain,与正常结束路径顺序相反
 

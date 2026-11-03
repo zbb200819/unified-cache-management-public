@@ -150,6 +150,47 @@ TEST_F(PreLogicTest, TokenIndexMapInterIsNoopWhenOffloadOff)
     EXPECT_EQ(oneTopkList, (std::vector<int>{0, 5}));  // unchanged
 }
 
+TEST_F(PreLogicTest, TokenIndexMapInterSanitizesRevIdxOutOfRangeToMinusOne)
+{
+    /* [I5] revIdx (token / mBlockSize) beyond mRealTimeIdx[reqID][layerID]
+     * must be sanitized to -1 instead of performing the unchecked
+     * std::vector operator[] read (OOB UB; garbage index would pollute the
+     * whole downstream chain). A valid token in the same list is a control. */
+    engine = MakeEngine(/*layerNum=*/1);
+    const std::string reqID = "req1";
+    engine->mRealTimeIdx[reqID] = {
+        {5, 9}
+    };  // [layer 0] size 2, blockSize = 4
+    engine->mSeqLen[reqID] = 1000;
+    std::vector<int> oneTopkList = {0, 10};
+    // token 0: block 0 -> idx 5 -> 5*4 + 0 = 20 (valid)
+    // token 10: block 10/4 = 2 >= size 2 -> out of range -> -1
+    engine->TokenIndexMapInter(oneTopkList, /*bsIndex=*/0, /*layerID=*/0,
+                               /*topkLen=*/2, reqID);
+    EXPECT_EQ(oneTopkList[0], 20);
+    EXPECT_EQ(oneTopkList[1], -1);
+}
+
+TEST_F(PreLogicTest, TokenIndexMapInterSanitizesDirtyTokenToMinusOne)
+{
+    /* [I5] A transformed token beyond mSeqLen[reqID] must be sanitized to
+     * -1 instead of propagating (out-of-range gids take the pinned-slot
+     * path and would end up in the device scatter/gather indices). */
+    engine = MakeEngine(/*layerNum=*/1);
+    const std::string reqID = "req1";
+    engine->mRealTimeIdx[reqID] = {
+        {5, 9}
+    };  // [layer 0], blockSize = 4
+    engine->mSeqLen[reqID] = 30;
+    std::vector<int> oneTopkList = {0, 5};
+    // token 0: block 0 -> idx 5 -> 5*4 + 0 = 20 < 30 (valid control)
+    // token 5: block 1 -> idx 9 -> 9*4 + 1 = 37 >= 30 -> -1
+    engine->TokenIndexMapInter(oneTopkList, /*bsIndex=*/0, /*layerID=*/0,
+                               /*topkLen=*/2, reqID);
+    EXPECT_EQ(oneTopkList[0], 20);
+    EXPECT_EQ(oneTopkList[1], -1);
+}
+
 /* ---------------- AddIndexerMapForRequest ---------------- */
 
 TEST_F(PreLogicTest, AddIndexerMapForRequestAppendsBlocksToDocsAndBlocksMap)

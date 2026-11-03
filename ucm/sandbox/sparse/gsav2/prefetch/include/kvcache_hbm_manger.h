@@ -104,7 +104,10 @@ public:
                     mLogger.log(LogLevel::ERROR,
                                 "|HBM Manager| Pinned slot %d exceeds maxTotalSlots %d, gid: %d\n",
                                 transformedSlot, mMaxTotalSlots, gid);
-                    topkSlotIds[i] = transformedSlot;
+                    // [I5] fail-safe:越界 pinned slot 置 -1 交给下游过滤
+                    // (buildTopkOutput 对负值跳过,LRU 补齐),不再把越界
+                    // slot 值经 shm 传到全 rank 的设备 scatter/gather 索引。
+                    topkSlotIds[i] = -1;
                     continue;
                 }
                 if (!mIsPinned[transformedSlot]) {

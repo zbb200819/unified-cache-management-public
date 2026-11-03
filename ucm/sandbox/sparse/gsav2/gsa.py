@@ -1777,12 +1777,17 @@ class GSA(UcmSparseBase):
         gsa_meta = GSAMetaData(self._vllm_config, self.topk_layer_num)
         gsa_meta.gsa_stats = self.gsa_stats
         for req_id in scheduler_output.preempted_req_ids:
-            self._release_preempted_gsa_stats(req_id)
+            # [I3] 对齐 request_finished_in_worker 的正确顺序:先 drain 预取与
+            # indexer 线程(在飞 DMA 可能正在 scatter 本请求的 device 块),
+            # 再 free 池/发布空闲数,最后置墓碑。原顺序(先 free/发布、后
+            # drain)的 drain 窗口内 scheduler 可能已把被抢占块重分配给其他
+            # 请求,in-flight DMA 仍会写这些块 → 跨请求 KV 污染。
             while self.prefetch_engine.prefetch_engine_c.get_prefetch_status():
                 time.sleep(0.001)
             if IS_INDEXER_OFFLOAD:
                 while self.prefetch_engine.prefetch_engine_c.get_indexer_status():
                     time.sleep(0.001)
+            self._release_preempted_gsa_stats(req_id)
             self.prefetch_engine.del_finish_meta(req_id)
             self._block_hash_injected_reqs.discard(req_id)
             self.preempt_req_output_tokens[req_id] = len(
@@ -2206,7 +2211,13 @@ class GSA(UcmSparseBase):
                 topk_lens_input.append(req_meta.prompt_sparse_len)
                 req_id_list.append(req_id)
                 topk_lists.append(
-                    req_meta.indexer_topk_blocks_cpu[:, : req_meta.prompt_sparse_len]
+                    # [I4] 深拷贝切断与 cal_indexer_topk_blocks 的缓冲共享:
+                    # 下一步的覆写发生在 execute_finished(indexer 线程已恢复)
+                    # 中且无 indexer 状态等待,共享的 numpy 视图会被 C++ indexer
+                    # 工作线程异步撕读 → 静默错预取。
+                    req_meta.indexer_topk_blocks_cpu[
+                        :, : req_meta.prompt_sparse_len
+                    ].copy()
                 )
                 req_meta.indexer_block_tables[:, : req_meta.prompt_sparse_len] = (
                     req_meta.prefetch_indexer_block_tables_cpu[

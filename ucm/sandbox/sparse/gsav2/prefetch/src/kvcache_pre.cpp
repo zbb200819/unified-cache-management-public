@@ -912,6 +912,11 @@ void GSAPrefetchEngineC::TokenIndexMapInter(std::vector<int>& oneTopkList, int b
                         "[ERROR] revIdx >= mRealTimeIdx[reqID][layerID].size()!!! "
                         "req_id: %s, layer_id %d, ori token %d, revIdx %d, mRealTimeIdx size %d\n",
                         reqID.c_str(), layerID, ori, revIdx, mRealTimeIdx[reqID][layerID].size());
+            // [I5] fail-safe:越界索引不再继续下标访问(std::vector operator[]
+            // 无检查,OOB 读 UB 且拿到垃圾 idx 污染后续链路),置 -1 交给下游
+            // 过滤(HBMManager 对 gid<0 记日志跳过;buildTopkOutput 对负值跳过)。
+            oneTopkList[j] = -1;
+            continue;
         }
         int idx = mRealTimeIdx[reqID][layerID][oneTopkList[j] / mBlockSize];
         oneTopkList[j] = idx * mBlockSize + slot;
@@ -922,6 +927,10 @@ void GSAPrefetchEngineC::TokenIndexMapInter(std::vector<int>& oneTopkList, int b
                         "idx: %d seq_len: %d for reqID %s\n",
                         mDecodeStep, layerID, ori, oneTopkList[j], revIdx, idx, mSeqLen[reqID],
                         reqID.c_str());
+            // [I5] fail-safe:脏 token 置 -1 交给下游过滤,不再继续传播(越界
+            // gid 会在 HBMManager 走 pinned 分支得到越界 slot 值并传到设备索引)。
+            oneTopkList[j] = -1;
+            continue;
         }
     }
 }

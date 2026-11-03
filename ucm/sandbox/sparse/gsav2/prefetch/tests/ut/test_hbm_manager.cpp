@@ -83,6 +83,56 @@ TEST(HBMManagerInit, NoPreloadLeavesSlotsUnallocatedButLruIntact)
     ExpectLruChainValid(m);
 }
 
+/* ---------------- topk sanitization (I5 fail-safe) ---------------- */
+
+TEST(HBMManagerTopkSanitize, OutOfRangePinnedSlotIsSanitizedToMinusOne)
+{
+    /* [I5] A gid whose transformed pinned slot (gid - dram + capacity) is
+     * >= maxTotalSlots must be sanitized to -1 in topkSlotIds instead of
+     * writing the raw transformedSlot value (e.g. 732), which previously
+     * travelled through shm into the device scatter/gather indices on
+     * every rank. */
+    HBMManager m;
+    const int dram = 1024, cap = 256;
+    m.init(dram, cap, /*immu=*/128, /*topk=*/64, kNullLogger, /*preload=*/true,
+           /*maxTotalSlots=*/512);
+    /* gid 5 is a preload hit (slot 5); gid 1500 -> 1500 - 1024 + 256 = 732
+     * >= maxTotalSlots 512 -> out-of-range pinned -> -1. */
+    std::vector<int> deduped = {5, 1500};
+    std::vector<int> topkSlotIds(deduped.size(), -1);
+    std::vector<int> missGids, missIdx;
+    m.collectTopkHitsAndMisses(deduped, topkSlotIds, missGids, missIdx, kNullLogger);
+    EXPECT_EQ(topkSlotIds[0], 5);    // valid preload hit unchanged
+    EXPECT_EQ(topkSlotIds[1], -1);   // out-of-range pinned slot sanitized
+    EXPECT_TRUE(missGids.empty());
+    /* No pinned slot may be created for the out-of-range gid. */
+    EXPECT_EQ(m.getPinnedSlotCount(), 0);
+    ExpectLruChainValid(m);
+}
+
+TEST(HBMManagerTopkSanitize, OutOfRangePinnedSlotNeverReachesTopkOutput)
+{
+    /* End-to-end through processTopkWithDebug (dedup + generation bump +
+     * collect + misses + buildTopkOutput): negatives are skipped and the
+     * output is backfilled from LRU up to mHbmImmutableSize (128), so the
+     * sanitized -1 sentinel never reaches the device indices and the
+     * output size is unaffected by the out-of-range gid. */
+    HBMManager m;
+    m.init(1024, 256, /*immu=*/128, /*topk=*/64, kNullLogger, /*preload=*/true,
+           /*maxTotalSlots=*/512);
+    std::vector<int> topkIds = {5, 1500};
+    std::vector<int> output, missGids, missSlots;
+    m.processTopkWithDebug(topkIds, output, missGids, missSlots, kNullLogger);
+    EXPECT_EQ((int)output.size(), 128);  // mHbmImmutableSize backfill
+    for (int s : output) {
+        EXPECT_GE(s, 0);
+        EXPECT_LT(s, 512);  // the out-of-range slot 732 must never appear
+    }
+    EXPECT_EQ(m.getPinnedSlotCount(), 0);
+    EXPECT_TRUE(missGids.empty());
+    ExpectLruChainValid(m);
+}
+
 TEST(HBMManagerInit, GetSlotForGlobalHandlesOutOfRangeAndPinnedFormula)
 {
     HBMManager m;
