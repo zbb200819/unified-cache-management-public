@@ -22,7 +22,7 @@
 | F2 | `indexer_select_post_process` 重复定义相互覆盖 | **P0** | v0.23.0_pmr 补丁生效时 | v0.23.0_pmr/.../device_op_patch.py:13,188 | **是** | ✅ 已修复 |
 | A3 | 老引擎 freeBlockPtr 裸写无界 | P1 | 行宽与表大小错配 | sparse/gsa/.../kvcache_pre.cpp:432 | 是(老引擎) | 待修复 |
 | B2 | 块 ID 陈旧 → 跨请求并发踩写 | P1 | 请求抢占/完成时 DMA 在途 | kvcache_pre_scatter.cpp:1305-1313 | **是** | 待修复 |
-| B3 | 裸指针 use-after-free 风险 | P1 | Python 张量先于 C++ 释放 | pybinds.cpp:143-148 + gsa.py:1544-1546 | **是** | 待修复 |
+| B3 | 裸指针 use-after-free 风险 | P1 | Python 张量先于 C++ 释放 | pybinds.cpp:143-148 + gsa.py:1544-1546 | **是** | ✅ 已修复 |
 | C1 | C++ map 跨线程并发读写无锁 | P1 | Python 写 API 与预取线程同时活跃 | kvcache_pre_scatter.cpp:1167-1171 附近 | **是** | ✅ 已修复 |
 | D1 | `-1` 槽位索引可达设备侧 scatter | P1 | aclgraph 捕获/回放 | sfa_kv_transfer_patch.py:387-392 | **是** | ✅ 已修复 |
 | E2 | `_load_kv_dram` 未捕获 C++ throw | P1 | PD 分离 D 节点 + store 注入未就绪 | gsa.py:2576 | 否(死代码) | ✅ 已修复 |
@@ -219,6 +219,27 @@ dstTensor = mKCacheAcl[layerID];   // ← SetKvTensor 注册的 vLLM KV cache �
 - 每步传入的 `req_meta.use_tokens.ptr`(gsa.py:1529)
 
 **修复建议**:被 C++ 持有指针的张量显式登记到 GSA 对象生命周期清单(如 `self._keepalive = [...]`),确保与引擎同生共死;C++ 侧增加指针有效性的弱校验。
+
+### ✅ 修复记录(B3)
+
+- **修复内容**(`gsa.py` `_pre_swap_tokens_all`,:1564 一带):一次性缓存改为**每次调用校验一致性**——
+  ```python
+  cur_cpu_ptr = self.gsa_swap_topk.cpu.data_ptr()
+  cur_npu_ptr = self.gsa_swap_topk.npu.data_ptr()
+  if (self.gsa_swap_topk_cpu_ptr != cur_cpu_ptr
+          or self.gsa_swap_topk_npu_ptr != cur_npu_ptr):
+      self.log.info(...  # 记录新旧地址
+      self.gsa_swap_topk_cpu_ptr = cur_cpu_ptr   # 刷新缓存
+      self.gsa_swap_topk_npu_ptr = cur_npu_ptr
+  ```
+- **修复原因与安全性论证**:
+  1. **张量本体不会先于 C++ 释放**:`gsa_swap_topk.cpu`/`.npu` 张量由 `self.gsa_swap_topk`(TopkIndices)持有,后者挂在 GSA 对象上,与 C++ 引擎同生命周期——"Python 张量先于 C++ 被释放"的唯一现实路径是 `.cpu`/`.npu` **张量对象被替换**(重新分配缓冲后 `self.gsa_swap_topk.cpu = new_tensor` 之类);
+  2. 旧实现首次取地址后**永不校验**,一旦缓冲被替换,缓存地址即成悬垂指针——C++ 拿它做 host memcpy / H2D 拷贝就是 use-after-free(读已回收内存 → 静默脏数据,或崩溃);
+  3. 新实现每次调用比对当前 `data_ptr()`:不一致即说明缓冲被替换,刷新缓存 + log(自愈 + 检测)。校验成本为每次调用两次 `data_ptr()`(Python C 层直接取 `THPVariable` 内部指针,纳秒级),相对 pre_swap_tokens 的批量 memcpy 可忽略;
+  4. **use_tokens 指针无需同款处理**:每次调用都由调用方从 `req_meta.use_tokens` 现取 `data_ptr` 现传(:1529 一带),指向的存储由 use_tokens tensor 持有且**同步使用**(单次调用内完成拷贝),无跨调用缓存,天然安全;
+  5. 首次调用时两缓存为 None(`:743-744`),必然走刷新分支并记录初始地址——与原"首次 log"行为等价。
+- **备注**:文档原建议的"keepalive 清单"方案适用于"C++ 长期持有指针"场景;本处指针是**每次调用同步传入、单次使用**(`pre_swap_tokens` 调用期间完成全部拷贝),真正的风险仅在"缓存跨调用不校验",故逐次校验是更精准的最小修复。pybinds.cpp 注释里 `set_kv_buffer`/`set_store_v1` 等**长期持有**型裸指针(注释自己承认的 UAF)属 C++ 侧弱校验问题,超出 Python 侧修复范围,保留为后续项。
+- **验证**:`ast.parse` 语法通过;常规步行为不变(地址稳定,校验恒 False);缓冲重建场景日志出现 "gsa_swap_topk buffer replaced" 记录且新地址生效。
 
 ---
 

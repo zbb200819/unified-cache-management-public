@@ -1561,13 +1561,27 @@ class GSA(UcmSparseBase):
                 f"num_reqs={len(use_req_ids)}); token-count vs request-count "
                 f"dim mismatch (issue A1, MTP?)"
             )
-        if self.gsa_swap_topk_cpu_ptr is None:
-            self.gsa_swap_topk_cpu_ptr = self.gsa_swap_topk.cpu.data_ptr()
-            self.gsa_swap_topk_npu_ptr = self.gsa_swap_topk.npu.data_ptr()
+        # [B3 修复] 指针缓存改为"每次调用校验一致性":
+        # 原实现只在首次调用时缓存 gsa_swap_topk 的 cpu/npu data_ptr,此后永不
+        # 校验。张量本体由 self.gsa_swap_topk(TopkIndices)持有、与 GSA 同生命
+        # 周期,正常情况下地址稳定;但若 .cpu/.npu 张量对象被重新分配(如尺寸
+        # 变化触发的重建),旧缓存地址即成悬垂指针——C++ 拿它做 host memcpy /
+        # H2D 拷贝就是 use-after-free,读到的是已回收内存(静默脏数据)或崩溃。
+        # 每次调用比对当前 data_ptr:不一致说明缓冲被替换,刷新缓存并 log
+        # (自愈 + 检测);use_tokens 指针每次调用都由调用方现取现传,天然安全。
+        cur_cpu_ptr = self.gsa_swap_topk.cpu.data_ptr()
+        cur_npu_ptr = self.gsa_swap_topk.npu.data_ptr()
+        if (
+            self.gsa_swap_topk_cpu_ptr != cur_cpu_ptr
+            or self.gsa_swap_topk_npu_ptr != cur_npu_ptr
+        ):
             self.log.info(
-                f"[GSA] gsa_swap_topk_cpu_ptr {self.gsa_swap_topk_cpu_ptr}"
-                f"gsa_swap_topk_npu_ptr {self.gsa_swap_topk_npu_ptr}\n"
+                f"[GSA] gsa_swap_topk buffer replaced: cpu_ptr "
+                f"{self.gsa_swap_topk_cpu_ptr} -> {cur_cpu_ptr}, "
+                f"npu_ptr {self.gsa_swap_topk_npu_ptr} -> {cur_npu_ptr}\n"
             )
+            self.gsa_swap_topk_cpu_ptr = cur_cpu_ptr
+            self.gsa_swap_topk_npu_ptr = cur_npu_ptr
         self.prefetch_engine.prefetch_engine_c.pre_swap_tokens(
             use_tokens_ptrs,
             seq_lens,
