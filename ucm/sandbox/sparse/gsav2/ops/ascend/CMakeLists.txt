@@ -178,6 +178,7 @@ if (BUILD_OPEN_PROJECT)
             register
             ascendalog
             error_manager
+            ops_base
             -Wl,--as-needed
             -Wl,--whole-archive
             tiling_api

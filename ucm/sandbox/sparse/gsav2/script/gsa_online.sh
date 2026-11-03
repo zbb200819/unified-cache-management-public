@@ -7,8 +7,17 @@ CODE_ROOT=$(dirname "$(dirname "$(readlink -f "$0")")")
 # ================================
 # 🔧 基础参数配置
 # ================================
+export PYTHONPATH="/vllm-workspace/vllm:/vllm-workspace/vllm-ascend:$CODE_ROOT/ucm:$PYTHONPATH"
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HCCL_OP_EXPANSION_MODE="AIV"
+export OMP_PROC_BIND=false
+export OMP_NUM_THREADS=1
+export HCCL_BUFFSIZE=1024
+export VLLM_ASCEND_ENABLE_MLAPO=1
+export VLLM_VERSION=0.23.0
+
+
 export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
-export MOONCAKE_CONFIG_PATH="./mooncake.json"
 export PYTHONPATH="/vllm-workspace/vllm:/vllm-workspace/vllm-ascend:$CODE_ROOT/ucm:$PYTHONPATH"
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export VLLM_LOGGING_LEVEL=INFO
@@ -16,7 +25,6 @@ export VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE=0
 export debug_save_search_result=false
 export PYTHONHASHSEED=123456
 export SPDLOG_LEVEL=warn
-export VLLM_LOG_PATH='./vllm_log/'
 
 export TASK_QUEUE_ENABLE=1
 export HCCL_OP_EXPANSION_MODE="AIV"

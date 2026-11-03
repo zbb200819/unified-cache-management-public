@@ -363,6 +363,7 @@ void QSFAMlaTiling::FillTilingBaseParamsMla()
     tilingData_.baseParams.set_isActualLenDimsKVNull(qsfaInfo_->actualSeqLenFlag ? 0U : 1U);
     // GSA-P1: 设置有效 sparse count（0 表示未知，kernel 退化为 sparseBlockCount*sparseBlockSize）
     tilingData_.baseParams.set_effectiveSparseCount(qsfaInfo_->effectiveSparseCount);
+    tilingData_.baseParams.set_hasActualSparseLengths(qsfaInfo_->hasActualSparseLengths ? 1U : 0U);
     // GSA-v2: 是否返回 softmax 统计结果
     tilingData_.baseParams.set_returnSoftmaxLse(qsfaInfo_->returnSoftmaxLse ? 1U : 0U);
 }
@@ -1600,6 +1601,10 @@ void QSFAInfoParser::GetOptionalInputParaInfo()
     opParamInfo_.actualSeqLengths.desc = context_->GetOptionalInputDesc(ACT_SEQ_LEN_KV_INPUT_INDEX);
     opParamInfo_.keyDequantScale.tensor = context_->GetOptionalInputTensor(KEY_DEQUANT_SCALE_INPUT_INDEX);
     opParamInfo_.valueDequantScale.tensor = context_->GetOptionalInputTensor(VALUE_DEQUANT_SCALE_INPUT_INDEX);
+    opParamInfo_.actualSparseLengths.tensor =
+        context_->GetOptionalInputTensor(ACTUAL_SPARSE_LENGTHS_INPUT_INDEX);
+    opParamInfo_.actualSparseLengths.desc =
+        context_->GetOptionalInputDesc(ACTUAL_SPARSE_LENGTHS_INPUT_INDEX);
 }
 
 void QSFAInfoParser::GetInputParaInfo()
@@ -2006,6 +2011,8 @@ void QSFAInfoParser::FillTilingInfoAttrsAndLayouts(QSFATilingInfo &qsfaInfo)
     // GSA-P1: 扫描 sparse_indices 统计有效(非-1)的 topk 数量
     // host 侧一次性扫描，避免 kernel 侧 V_TEMPLATE 路径盲目按 sparseBlockCount 计算有效长度
     qsfaInfo.effectiveSparseCount = ScanEffectiveSparseCount();
+    // GSA-P1: 若用户传入 per-batch 真是 topk 长度， kernel 直接按该长度计算 （padding 场景提速）
+    qsfaInfo.hasActualSparseLengths = (opParamInfo_.actualSparseLengths.tensor != nullptr);
     // GSA-v2: return_softmax_lse 属性
     qsfaInfo.returnSoftmaxLse = ParseReturnSoftmaxLse();
 }
@@ -2057,56 +2064,7 @@ IMPL_OP_OPTILING(KvQuantSparseFlashAttentionGsa)
 // 返回 0 表示无法获取数据（动态shape无device数据），kernel 侧退化为 sparseBlockCount 行为。
 uint32_t QSFAInfoParser::ScanEffectiveSparseCount()
 {
-    if (opParamInfo_.sparseIndices.shape == nullptr) {
-        return 0U;
-    }
-    // 尝试从 TilingContext 获取 sparse_indices 运行时数据
-    // 在 aclnn 调用路径下，tiling 阶段可通过 GetInputTensor 获取已计算好的 sparse_indices
-    auto sparseIndicesTensor = context_->GetInputTensor(SPARSE_INDICES_INPUT_INDEX);
-    if (sparseIndicesTensor == nullptr) {
-        return 0U;
-    }
-    auto dataPtr = sparseIndicesTensor->GetData<int32_t>();
-    if (dataPtr == nullptr) {
-        return 0U;
-    }
-    // sparse_indices shape: [B, Q_S, KV_N, sparseBlockCount] (BSND) 或 [Q_T, KV_N, sparseBlockCount] (TND)
-    // 计算总行数 = B * Q_S * KV_N 或 Q_T * KV_N
-    const auto &storageShape = opParamInfo_.sparseIndices.shape->GetStorageShape();
-    uint32_t totalRows = 1U;
-    for (size_t dimIdx = 0; dimIdx + 1 < storageShape.GetDimNum(); dimIdx++) {
-        int64_t dimVal = storageShape.GetDim(dimIdx);
-        if (dimVal <= 0) { return 0U; }
-        totalRows *= static_cast<uint32_t>(dimVal);
-    }
-    uint32_t countPerRow = sparseBlockCount_;
-    if (countPerRow == 0 || totalRows == 0) {
-        return 0U;
-    }
-    // 逐行扫描：找到每行最后一个非-1的位置+1，取所有行的最小值
-    // 语义保证：每行有效值在前半部分，无效(-1)在后半部分
-    uint32_t minEffective = countPerRow;
-    for (uint32_t rowIdx = 0; rowIdx < totalRows; rowIdx++) {
-        const int32_t *rowPtr = dataPtr + rowIdx * countPerRow;
-        uint32_t effective = countPerRow;
-        // 从末尾向前扫描找首个非-1
-        for (int32_t colIdx = static_cast<int32_t>(countPerRow) - 1; colIdx >= 0; colIdx--) {
-            if (rowPtr[colIdx] != -1) {
-                effective = static_cast<uint32_t>(colIdx) + 1U;
-                break;
-            }
-        }
-        if (effective < minEffective) {
-            minEffective = effective;
-        }
-        // 快速退出：如果某行全有效，说明至少有 countPerRow 个有效，无需继续
-        if (minEffective == countPerRow) {
-            break;
-        }
-    }
-    OP_LOGI(opName_, "QSFA-GSA P1: sparseBlockCount=%u, effectiveSparseCount=%u (scanned %u rows)",
-            countPerRow, minEffective, totalRows);
-    return minEffective;
+    return 0U;
 }
 
 // GSA-v2: 解析 return_softmax_lse 属性

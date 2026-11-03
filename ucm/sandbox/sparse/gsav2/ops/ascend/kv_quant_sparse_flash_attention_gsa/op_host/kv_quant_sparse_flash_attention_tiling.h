@@ -34,6 +34,9 @@ constexpr uint32_t VALUE_DEQUANT_SCALE_INPUT_INDEX = 3;
 constexpr uint32_t BLOCK_TABLE_INPUT_INDEX = 6;
 constexpr uint32_t ACT_SEQ_LEN_Q_INPUT_INDEX = 7;
 constexpr uint32_t ACT_SEQ_LEN_KV_INPUT_INDEX = 8;
+constexpr uint32_t SINKS_INPUT_INDEX = 9;
+// GSA-P1: 每个 batch 的真实 topk 有效长度
+constexpr uint32_t ACTUAL_SPARSE_LENGTHS_INPUT_INDEX = 10;
 // Outputs Index
 constexpr uint32_t OUTPUT_INDEX = 0;
 // Attributes Index
@@ -125,6 +128,8 @@ struct QSFAParaInfo {
     QSFAOptionalParaInfo keyRope = {nullptr, nullptr};
     QSFAOptionalParaInfo keyDequantScale = {nullptr, nullptr};
     QSFAOptionalParaInfo valueDequantScale = {nullptr, nullptr};
+    // GSA-p1: 每个 batch 的真实 topk 有效长度
+    QSFAOptionalParaInfo actualSparseLengths = {nullptr, nullptr};
     QSFARequiredParaInfo attenOut = {nullptr, nullptr};
 
     const char *layoutQuery = nullptr;
@@ -169,6 +174,8 @@ TILING_DATA_FIELD_DEF(uint32_t, isActualLenDimsNull)
 TILING_DATA_FIELD_DEF(uint32_t, isActualLenDimsKVNull)
 // GSA-P1: 有效 sparse count（非-1的实际topk数量），0表示未知（kernel退化为sparseBlockCount）
 TILING_DATA_FIELD_DEF(uint32_t, effectiveSparseCount)
+// GSA-P1: 是否传入 actual_sparse_lengths （1=是，kernel 按 per-batch 长度计算有效KV）
+TILING_DATA_FIELD_DEF(uint32_t, hasActualSparseLengths)
 // GSA-v2: 是否返回 softmax_max / softmax_sum
 TILING_DATA_FIELD_DEF(uint32_t, returnSoftmaxLse)
 END_TILING_DATA_DEF
@@ -261,6 +268,8 @@ struct QSFATilingInfo {
 
     // GSA-P1: 有效 sparse count（host侧扫描sparse_indices统计非-1的个数，0表示未知）
     uint32_t effectiveSparseCount = 0;
+    // GSA-P1: 是否传入 actual_sparse_lengths （per-batch 真实 topk 长度）
+    bool hasActualSparseLengths = false;
     // GSA-v2: 是否返回 softmax 统计结果
     bool returnSoftmaxLse = false;
 

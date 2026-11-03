@@ -362,6 +362,9 @@ inline aclScalar* ConvertType(const c10::optional<at::Scalar>& opt_scalar)
 inline aclDataType ConvertType(const at::ScalarType scalarType)
 { return kATenScalarTypeToAclDataTypeTable[static_cast<int64_t>(scalarType)]; }
 
+inline const char* ConvertType(const string& str)
+{ return str.c_str(); }
+
 template <typename T>
 T ConvertType(T value)
 { return value; }

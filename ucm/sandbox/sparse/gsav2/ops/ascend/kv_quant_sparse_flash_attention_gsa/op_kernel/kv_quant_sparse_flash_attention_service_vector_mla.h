@@ -732,37 +732,30 @@ __aicore__ inline void QSFAVectorService<QSFAT>::CopyOutMrgeResult(int64_t mte2S
     uint32_t dealLoop = CeilDiv(dealRow, LIMIT_DEAL_ROW);
     uint32_t dealRowFp32 = LIMIT_DEAL_ROW;
     uint32_t element = LIMIT_DEAL_ROW * constInfo.headDim;
+    LocalTensor<half> kvTensorAsFp32 = inputBuff2.Get<T>();
     LocalTensor<K_ROPE_T> antiKvTensorAsB16 = tmpBuff1.Get<K_ROPE_T>();
-    // scale: FP32 → K_ROPE_T (half 或 bfloat16_t)
-    LocalTensor<K_ROPE_T> antiQuantScaleB16 = inputBuff2.Get<K_ROPE_T>();
-    Cast(antiQuantScaleB16, antiQuantScale, RoundMode::CAST_NONE,
-         static_cast<uint32_t>(dealRow * ConstInfo::BUFFER_SIZE_BYTE_32B / sizeof(T)));
-    PipeBarrier<PIPE_V>();
-    // half 域 Mul 的 repeat element 数 (128 for half/bf16, vs 64 for fp32)
-    constexpr uint32_t B16_REPEAT_ELEMENT_NUM = FP32_REPEAT_ELEMENT_NUM * 2;
     for (uint32_t i = 0; i < dealLoop; i++) {
         if (i == dealLoop - 1) {
             dealRowFp32 = dealRow - i * LIMIT_DEAL_ROW;
         }
-        if constexpr (IsSameType<K_ROPE_T, half>::value) {
-            // K_ROPE_T=half: INT8→half Cast 后直接 half 域 Mul
-            for (uint32_t j = 0; j < constInfo.tileSize / B16_REPEAT_ELEMENT_NUM; j++) {
-                Mul(antiKvTensorAsB16[i * element + j * B16_REPEAT_ELEMENT_NUM],
-                    kvTensorAsFp16[i * element + j * B16_REPEAT_ELEMENT_NUM],
-                    antiQuantScaleB16[i * LIMIT_DEAL_ROW * (B16_REPEAT_ELEMENT_NUM / 2)],
-                    B16_REPEAT_ELEMENT_NUM, static_cast<uint8_t>(dealRowFp32), {1, 1, 0, 8, 8, 1});
-            }
+        Cast(kvTensorAsFp32, kvTensorAsFp16[i * element], RoundMode::CAST_NONE, 
+            static_cast<uint32_t>(dealRowFp32 * constInfo.headDim));
+        PipeBarrier<PIPE_V>();
+        for (uint32_t j = 0; j < constInfo.tileSize / FP32_REPEAT_ELEMENT_NUM; j++) {
+            Mul(kvTensorAsFp32[j * FP32_REPEAT_ELEMENT_NUM], kvTensorAsFp32[j * FP32_REPEAT_ELEMENT_NUM],
+                antiQuantScaleB16[i * LIMIT_DEAL_ROW * 32],
+                FP32_REPEAT_ELEMENT_NUM, 4 * dealRowFP32, {1, 1, 0, 16, 16, 1});
+        }
+        PipeBarrier<PIPE_V>();
+
+        if constexpr (IsSameType<K_ROPE_T, bfloat16_t>::value) {
+            Cast(antiKvTensorAsB16[i * element], kvTensorAsFp32, RoundMode::CAST_RINT,
+                 static_cast<uint32_t>(dealRowFp32 * constInfo.headDim));
+            
         } else {
             // K_ROPE_T=bfloat16_t: INT8→half→BF16 Cast 后在 BF16 域 Mul
-            Cast(antiKvTensorAsB16[i * element], kvTensorAsFp16[i * element], RoundMode::CAST_NONE,
+            Cast(antiKvTensorAsB16[i * element], kvTensorAsFp32, RoundMode::CAST_ROUND,
                  static_cast<uint32_t>(dealRowFp32 * constInfo.headDim));
-            PipeBarrier<PIPE_V>();
-            for (uint32_t j = 0; j < constInfo.tileSize / B16_REPEAT_ELEMENT_NUM; j++) {
-                Mul(antiKvTensorAsB16[i * element + j * B16_REPEAT_ELEMENT_NUM],
-                    antiKvTensorAsB16[i * element + j * B16_REPEAT_ELEMENT_NUM],
-                    antiQuantScaleB16[i * LIMIT_DEAL_ROW * (B16_REPEAT_ELEMENT_NUM / 2)],
-                    B16_REPEAT_ELEMENT_NUM, static_cast<uint8_t>(dealRowFp32), {1, 1, 0, 8, 8, 1});
-            }
         }
         PipeBarrier<PIPE_V>();
     }

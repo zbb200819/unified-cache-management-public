@@ -67,7 +67,9 @@ public:
                                 __gm__ uint8_t *sparseIndices, __gm__ uint8_t* keyScale,
                                 __gm__ uint8_t* valueScale, __gm__ uint8_t *blockTable,
                                 __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
-                                __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
+                                __gm__ uint8_t *sinks, __gm__ uint8_t *attentionOut,
+                                __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
+                                __gm__ uint8_t *actualSparseLengths, __gm__ uint8_t *workspace,
                                 const KvQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
 				                __gm__ uint8_t *gmTiling, TPipe *tPipe);
 
@@ -140,11 +142,17 @@ private:
     GlobalTensor<K_ROPE_T> kRopeGm;
 
     GlobalTensor<OUT_T> attentionOutGm;
+    GlobalTensor<T> softmaxMaxGm;
+    GlobalTensor<T> softmaxSumGm;
+    GlobalTensor<T> sinksGm;
     GlobalTensor<int32_t> blockTableGm;
     GlobalTensor<int32_t> topKGm;
 
     GlobalTensor<int32_t> actualSeqLengthsQGm;
     GlobalTensor<int32_t> actualSeqLengthsKVGm;
+    // GSA-P1: per-batch sparse lengths
+    GlobalTensor<int32_t> actualSparseLengthsGm;
+    bool hasActualSparseLengths = false;
 
     // workspace
     GlobalTensor<MM1_OUT_T> mm1ResGm;
@@ -164,7 +172,8 @@ private:
     __aicore__ inline void InitTilingData();
     __aicore__ inline void InitCalcParamsEach();
     __aicore__ inline void InitBuffers();
-    __aicore__ inline void InitActualSeqLen(__gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths);
+    __aicore__ inline void InitActualSeqLen(__gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
+                                            __gm__ uint8_t *actualSparseLengths);
     __aicore__ inline void InitOutputSingleCore();
     // ================================Process functions================================
     __aicore__ inline void ProcessBalance();
@@ -221,6 +230,8 @@ template <typename QSFAT> __aicore__ inline void KvQuantSparseFlashAttentionMla<
     if (constInfo.effectiveSparseCount == 0) {
         constInfo.effectiveSparseCount = constInfo.sparseBlockCount;
     }
+    // GSA-P1: 是否返回 per-batch sparse lengths
+    hasActualSparseLengths = (tilingData->baseParams.hasActualSparseLengths != 0);
     // GSA-v2: 是否返回 softmax 统计结果
     constInfo.returnSoftmaxLse = tilingData->baseParams.returnSoftmaxLse;
     constInfo.sparseMode = tilingData->baseParams.sparseMode;
@@ -251,7 +262,8 @@ template <typename QSFAT> __aicore__ inline void KvQuantSparseFlashAttentionMla<
 template <typename QSFAT>
 __aicore__ inline void
 KvQuantSparseFlashAttentionMla<QSFAT>::InitActualSeqLen(__gm__ uint8_t *actualSeqLengthsQ,
-                                                          __gm__ uint8_t *actualSeqLengths)
+                                                          __gm__ uint8_t *actualSeqLengths,
+                                                          __gm__ uint8_t *actualSparseLengths)
 {
     constInfo.actualLenDimsQ = tilingData->baseParams.actualLenDimsQ;
     constInfo.actualLenDimsKV = tilingData->baseParams.actualLenDimsKV;
@@ -260,6 +272,10 @@ KvQuantSparseFlashAttentionMla<QSFAT>::InitActualSeqLen(__gm__ uint8_t *actualSe
     }
     if (constInfo.actualLenDimsKV != 0) {
         actualSeqLengthsKVGm.SetGlobalBuffer((__gm__ int32_t *)actualSeqLengths, constInfo.actualLenDimsKV);
+    }
+    // GSA-P1: per-batch sparse lengths
+    if (hasActualSparseLengths) {
+        actualSparseLengthsGm.SetGlobalBuffer((__gm__ int32_t *)actualSparseLengths, constInfo.batchSize);
     }
 }
 
@@ -322,9 +338,17 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::GetSparseActualSeq
     if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
         // GSA-P1: 使用 effectiveSparseCount（host侧扫描的有效topk数）替代 sparseBlockCount
         // 这是 5120-padding-1 场景性能从 429us 回到 ~95us 的关键改动
-        tempLoopInfo.curActualSeqLen = (constInfo.effectiveSparseCount * constInfo.sparseBlockSize > threshold) ?
+        // 
+        uint32_t effcout = constInfo.effectiveSparseCount;
+        if (hasActualSparseLengths) {
+            int32_t perBatch = actualSparseLengthsGm.GetValue(bIdx);
+            if (perBatch > 0 && static_cast<uint32_t>(perBatch) < effcout) {
+                effcout = static_cast<uint32_t>(perBatch);
+            }
+        }
+        tempLoopInfo.curActualSeqLen = (effcout * constInfo.sparseBlockSize > threshold) ?
                                            threshold :
-                                           constInfo.effectiveSparseCount * constInfo.sparseBlockSize;
+                                           effcout * constInfo.sparseBlockSize;
     } else {
         uint64_t topKBaseOffset = 0;
         if constexpr (LAYOUT_T == QSFA_LAYOUT::BSND) { // B,S1,N2 K
@@ -435,7 +459,9 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uint8_
     __gm__ uint8_t *key, __gm__ uint8_t *value,
     __gm__ uint8_t *sparseIndices, __gm__ uint8_t* keyScale,
     __gm__ uint8_t* valueScale, __gm__ uint8_t *blockTable, __gm__ uint8_t *actualSeqLengthsQ,
-    __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
+    __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *sinks, __gm__ uint8_t *attentionOut,
+    __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, __gm__ uint8_t *actualSparseLengths,
+    __gm__ uint8_t *workspace,
     const KvQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
     __gm__ uint8_t *gmTiling, TPipe *tPipe)
 {
@@ -451,7 +477,7 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uint8_
     tilingData = tiling;
 
     InitTilingData();
-    InitActualSeqLen(actualSeqLengthsQ, actualSeqLengths);
+    InitActualSeqLen(actualSeqLengthsQ, actualSeqLengths, actualSparseLengths);
 
     // 初始化计算参数
     InitCalcParamsEach();
@@ -465,6 +491,15 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uint8_
     valueGm.SetGlobalBuffer((__gm__ KV_T *)valuePtr);
 
     attentionOutGm.SetGlobalBuffer((__gm__ OUT_T *)attentionOut);
+    if (softmaxMax != nullptr) {
+        softmaxMaxGm.SetGlobalBuffer((__gm__ T *)softmaxMax);
+    }
+    if (softmaxSum != nullptr) {
+        softmaxSumGm.SetGlobalBuffer((__gm__ T *)softmaxSum);
+    }
+    if (sinks != nullptr) {
+        sinksGm.SetGlobalBuffer((__gm__ T *)sinks);
+    }
 
     if ASCEND_IS_AIV {
         if (constInfo.needInit && LAYOUT_T != QSFA_LAYOUT::TND) {

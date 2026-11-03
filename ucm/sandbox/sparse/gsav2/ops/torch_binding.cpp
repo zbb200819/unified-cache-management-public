@@ -148,6 +148,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_kv_quant_sparse_flash_attenti
     const c10::optional<at::Tensor>& actualSeqLengthsQuery,
     const c10::optional<at::Tensor>& actualSeqLengthsKV,
     const c10::optional<at::Tensor>& sinks,
+    const c10::optional<at::Tensor>& actualSparseLengths,
     c10::optional<int64_t> sparseBlockSize,
     c10::string_view layoutQuery,
     c10::string_view layoutKV,
@@ -178,14 +179,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_kv_quant_sparse_flash_attenti
     auto&& tileSize_ = tileSize.value_or(128);
     auto&& returnSoftmaxLse_ = returnSoftmaxLse.value_or(false);
 
+    // CovertTypes 
+    std::string layoutQueryStr(layoutQuery);
+    std::string layoutKVStr(layoutKV);
+
     EXEC_NPU_CMD(aclnnKvQuantSparseFlashAttentionGsa, query, key, value, sparseIndices,
                  keyDequantScale, valueDequantScale, blockTable,
-                 actualSeqLengthsQuery, actualSeqLengthsKV, sinks,
-                 attentionOut, softmaxMax, softmaxSum,
+                 actualSeqLengthsQuery, actualSeqLengthsKV, sinks, actualSparseLengths,
                  scaleValue, keyQuantMode, valueQuantMode, sparseBlockSize_,
-                 std::string(layoutQuery), std::string(layoutKV), sparseMode_,
+                 layoutQueryStr, layoutKVStr, sparseMode_,
                  preTokens_, nextTokens_, attentionMode_, quantScaleRepoMode_,
-                 tileSize_, ropeDim, returnSoftmaxLse_);
+                 tileSize_, ropeDim, returnSoftmaxLse_,
+                 attentionOut, softmaxMax, softmaxSum,);
     return std::make_tuple(attentionOut, softmaxMax, softmaxSum);
 }
 
@@ -211,7 +216,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _gsa), ops)
     // gsa_topk_expand_tmp: pad 是 IntArrayRef，用 SymInt list 表达；padValue 用 int
     // 返回 view 的 tensor
     ops.def("gsa_topk_expand_tmp(Tensor topk_indices, Tensor swap_topk, Tensor swap_index, "
-            "Tensor tmp_tensor, SymInt[] pad, int pad_value, int expand_len) -> Tensor");
+            "Tensor tmp_tensor, int[] pad, int pad_value, int expand_len) -> Tensor");
     ops.impl("gsa_topk_expand_tmp", torch::kPrivateUse1, &gsa::gsa_topk_expand_tmp_wrapper);
 
     // --- 自定义 AscendC 算子 ---
@@ -222,11 +227,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _gsa), ops)
         "Tensor? key_dequant_scale=None, Tensor? value_dequant_scale=None, "
         "Tensor? block_table=None, Tensor? actual_seq_lengths_query=None, "
         "Tensor? actual_seq_lengths_kv=None, Tensor? sinks=None, "
-        "int sparse_block_size=1, str layout_query=\"BSND\", str layout_kv=\"BSND\", "
-        "int sparse_mode=3, int pre_tokens=9223372036854775807, "
-        "int next_tokens=9223372036854775807, int attention_mode=0, "
-        "int quant_scale_repo_mode=1, int tile_size=128, int rope_head_dim=64, "
-        "bool return_softmax_lse=False) -> (Tensor, Tensor, Tensor)");
+        "Tensor? actual_sparse_lengths=None, "
+        "int? sparse_block_size=1, str layout_query=\"BSND\", str layout_kv=\"BSND\", "
+        "int? sparse_mode=3, int? pre_tokens=9223372036854775807, "
+        "int? next_tokens=9223372036854775807, int? attention_mode=0, "
+        "int? quant_scale_repo_mode=1, int? tile_size=128, int? rope_head_dim=64, "
+        "bool? return_softmax_lse=False) -> (Tensor, Tensor, Tensor)");
     ops.impl("npu_kv_quant_sparse_flash_attention_gsa", torch::kPrivateUse1,
              &gsa::npu_kv_quant_sparse_flash_attention_gsa);
 }

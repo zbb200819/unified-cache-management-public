@@ -3,9 +3,10 @@
 
 add_ops_compile_options(
         OP_NAME KvQuantSparseFlashAttentionGsa
-        OPTIONS --cce-auto-sync=on
+        OPTIONS --cce-auto-sync=off
                 -Wno-deprecated-declarations
                 -Werror
+                -mllvm -cce-vf-remove-member=false
                 -mllvm -cce-aicore-hoist-movemask=false
                 --op_relocatable_kernel_binary=true
 )
