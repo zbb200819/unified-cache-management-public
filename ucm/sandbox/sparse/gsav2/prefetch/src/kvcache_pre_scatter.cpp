@@ -841,13 +841,9 @@ bool GSAPrefetchEngineC::SubmitIndexerInitLoadTask(UC::Detail::TaskDesc& task,
                     reqID.c_str(), layerID, loadNumber, error.c_str());
         return false;
     }
-    auto waitStatus = mStoreV1_->Wait(loadResult.Value());
-    if (waitStatus.Failure()) {
-        const std::string error = waitStatus.ToString();
-        mLogger.log(LogLevel::ERROR,
-                    "[ERROR] IndexerInitLoad Wait failed, "
-                    "reqID=%s layerID=%d loadNumber=%zu status=%s\n",
-                    reqID.c_str(), layerID, loadNumber, error.c_str());
+    // [H2] 有界等待:IndexerInitLoad 由 Python 主线程触达(SetIndexerMap →
+    // IndexerInitLoad),超时返回 false 走既有降级,避免主线程挂死。
+    if (!WaitStoreBounded(loadResult.Value(), reqID, layerID, "indexer_init_load")) {
         return false;
     }
     return true;
@@ -1079,13 +1075,9 @@ bool GSAPrefetchEngineC::LoadIndexerTask(const std::string& reqID, int layerID,
                     reqID.c_str(), layerID, loadNumber, error.c_str());
         return false;
     }
-    auto waitStatus = mStoreV1_->Wait(loadResult.Value());
-    if (waitStatus.Failure()) {
-        const std::string error = waitStatus.ToString();
-        mLogger.log(LogLevel::ERROR,
-                    "[ERROR] UCMIndexerLoadAsync Wait failed, "
-                    "reqID=%s layerID=%d loadNumber=%zu status=%s\n",
-                    reqID.c_str(), layerID, loadNumber, error.c_str());
+    // [H2] 有界等待:此路径运行在 indexer 工作线程,超时返回 false 走既有
+    // 降级,避免该线程永久挂死(mIsIndexerLoadRunning 永真、后续加载停摆)。
+    if (!WaitStoreBounded(loadResult.Value(), reqID, layerID, "indexer_async_load")) {
         return false;
     }
     totalNumber += loadNumber;

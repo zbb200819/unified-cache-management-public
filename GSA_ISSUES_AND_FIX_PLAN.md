@@ -34,7 +34,7 @@
 | F5 | `init_kvcache_ptrs` 无判空直接索引 | P2 | kv_cache 为 None/空 | gsa.py:2771-2782 | **是** | ✅ 已修复 |
 | G1 | 跨文件隐式常量约定 | P2 | 修改任一常量 | sparse/utils.py:64-65 | **是** | ✅ 已修复 |
 | H1 | `KVPackAbort` 无日志裸调用 → 静默死亡 + 跨 rank 半死 | P1 | 8 处无前置日志的 abort 点触发 | kvcache_pre_detail.h:56-64 + scatter:316/410/421 + pre:538/1581-1607 | **是** | 待修复 |
-| H2 | `mStoreV1_->Wait` 无界阻塞 → 预取链路/Python 主线程挂死 | **P0** | store 实现无超时或超时失效(psync 卡死 IO / dram future.get / timeout_ms=0) | kvcache_pre.cpp:1184,1279 | **是** | 待修复 |
+| H2 | `mStoreV1_->Wait` 无界阻塞 → 预取链路/Python 主线程挂死 | **P0** | store 实现无超时或超时失效(psync 卡死 IO / dram future.get / timeout_ms=0) | kvcache_pre.cpp:1184,1279 + scatter:844,1082 | **是** | ✅ 已修复 |
 
 > 注意:**A/B/C/D/F/G 类问题与是否开启 PD 分离无关,PD-mix 日常部署同样暴露在风险之下**;E 类仅在 PD 分离部署时进入执行路径(PD-mix 下 agent 不创建,是死代码)。
 
@@ -701,10 +701,12 @@ MAX_SLOTS_BLOCK_NUM = 12000
 
 ## H2【P0】`mStoreV1_->Wait` 无界阻塞 → 预取链路 / Python 主线程挂死
 
-**位置**(两条独立路径到达同一个无界阻塞点):
+**位置**(修复时实测共 4 个引擎侧无界 `Wait` 调用点,均在 prefetch 引擎内):
 
 1. **预取工作线程**:`CallPrefetchProcess`(scatter:205,★持 `mMutexUseToken`)→ :222 每层 `MergeAndCopyPrefetchLayer` → :408 每请求 `UCMTensorMerge` → :1550 `LoadUCMMergeHostAddress`(pre:1249)→ **:1279 `mStoreV1_->Wait(loadHandle)`**;
-2. **Python 主线程**(更直接):`SetTokensMap`(pre:677,每步调用)→ :711 `LastChunkMove` → **:1184 `mStoreV1_->Wait(loadHandle)`**。
+2. **Python 主线程**(更直接):`SetTokensMap`(pre:677,每步调用)→ :711 `LastChunkMove` → **:1184 `mStoreV1_->Wait(loadHandle)`**;
+3. **Python 主线程(indexer 初始化)**:`SetIndexerMap` → `IndexerInitLoad` → `SubmitIndexerInitLoadTask`(scatter:824)→ **scatter:844 `mStoreV1_->Wait(loadResult.Value())`**;
+4. **indexer 工作线程**:`IndexerLoadProcess` → `LoadIndexerTask`(scatter:1063)→ **scatter:1082 `mStoreV1_->Wait(loadResult.Value())`**。
 
 **接口契约无超时**(`ucm/store/ucmstore_v1.h:171-177`):`Wait` 是纯虚接口,语义 "Block until the specified task completes"——**无超时参数**。
 
@@ -730,6 +732,19 @@ MAX_SLOTS_BLOCK_NUM = 12000
 3. dram 的 `future.get()` 改为轮询 + 超时;
 4. `timeout_ms` 拒绝 0(配置校验;或 `Latch::WaitFor(0)` 语义改为立即超时——当前"0=永不超时"是陷阱);
 5. 与 H1-建议 4 联动:pybinds 暴露 fatal 状态供 Python 步级检查,半死状态尽早显式化。
+
+### ✅ 修复记录(H2)
+
+- **修复内容**(建议 1,引擎侧有界等待,不修改 `ucm/store`):
+  - `kvcache_pre.h`:新增私有方法 `WaitStoreBounded(handle, reqID, layerID, stage)` 声明 + 可配置超时成员 `mStoreWaitTimeoutMs`(默认 30000,与 posix store 默认超时对齐;单测可缩短);
+  - `kvcache_pre.cpp`:实现 `WaitStoreBounded`——循环 `mStoreV1_->Check(handle)`(非阻塞轮询,间隔 1ms)至 deadline;`Check` 报告已完成才调用 `Wait` 取最终状态(已完成任务的 `Wait` 立即返回,不会死等);deadline 到仍未完成则**不再调用 `Wait`**(绕开 psync 卡死 IO 的 drain 死等与 dram 的 `future.get()` 无限期阻塞),打 ERROR 日志(stage/layerID/reqID/超时值,并注明泄漏一条 store 任务记录)后返回 false;
+  - **4 个调用点全部替换**为 `WaitStoreBounded`:pre:1186(`LoadLastChunkSources`,stage="last_chunk",Python 主线程路径)、pre:1323(`LoadUCMMergeHostAddress`,stage="ucm_merge",预取线程路径,失败走现成的 `FillFailedUCMMerge` 零填充兜底)、scatter:846(`SubmitIndexerInitLoadTask`,stage="indexer_init_load")、scatter:1080(`LoadIndexerTask`,stage="indexer_async_load")——后两处为实施时审查补充发现,文档位置小节已同步更新;
+  - `tests/common/mock_store_v1.h`:新增 `checkNeverCompletes` 注入开关(`Check` 恒返回进行中,模拟 dram future 永不就绪 / psync 卡死 IO);
+  - `tests/ut/test_kvcache_pre_logic.cpp`:新增 3 个用例——超时路径断言**不进入 Wait**(防挂死核心)、Check 完成后才调 Wait 且失败状态透传、Check 本身报错不进入 Wait。
+- **修复效果**:store 实现无超时/超时失效时,预取线程、indexer 工作线程、Python 主线程均不再永久挂死,统一在 30s 内降级为"该层预取缺数据"(零填充兜底)或既有失败路径;`mMutexUseToken`/`mIsPrefetchRunning`/`mIsIndexerLoadRunning` 不再被卡死的 Wait 永久占用,`mDelSeqIds` 无限增长与 B2 墓碑全跳过两条连锁被切断;上游 H1 静默 abort 点(scatter:410,其他 rank `BeginKVPackSlot` 30s 超时)的主要触发源被消除。
+- **代价**:超时路径泄漏一条 store 侧任务记录(几十字节/次,`TaskWrapper::tasks_` 条目或 dram `taskResults_` future),已记入 ERROR 日志,属可接受的换命代价。
+- **未做(后续项,属 `ucm/store` 共享基础设施,本轮不动)**:建议 2(`TaskWrapper::Wait` drain 循环加上限)、建议 3(dram `future.get()` 改轮询+超时)、建议 4(`timeout_ms` 拒绝 0)。引擎侧轮询已绕开这三条的挂死面,优先级降低。
+- **验证**:C++ 无法本地编译,单测(3 个新增用例)与全量 UT 需随构建跑;故障注入(dram 对端不回复 / NFS 停摆)断言 30s 内走零填充兜底 + 日志含 "WaitStoreBounded timeout" 而非挂死;回归(正常路径 Check 一次即过,开销 ≈ 一次原子读 + 1ms 内一次 Wait)。
 
 ---
 

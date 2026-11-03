@@ -1181,13 +1181,9 @@ bool GSAPrefetchEngineC::LoadLastChunkSources(int layerID, const std::string& re
         return false;
     }
     auto loadHandle = loadResult.Value();
-    auto waitStatus = mStoreV1_->Wait(loadHandle);
-    if (waitStatus.Failure()) {
-        mLogger.log(LogLevel::ERROR,
-                    "|LastChunkMove| Wait failed, layerID=%d reqID=%s error=%s\n", layerID,
-                    reqID.c_str(), waitStatus.ToString().c_str());
-        return false;
-    }
+    // [H2] 有界等待:此路径由 Python 主线程(SetTokensMap → LastChunkMove)
+    // 每步直达,超时返回 false 走既有的失败降级,避免主线程挂死。
+    if (!WaitStoreBounded(loadHandle, reqID, layerID, "last_chunk")) { return false; }
 
     for (size_t i = 0; i < normalBlockCount; ++i) {
         const auto* base = bufferBase + i * mShardSize;
@@ -1246,6 +1242,52 @@ void GSAPrefetchEngineC::ReleaseUCMMergeHostAddress(UCMMergeHostAddress& address
     address.addresses.clear();
 }
 
+bool GSAPrefetchEngineC::WaitStoreBounded(const UC::Detail::TaskHandle& handle,
+                                          const std::string& reqID, int layerID,
+                                          const char* stage)
+{
+    if (!mStoreV1_) { return false; }
+    // 轮询间隔 1ms:Check 是非阻塞接口(一次原子/锁读取),轮询开销可忽略。
+    constexpr auto kStoreWaitPollInterval = std::chrono::milliseconds(1);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(mStoreWaitTimeoutMs);
+    for (;;) {
+        auto checkResult = mStoreV1_->Check(handle);
+        if (!checkResult) {
+            mLogger.log(LogLevel::ERROR,
+                        "|WaitStoreBounded| Check failed, stage=%s layerID=%d reqID=%s "
+                        "error=%s\n",
+                        stage, layerID, reqID.c_str(), checkResult.Error().ToString().c_str());
+            return false;
+        }
+        if (checkResult.Value()) {
+            // 任务已完成(无论成败),此时 Wait 立即返回最终状态,不会阻塞。
+            auto waitStatus = mStoreV1_->Wait(handle);
+            if (waitStatus.Failure()) {
+                mLogger.log(LogLevel::ERROR,
+                            "|WaitStoreBounded| Wait failed, stage=%s layerID=%d reqID=%s "
+                            "error=%s\n",
+                            stage, layerID, reqID.c_str(), waitStatus.ToString().c_str());
+                return false;
+            }
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            // 超时:不再调用 Wait(psync 卡死 IO 的 drain 死等 / dram 的
+            // future.get() 可能永不返回,调用方线程会随之挂死)。
+            // 代价是泄漏一条 store 侧任务记录(几十字节),换取调用方有界返回。
+            mLogger.log(LogLevel::ERROR,
+                        "|WaitStoreBounded| timeout after %llu ms, stage=%s layerID=%d "
+                        "reqID=%s (store task not completed; Wait skipped to avoid "
+                        "unbounded block, one store task entry leaked)\n",
+                        static_cast<unsigned long long>(mStoreWaitTimeoutMs), stage, layerID,
+                        reqID.c_str());
+            return false;
+        }
+        std::this_thread::sleep_for(kStoreWaitPollInterval);
+    }
+}
+
 bool GSAPrefetchEngineC::LoadUCMMergeHostAddress(UC::Detail::TaskDesc task,
                                                  UCMMergeHostAddress& address, int layerID,
                                                  const std::string& reqID)
@@ -1276,14 +1318,9 @@ bool GSAPrefetchEngineC::LoadUCMMergeHostAddress(UC::Detail::TaskDesc task,
         return false;
     }
     auto loadHandle = loadResult.Value();
-    auto waitStatus = mStoreV1_->Wait(loadHandle);
-    if (waitStatus.Failure()) {
-        mLogger.log(LogLevel::ERROR,
-                    "|UCMTensorMerge| Wait failed, "
-                    "layerID=%d, reqID=%s, error=%s\n",
-                    layerID, reqID.c_str(), waitStatus.ToString().c_str());
-        return false;
-    }
+    // [H2] 有界等待:超时返回 false,由 UCMTensorMerge 走 FillFailedUCMMerge
+    // 零填充兜底,而不是在无超时的 Wait 上挂死预取线程(其持有 mMutexUseToken)。
+    if (!WaitStoreBounded(loadHandle, reqID, layerID, "ucm_merge")) { return false; }
 
     address.hasHostTask = true;
     address.addresses.reserve(normalBlockCount);

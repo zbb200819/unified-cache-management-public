@@ -426,6 +426,18 @@ public:
                            aclTensor* dstTensor, aclTensor* dstIndexTensor,
                            aclTensor* dstHBMBufferTensor, aclrtStream stream);
 
+    // [H2] StoreV1::Wait 契约无超时参数:posix+psync 卡死 IO 时 drain 循环
+    // 死等、dram future.get() 无限期阻塞,会让预取线程(持 mMutexUseToken)、
+    // indexer 工作线程与 Python 主线程(LastChunkMove 路径)永久挂死。
+    // WaitStoreBounded 用 Check() 非阻塞轮询代替直接 Wait,仅在任务已完成时
+    // 调用 Wait 取最终状态(此时立即返回,不会阻塞);超时后不再进入 Wait,
+    // 返回 false 由调用方走既有的失败降级路径(如 FillFailedUCMMerge 零填充)。
+    bool WaitStoreBounded(const UC::Detail::TaskHandle& handle, const std::string& reqID,
+                          int layerID, const char* stage);
+    // 有界等待超时窗口(ms),默认 30s 与 posix store 默认超时(global_config.h)
+    // 对齐;单测可缩短以验证超时路径。
+    uint64_t mStoreWaitTimeoutMs{30000};
+
     // 0923 开始
     // UCMTensorMerge
     bool LoadUCMMergeHostAddress(UC::Detail::TaskDesc task, UCMMergeHostAddress& address,

@@ -558,6 +558,57 @@ TEST_F(PreLogicTest, LoadUCMMergeHostAddressReturnsFalseWhenStoreNull)
     EXPECT_FALSE(engine->LoadUCMMergeHostAddress(std::move(task), addr, 0, "req1"));
 }
 
+/* ---------------- WaitStoreBounded (H2) ---------------- */
+
+TEST_F(PreLogicTest, WaitStoreBoundedTimesOutWhenCheckNeverCompletes)
+{
+    /* [H2] Check 永远报告"进行中"(模拟 dram future 永不就绪 / psync 卡死
+     * IO)→ 有界等待在 deadline 后返回 false,且绝不进入可能死等的 Wait。
+     * 超时窗口缩短到 5ms 保持单测快速。 */
+    engine = MakeEngine();
+    store->checkNeverCompletes = true;
+    engine->mStoreWaitTimeoutMs = 5;
+    UCMMergeHostAddress addr(*engine);
+    UC::Detail::TaskDesc task;
+    task.resize(1);
+    EXPECT_FALSE(engine->LoadUCMMergeHostAddress(std::move(task), addr, 0, "req1"));
+    EXPECT_FALSE(addr.hasHostTask);
+    /* 超时路径必须绕开 Wait(直接 Wait 会挂死调用方线程)。 */
+    for (const auto& c : store->calls) { EXPECT_NE(c.name, "Wait"); }
+    store->checkNeverCompletes = false;
+}
+
+TEST_F(PreLogicTest, WaitStoreBoundedCallsWaitOnlyAfterCheckCompletes)
+{
+    /* Check 报告已完成 → 此时 Wait 立即返回最终状态;waitFails 注入最终
+     * 失败,断言失败状态被透传(LoadUCMMergeHostAddress 返回 false)。 */
+    engine = MakeEngine();
+    store->waitFails = true;
+    UCMMergeHostAddress addr(*engine);
+    UC::Detail::TaskDesc task;
+    task.resize(1);
+    EXPECT_FALSE(engine->LoadUCMMergeHostAddress(std::move(task), addr, 0, "req1"));
+    EXPECT_FALSE(addr.hasHostTask);
+    bool sawWait = false;
+    for (const auto& c : store->calls) { sawWait = sawWait || (c.name == "Wait"); }
+    EXPECT_TRUE(sawWait);
+    store->waitFails = false;
+}
+
+TEST_F(PreLogicTest, WaitStoreBoundedReturnsFalseWhenCheckFails)
+{
+    /* Check 本身报错(如 handle 非法)→ 不进入 Wait,直接返回 false。 */
+    engine = MakeEngine();
+    store->checkFails = true;
+    UCMMergeHostAddress addr(*engine);
+    UC::Detail::TaskDesc task;
+    task.resize(1);
+    EXPECT_FALSE(engine->LoadUCMMergeHostAddress(std::move(task), addr, 0, "req1"));
+    EXPECT_FALSE(addr.hasHostTask);
+    for (const auto& c : store->calls) { EXPECT_NE(c.name, "Wait"); }
+    store->checkFails = false;
+}
+
 /* ---------------- PrepareUCMMergeSources ---------------- */
 
 TEST_F(PreLogicTest, PrepareUCMMergeSourcesSetsSrcForOwnedUcmBlocks)

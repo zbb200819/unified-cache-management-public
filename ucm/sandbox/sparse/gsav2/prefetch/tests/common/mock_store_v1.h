@@ -54,6 +54,9 @@ public:
     bool lookupFails{false};
     bool waitFails{false};
     bool checkFails{false};
+    /* [H2] Check 永远报告"进行中":模拟 dram future 永不就绪 / psync 卡死 IO,
+     * 驱动 WaitStoreBounded 的超时路径(断言不进入可能死等的 Wait)。 */
+    bool checkNeverCompletes{false};
     bool loadFails{false};
     bool dumpFails{false};
 
@@ -135,6 +138,7 @@ public:
     UC::Expected<bool> Check(UC::Detail::TaskHandle) override
     {
         if (checkFails) { return UC::Status::Error("check-failed-injected"); }
+        if (checkNeverCompletes) { return false; }
         return true;
     }
 
