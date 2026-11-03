@@ -59,10 +59,32 @@ KVCACHE_BUFFER_SIZE = 16
 STREAM_NUM = 1
 PREFETCH_THREAD_NUM = 16
 DEFAULT_TOPK_LEN = 2048
+# [G1] swap 缓冲每行长度(SPA_TOKENS_LEN,C++ 侧 sparseLen)必须大于每步
+# topk 长度(DEFAULT_TOPK_LEN),否则 swap 行装不下 topk + 追加段
+# (A2 的 change_len <= sparseLen 校验会触发)。
+assert SPA_TOKENS_LEN > DEFAULT_TOPK_LEN, (
+    "G1 invariant violated: SPA_TOKENS_LEN "
+    f"({SPA_TOKENS_LEN}) must be > DEFAULT_TOPK_LEN ({DEFAULT_TOPK_LEN})"
+)
 IS_SHARED_MEMCPY = True
 PREFETCH_TYPE = 0
-MAX_INDEXER_BLOCK_NUM = 17000
+# [G1] 槽位 id 池上限。槽位 id(0..MAX_SLOTS_BLOCK_NUM-1)直接作为
+# dsa_k_cache 的行索引(dsa_slot_mapping → npu_scatter_nd_update_,见
+# sfa_kv_transfer_patch),因此 indexer 缓存容量(MAX_INDEXER_BLOCK_NUM,
+# 即 dsa_k_cache dim0 / indexer_sparse_num_all)必须 >= 槽位 id 池上限,
+# 并为增量/预取块保留余量。该关系此前由两个独立魔数"碰巧"满足
+# (17000 > 12000),修改任一常量即静默破坏 scatter 边界安全;改为程序
+# 推导 + 定义处/消费处双重 assert。
 MAX_SLOTS_BLOCK_NUM = 12000
+# indexer 缓存超出槽位池的余量(容纳增量/预取块)。
+INDEXER_BLOCK_MARGIN = 5000
+MAX_INDEXER_BLOCK_NUM = MAX_SLOTS_BLOCK_NUM + INDEXER_BLOCK_MARGIN
+assert MAX_INDEXER_BLOCK_NUM >= MAX_SLOTS_BLOCK_NUM, (
+    "G1 invariant violated: MAX_INDEXER_BLOCK_NUM "
+    f"({MAX_INDEXER_BLOCK_NUM}) must be >= MAX_SLOTS_BLOCK_NUM "
+    f"({MAX_SLOTS_BLOCK_NUM}), otherwise slot ids overflow the dsa_k_cache "
+    "row range (see sfa_kv_transfer_patch scatter)"
+)
 INIT_LOCAL_WINDOWS = 5
 LOCAL_WINDOWS_LEN = 1
 IS_INDEXER_OFFLOAD = False

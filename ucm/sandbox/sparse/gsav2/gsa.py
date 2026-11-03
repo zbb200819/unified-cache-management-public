@@ -563,6 +563,14 @@ class GSA(UcmSparseBase):
         self.is_share_memcpy = IS_SHARED_MEMCPY
         self.version = 0
         self.indexer_sparse_num_all = MAX_INDEXER_BLOCK_NUM
+        # [G1] 消费处运行时校验:槽位 id(0..num_slots-1)直接作为 dsa_k_cache
+        # 行索引,indexer 缓存容量必须 >= 槽位池上限,否则 scatter 越界
+        # (推导关系见 ucm/sparse/utils.py;>= 允许无余量的边界配置,
+        # 与 ut 的 monkeypatch 兼容)。
+        assert self.indexer_sparse_num_all >= self.num_slots, (
+            f"G1 invariant violated: indexer_sparse_num_all "
+            f"({self.indexer_sparse_num_all}) < num_slots ({self.num_slots})"
+        )
         self.has_prefill = False
         self.num_padding_reqs = 0
         self.alloc_block_sch = 0

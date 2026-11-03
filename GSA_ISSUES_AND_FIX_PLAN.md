@@ -32,7 +32,7 @@
 | F4 | `list(kv_cache)` 无判空 | P1 | warmup/profile 阶段 kv_cache=None | sfa_kv_transfer_patch.py:643,649 | **是** | ✅ 已修复 |
 | E5 | `attention_finished` gate 反转(行为回归) | P2 | PD 分离 D 节点 | gsa.py:1660 | 否(死代码) | ✅ 已修复 |
 | F5 | `init_kvcache_ptrs` 无判空直接索引 | P2 | kv_cache 为 None/空 | gsa.py:2771-2782 | **是** | ✅ 已修复 |
-| G1 | 跨文件隐式常量约定 | P2 | 修改任一常量 | sparse/utils.py:64-65 | **是** | 待修复 |
+| G1 | 跨文件隐式常量约定 | P2 | 修改任一常量 | sparse/utils.py:64-65 | **是** | ✅ 已修复 |
 
 > 注意:**A/B/C/D/F/G 类问题与是否开启 PD 分离无关,PD-mix 日常部署同样暴露在风险之下**;E 类仅在 PD 分离部署时进入执行路径(PD-mix 下 agent 不创建,是死代码)。
 
@@ -634,6 +634,17 @@ MAX_SLOTS_BLOCK_NUM = 12000
 **原因**:安全性依赖一组散落各文件的隐式一致:槽位 id 池 1..11999(`MAX_SLOTS_BLOCK_NUM`)× block_size 必须 < `dsa_k_cache` dim0=17000(`MAX_INDEXER_BLOCK_NUM`);`SPA_TOKENS_LEN=5120`、`DEFAULT_TOPK_LEN=2048`、`topk_indices_len=2048`(gsa.py:661)同理。修改任一常量即静默破坏边界安全(直接引发新的越界)。
 
 **修复建议**:常量间关系改为程序推导(如 `MAX_INDEXER_BLOCK_NUM = MAX_SLOTS_BLOCK_NUM + margin`),并在分配处 assert 关系成立。
+
+### ✅ 修复记录(G1)
+
+- **修复内容**:
+  1. `ucm/sparse/utils.py`:
+     - `MAX_INDEXER_BLOCK_NUM` 改为程序推导:`MAX_SLOTS_BLOCK_NUM + INDEXER_BLOCK_MARGIN`(新常量 `INDEXER_BLOCK_MARGIN = 5000`,12000+5000=17000,**值不变,纯加固**),定义处附注释说明槽位 id 与 `dsa_k_cache` 行索引的对应关系,并 assert `MAX_INDEXER_BLOCK_NUM >= MAX_SLOTS_BLOCK_NUM`;
+     - 补 assert `SPA_TOKENS_LEN > DEFAULT_TOPK_LEN`(5120 > 2048):swap 行长度必须容纳每步 topk + 追加段,否则 A2 的 `change_len <= sparseLen` 校验必然触发;
+  2. `gsa.py` 消费处(`indexer_sparse_num_all` 赋值后):运行时 assert `indexer_sparse_num_all >= num_slots`,防 monkeypatch 之外的运行时错误配置。
+- **修复原因**:安全性此前依赖散落各文件的隐式一致(槽位 id 池 < dsa_k_cache dim0、swap 行长 > topk 长度),修改任一常量即**静默**破坏边界安全、直接引发新越界;程序推导把"改一处忘另一处"变成定义处的编译期错误(assert 在 import 时即触发),消费处 assert 再兜一层。
+- **兼容性注意**:消费处用 `>=` 而非 `>`——槽位 id 最大值 = `num_slots - 1`,等于 dim0-1 时仍在有效行范围内,`>=` 即安全;同时与 ut 的 monkeypatch 兼容(`conftest.py:218-219` 将两个常量都 patch 为 16,`16 >= 16` 通过)。
+- **验证**(独立脚本实跑):从 utils.py AST 提取常量赋值链独立求值——`MAX_INDEXER_BLOCK_NUM=17000`、`MAX_SLOTS_BLOCK_NUM=12000`、`INDEXER_BLOCK_MARGIN=5000`,值与改前完全一致,推导关系与两个断言均成立;`gsa.py` `ast.parse` 语法通过。
 
 ---
 
