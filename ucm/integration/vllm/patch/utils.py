@@ -91,12 +91,23 @@ def when_imported(module_name):
     def decorator(func):
         if module_name not in _POST_IMPORT_HOOKS:
             _POST_IMPORT_HOOKS[module_name] = []
-        _POST_IMPORT_HOOKS[module_name].append(func)
+        hooks = _POST_IMPORT_HOOKS[module_name]
+        # [F1 修复] 注册侧同样按函数对象去重:避免同一钩子被重复 append 后,
+        # 在“模块尚未导入”路径(HookingFinder)被重复执行。
+        # 函数对象默认按标识比较,幂等安全。
+        if func not in hooks:
+            hooks.append(func)
 
         if module_name in sys.modules:
             mod = sys.modules[module_name]
-            if not getattr(mod, "_ucm_patched", False):
-                setattr(mod, "_ucm_patched", True)
+            # [F1 修复] 去重粒度从“模块级”(_ucm_patched)改为“钩子级”(_ucm_hook_done):
+            # 原实现在已导入模块上只执行第一个注册的钩子并置 _ucm_patched=True,
+            # 同一模块上后续注册的补丁钩子(如 sfa_v1_patch 与 sfa_kv_transfer_patch
+            # 先后 hook 同一模块)被静默跳过——补丁丢失且无任何告警,表现为功能缺失
+            # 或依赖该补丁初始化的属性不存在而间接崩溃。
+            # 未导入模块的路径(HookingFinder)本就会执行全部钩子,与此修复语义一致。
+            if not getattr(func, "_ucm_hook_done", False):
+                setattr(func, "_ucm_hook_done", True)
                 func(mod)
         return func
 

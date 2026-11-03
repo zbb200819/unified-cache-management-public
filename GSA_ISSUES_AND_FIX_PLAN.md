@@ -18,7 +18,7 @@
 | A2 | CopyPreSwapTokens 负偏移越界写 | **P0** | use_tokens 内容过期 | kvcache_pre_scatter.cpp:1239-1242 | **是** | ✅ 已修复 |
 | B1 | 前向/预取互斥闸是死代码 → 设备侧并发踩写 | **P0** | 预取块与前向读写块重叠 | kvcache_pre_scatter.cpp:51-88 | **是** | 待修复 |
 | E1 | P 节点 `init_dsa_data` AttributeError 启动崩溃 | **P0** | PD 分离 P 节点 | gsa.py:1892-1905 | 否(死代码) | ✅ 已修复 |
-| F1 | `when_imported` 单次触发保护静默丢弃后续补丁钩子 | **P0** | 同一模块注册两个补丁 | patch/utils.py:96-100 | **是** | 待修复 |
+| F1 | `when_imported` 单次触发保护静默丢弃后续补丁钩子 | **P0** | 同一模块注册两个补丁 | patch/utils.py:96-100 | **是** | ✅ 已修复 |
 | F2 | `indexer_select_post_process` 重复定义相互覆盖 | **P0** | v0.23.0_pmr 补丁生效时 | v0.23.0_pmr/.../device_op_patch.py:13,188 | **是** | 待修复 |
 | A3 | 老引擎 freeBlockPtr 裸写无界 | P1 | 行宽与表大小错配 | sparse/gsa/.../kvcache_pre.cpp:432 | 是(老引擎) | 待修复 |
 | B2 | 块 ID 陈旧 → 跨请求并发踩写 | P1 | 请求抢占/完成时 DMA 在途 | kvcache_pre_scatter.cpp:1305-1313 | **是** | 待修复 |
@@ -380,6 +380,22 @@ if module_name in sys.modules:
 **原因**:模块已被 import 的情况下,**第一个**注册的 `when_imported` 钩子执行并把模块标记为 `_ucm_patched`;同一模块上后续注册的任何补丁钩子(如 sfa_v1_patch、sfa_kv_transfer_patch 先后 hook 同一模块)看到标志位已置,**静默跳过**——补丁丢失无任何告警,表现为功能静默缺失或间接崩溃(依赖被丢弃补丁初始化的属性不存在)。
 
 **修复建议**:去掉模块级单次触发标志,改为按钩子粒度去重(如给每个 func 设 `_ucm_hook_done` 标志),或在 hook 被跳过时至少 log.warning。
+
+### ✅ 修复记录(F1)
+
+- **修复内容**(`integration/vllm/patch/utils.py` `when_imported`,两处):
+  1. **"模块已导入"路径**(:96-100):去重标志从模块属性 `mod._ucm_patched` 改为**函数对象属性** `func._ucm_hook_done`——每个钩子执行一次,同一模块上后续注册的钩子不再被第一个钩子挤掉;
+  2. **注册侧**(:92-99):`_POST_IMPORT_HOOKS` append 前按函数对象去重(`if func not in hooks`),使"模块尚未导入"路径(HookingFinder :44-47 遍历执行全部注册钩子)不会对重复注册的同一函数执行多次。
+- **修复原因**:
+  - 原机制下,第一个 `when_imported` 钩子在已导入模块上执行后置 `mod._ucm_patched=True`,同模块后续钩子(实际场景:sfa_v1_patch 与 sfa_kv_transfer_patch 等先后 hook 同一模块)**静默跳过**且无任何告警——补丁丢失后表现为功能缺失、或下游因补丁未初始化的属性不存在而间接崩溃,极难排查;
+  - "尚未导入"路径本就执行全部钩子(HookingFinder 不检查 `_ucm_patched`),改为钩子级去重后两条路径语义一致;
+  - `_ucm_patched` 全仓库无其他消费方(grep 确认),可安全移除该模块级标志;
+  - 函数对象默认按标识比较,`func not in hooks` 幂等安全,不影响正常多次注册不同钩子。
+- **验证**(临时脚本实跑通过):stub `wrapt`/`ucm.logger` 后执行 utils.py 真实源码——
+  - 同一已导入模块先后注册 A/B/A2 三个钩子 + 同一函数对象重复注册:执行序列 `['A','B','A2','DUP']`(全部执行、重复仅一次);
+  - 注册表条目数 = 4(注册侧去重生效);
+  - `ast.parse` 语法通过。
+- **影响面**:所有经由 `when_imported` 的补丁(整个 integration 目录)——修复后此前被丢弃的钩子会真正执行,属于"修复即生效"型;若某些补丁依赖"被丢弃"才不报错,则该修复会暴露其自身错误(这是期望行为,按报错逐个处理)。
 
 ---
 
