@@ -939,9 +939,18 @@ class GSA(UcmSparseBase):
             self._store_inject_max_retries,
         )
 
-    def _ensure_store_injected(self):
+    def _ensure_store_injected(self) -> bool:
+        """确保 C++ store 指针已注入两个 prefetch engine。
+
+        [E4 修复] 返回注入状态,调用方据此决定是否走依赖 store 的路径:
+        - True:store 已注入(本次或此前),可安全调用 ucm_lookup/ucm_load_ssd;
+        - False:本次未成功(connector/store 未就绪等,下一步重试),调用方应
+          跳过依赖 store 的路径(_load_kv_dram),而非裸调 C++ 接口。
+        持续失败达到 _store_inject_max_retries 后由 _log_store_inject_retry 抛出
+        (fail-fast,保留原语义)。
+        """
         if self._store_injected:
-            return
+            return True
         self._store_inject_retries += 1
         try:
             kv_group = get_kv_transfer_group()
@@ -956,22 +965,22 @@ class GSA(UcmSparseBase):
                 self._log_store_inject_retry(
                     "no connector with a store (PD-separated multi-connector?)"
                 )
-                return
+                return False
             if not hasattr(connector, "store"):
                 self._log_store_inject_retry(
                     f"connector type={type(connector).__name__} has no 'store' attribute"
                 )
-                return
+                return False
             if connector.store is None:
                 self._log_store_inject_retry(
                     "connector.store is None (Worker role before register_kv_caches?)"
                 )
-                return
+                return False
             if not self._inject_store_v1(connector):
                 self._log_store_inject_retry(
                     "cc_store() returned 0 (null pointer), C++ backend not ready"
                 )
-                return
+                return False
         except Exception as e:
             if self._store_inject_retries >= self._store_inject_max_retries:
                 logger.error(
@@ -987,6 +996,8 @@ class GSA(UcmSparseBase):
                 self._store_inject_max_retries,
                 e,
             )
+            return False
+        return True
 
     def _inject_block_hashes(
         self, req_id, block_idxs, pool_slots, inject_indexer=False
@@ -2400,11 +2411,20 @@ class GSA(UcmSparseBase):
             if self.gsa_metadata.gsa_stats[rid].is_gsa()
         ]
         stats = self.gsa_metadata.gsa_stats
-        self._ensure_store_injected()
-        for req_id in scheduler_output.scheduled_cached_reqs.resumed_req_ids:
-            self._load_kv_dram(req_id)
-        for req_id in scheduler_output.scheduled_new_reqs:
-            self._load_kv_dram(req_id)
+        # [E2/E4 修复] store 未注入成功时跳过依赖 store 的 DRAM 加载:
+        # C++ UCMLookup/UCMLoadSSD 在 store 未初始化时 throw std::runtime_error
+        # (见 prefetch/include/kvcache_prefetch.h),裸调会打穿 execute_model。
+        store_ready = self._ensure_store_injected()
+        if store_ready:
+            for req_id in scheduler_output.scheduled_cached_reqs.resumed_req_ids:
+                self._load_kv_dram(req_id)
+            for req_id in scheduler_output.scheduled_new_reqs:
+                self._load_kv_dram(req_id)
+        else:
+            logger.info(
+                "[GSA] store not injected yet; skip _load_kv_dram this step "
+                "(will retry on the next scheduled step)"
+            )
 
         prefetch_trigger_output = 1 if self.is_pd_mix else 0
         num_output_one = [
@@ -2596,14 +2616,30 @@ class GSA(UcmSparseBase):
         retry = 0
         start = time.perf_counter()
         while True:
-            result = self.ucm_prefetch_engine.ucm_lookup(lookup_ids)
+            # [E2 修复] C++ UCMLookup 在内部错误时 throw std::runtime_error;
+            # lookup 是只读探测、无已提交状态,失败时跳过本步(下一步重试),
+            # 而非让未捕获异常打穿 build_sparse_meta → execute_model。
+            try:
+                result = self.ucm_prefetch_engine.ucm_lookup(lookup_ids)
+            except Exception as e:
+                self.log.error(
+                    f"[GSA] ucm_lookup failed for req_id {req_id}: {e}; "
+                    f"skip DRAM load this step\n"
+                )
+                return
             if all(result):
                 break
             miss_pos = [i for i, hit in enumerate(result) if not hit]
             retry += 1
             if retry > UCM_LOOKUP_MAX_RETRY:
-                self.log.error(f"[GSA] ERROR look up timeout for req_id {req_id}\n")
-                return
+                # [E3 修复] 超时不能静默 return:此时不提交 DRAM 加载任务,
+                # 该请求将带着 KV 空洞继续推理 → 静默错误输出。
+                # 改为带上下文 fail-fast,由上层决策(重调度/告警),不吞错误。
+                raise RuntimeError(
+                    f"[GSA] ucm lookup timeout for req_id {req_id} after "
+                    f"{UCM_LOOKUP_MAX_RETRY} retries; giving up would leave a "
+                    f"silent KV hole (blocks never hit in store)"
+                )
             lookup_ids = np.ascontiguousarray(
                 lookup_ids.reshape(-1, 16)[miss_pos].reshape(-1)
             )
@@ -2614,7 +2650,14 @@ class GSA(UcmSparseBase):
                 f"{(time.perf_counter() - start) * 1_000_000}\n"
             )
             start = time.perf_counter()
-        _ = self.ucm_prefetch_engine.ucm_load_ssd(ids)
+        # [E2/E3 修复] lookup 已全部命中,此处提交加载任务;若提交失败,
+        # 该请求将无 DRAM KV → 静默 KV 空洞,必须带上下文上抛而非吞掉。
+        try:
+            _ = self.ucm_prefetch_engine.ucm_load_ssd(ids)
+        except Exception as e:
+            raise RuntimeError(
+                f"[GSA] ucm_load_ssd failed for req_id {req_id}: {e}"
+            ) from e
         if IS_PERFORMANCE_LOG:
             self.log.info(
                 f"[GSA] submit load task for req_id {req_id}: "

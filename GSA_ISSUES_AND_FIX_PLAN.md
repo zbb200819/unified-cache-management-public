@@ -25,9 +25,9 @@
 | B3 | 裸指针 use-after-free 风险 | P1 | Python 张量先于 C++ 释放 | pybinds.cpp:143-148 + gsa.py:1544-1546 | **是** | 待修复 |
 | C1 | C++ map 跨线程并发读写无锁 | P1 | Python 写 API 与预取线程同时活跃 | kvcache_pre_scatter.cpp:1167-1171 附近 | **是** | 待修复 |
 | D1 | `-1` 槽位索引可达设备侧 scatter | P1 | aclgraph 捕获/回放 | sfa_kv_transfer_patch.py:387-392 | **是** | 待修复 |
-| E2 | `_load_kv_dram` 未捕获 C++ throw | P1 | PD 分离 D 节点 + store 注入未就绪 | gsa.py:2576 | 否(死代码) | 待修复 |
-| E3 | `_load_kv_dram` 超时静默 KV 空洞 + 阻塞 hang | P1 | PD 分离 D 节点 + lookup 超时 | gsa.py:2575-2587 | 否(死代码) | 待修复 |
-| E4 | `_ensure_store_injected` 非异常静默失败 | P1 | connector/store 未就绪 | gsa.py:955-974 | 否(死代码) | 待修复 |
+| E2 | `_load_kv_dram` 未捕获 C++ throw | P1 | PD 分离 D 节点 + store 注入未就绪 | gsa.py:2576 | 否(死代码) | ✅ 已修复 |
+| E3 | `_load_kv_dram` 超时静默 KV 空洞 + 阻塞 hang | P1 | PD 分离 D 节点 + lookup 超时 | gsa.py:2575-2587 | 否(死代码) | ✅ 已修复 |
+| E4 | `_ensure_store_injected` 非异常静默失败 | P1 | connector/store 未就绪 | gsa.py:955-974 | 否(死代码) | ✅ 已修复 |
 | F3 | `req_sparsed_slots=None` 无判空 | P1 | 非 GSA 调度路径构造的 SchedulerOutput | sched_output_patch.py:20-23 | **是** | 待修复 |
 | F4 | `list(kv_cache)` 无判空 | P1 | warmup/profile 阶段 kv_cache=None | sfa_kv_transfer_patch.py:643,649 | **是** | 待修复 |
 | E5 | `attention_finished` gate 反转(行为回归) | P2 | PD 分离 D 节点 | gsa.py:1660 | 否(死代码) | 待修复 |
@@ -319,6 +319,15 @@ while True:
 
 **修复建议**:`_load_kv_dram` 外层包 try/except;`_store_injected` 未成功时跳过本步(下一步重试),而非裸调 `ucm_lookup`。
 
+### ✅ 修复记录(E2,与 E4/E3 联合修复)
+
+- **修复内容**:
+  1. `build_sparse_meta`(gsa.py:`_ensure_store_injected` 调用处):改为接收注入状态,`store_ready=False` 时**跳过两个 `_load_kv_dram` 循环**并 log info(下一步调度重试),不再在 store 未注入时裸调 C++;
+  2. `_load_kv_dram` 内部:`ucm_lookup` 包 try/except——C++ 抛出(store 未初始化/内部错误)时 `log.error` + return(lookup 为只读探测、无已提交状态,跳过本步安全);`ucm_load_ssd` 包 try/except——lookup 已全部命中、提交加载任务失败意味着该请求将无 DRAM KV(静默 KV 空洞),**带上下文上抛**(`raise ... from e`)而非吞掉;
+- **修复原因**:C++ `UCMLookup/UCMLoadSSD`(`prefetch/include/kvcache_prefetch.h:81/99`)在 `mStoreV1_ == nullptr` 时 `throw std::runtime_error`;注入重试窗口(≤5 步)内旧代码照常进入 `_load_kv_dram` → 未捕获 RuntimeError 打穿 `build_sparse_meta → execute_model` → D 节点在首个长 prompt 请求上崩溃。
+- **错误处理策略(与 E3 一致的原则)**:lookup 前的失败可安全重试(跳过);lookup 之后的失败意味着 KV 空洞 → fail-fast 上抛。
+- **验证**:`ast.parse` 语法通过;PD 分离 D 节点长 prompt 请求 + store 延迟就绪场景冒烟(预期:store 未就绪时日志出现 skip 记录、不再崩溃)。
+
 ---
 
 ## E3【P1】`_load_kv_dram` 超时静默 KV 空洞 + 阻塞 hang
@@ -336,6 +345,13 @@ time.sleep(UCM_LOOKUP_TIME_SPACE)   # ← 阻塞式重试,最坏 ≈10s/请求�
 
 **修复建议**:超时路径显式 fail-fast(抛出或降级标记,由上层决策),不能静默 return;重试改异步或大幅收紧预算。
 
+### ✅ 修复记录(E3,与 E2 联合修复)
+
+- **修复内容**:`_load_kv_dram` 超时路径(`retry > UCM_LOOKUP_MAX_RETRY`)从 `log.error + return` 改为 `raise RuntimeError`,错误信息说明"继续运行将留下静默 KV 空洞(若干 block 在 store 中永远不命中)";`ucm_load_ssd` 提交失败同样上抛(见 E2)。
+- **修复原因**:超时后静默返回 = 该请求不提交 DRAM 加载任务、带着缺失的 KV 继续推理 → **输出静默错误**,比崩溃更难定位;fail-fast 把决策权交给上层(重调度/告警/人工介入)。
+- **遗留(后续项)**:阻塞式 `while True × sleep` 重试预算(最坏 ≈10s/请求卡 forward)未改——改异步需要把 lookup/load 移出调度关键路径,属独立设计项;当前至少保证超时会显式报错而非假死。
+- **验证**:store 中制造永久 miss 的 block 做超时用例,断言 RuntimeError 与错误信息。
+
 ---
 
 ## E4【P1】`_ensure_store_injected` 非异常静默失败
@@ -345,6 +361,12 @@ time.sleep(UCM_LOOKUP_TIME_SPACE)   # ← 阻塞式重试,最坏 ≈10s/请求�
 **原因**:非异常失败与"注入成功"在调用方看来不可区分(只能靠 `_store_injected` 私有状态),而下游 `_load_kv_dram` 不检查该状态(见 E2),形成"静默失败 → 下游裸调 → 崩溃"链条。
 
 **修复建议**:失败返回 bool,`build_sparse_meta` 中未注入成功时跳过 `_load_kv_dram`(与 E2 一并修)。
+
+### ✅ 修复记录(E4,与 E2 联合修复)
+
+- **修复内容**:`_ensure_store_injected` 签名改为 `-> bool`,四条非异常 return 路径与异常重试路径统一返回 `False`(注入成功返回 `True`);调用方 `build_sparse_meta` 依据返回值决定是否执行 `_load_kv_dram`(见 E2)。
+- **修复原因**:原实现失败与成功在调用方不可区分(仅靠私有状态 `_store_injected`),下游不检查该状态直接裸调 `ucm_lookup`,形成"静默失败 → 下游裸调 → 崩溃"链条。注:本地版本 `_log_store_inject_retry`(gsa.py:921-940)本就带"重试超限后 raise"的 fail-fast(优于远端提交版),保留不动;本次仅补齐"重试窗口内返回状态"的缺口。
+- **验证**:`ast.parse` 语法通过。
 
 ---
 
