@@ -1890,6 +1890,16 @@ class GSA(UcmSparseBase):
                 req_meta.slab_host_slot += add_blocks[index_in_batch]
 
     def init_dsa_data(self, model_runner):
+        # PD 分离的 P 节点(is_kv_consumer=False)不会分配 gsa_swap_topk 等 buffer:
+        # __init__ worker 初始化块与 init_gsa_metadata 均带 is_decode_node gate,
+        # 此处若不加同样 gate,直接访问 self.gsa_swap_topk 会 AttributeError → 启动崩溃。
+        # 注意:P 节点上 self.log(GSALogger)同样未创建,只能用模块级 logger。
+        if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
+            logger.info(
+                "[GSA] skip init_dsa_data on non-decode node (is_decode_node=%s)",
+                self.is_decode_node,
+            )
+            return
         model_runner.gsa_swap_topk = self.gsa_swap_topk
         model_runner.gsa_prefetch_topk = self.gsa_prefetch_topk
         model_runner.gsa_warmup_topk = self.gsa_warmup_topk

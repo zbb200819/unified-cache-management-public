@@ -12,27 +12,27 @@
 
 ## 总览表
 
-| 编号 | 标题 | 严重度 | 触发条件 | 主要位置 | PD-mix 是否触发 |
-|---|---|---|---|---|---|
-| A1 | CopyPreSwapTokens 行索引越界写 | **P0** | MTP + 总 token 数 > dim1 | kvcache_pre_scatter.cpp:1235-1238 | **是** |
-| A2 | CopyPreSwapTokens 负偏移越界写 | **P0** | use_tokens 内容过期 | kvcache_pre_scatter.cpp:1239-1242 | **是** |
-| B1 | 前向/预取互斥闸是死代码 → 设备侧并发踩写 | **P0** | 预取块与前向读写块重叠 | kvcache_pre_scatter.cpp:51-88 | **是** |
-| E1 | P 节点 `init_dsa_data` AttributeError 启动崩溃 | **P0** | PD 分离 P 节点 | gsa.py:1892-1905 | 否(死代码) |
-| F1 | `when_imported` 单次触发保护静默丢弃后续补丁钩子 | **P0** | 同一模块注册两个补丁 | patch/utils.py:96-100 | **是** |
-| F2 | `indexer_select_post_process` 重复定义相互覆盖 | **P0** | v0.23.0_pmr 补丁生效时 | v0.23.0_pmr/.../device_op_patch.py:13,188 | **是** |
-| A3 | 老引擎 freeBlockPtr 裸写无界 | P1 | 行宽与表大小错配 | sparse/gsa/.../kvcache_pre.cpp:432 | 是(老引擎) |
-| B2 | 块 ID 陈旧 → 跨请求并发踩写 | P1 | 请求抢占/完成时 DMA 在途 | kvcache_pre_scatter.cpp:1305-1313 | **是** |
-| B3 | 裸指针 use-after-free 风险 | P1 | Python 张量先于 C++ 释放 | pybinds.cpp:143-148 + gsa.py:1544-1546 | **是** |
-| C1 | C++ map 跨线程并发读写无锁 | P1 | Python 写 API 与预取线程同时活跃 | kvcache_pre_scatter.cpp:1167-1171 附近 | **是** |
-| D1 | `-1` 槽位索引可达设备侧 scatter | P1 | aclgraph 捕获/回放 | sfa_kv_transfer_patch.py:387-392 | **是** |
-| E2 | `_load_kv_dram` 未捕获 C++ throw | P1 | PD 分离 D 节点 + store 注入未就绪 | gsa.py:2576 | 否(死代码) |
-| E3 | `_load_kv_dram` 超时静默 KV 空洞 + 阻塞 hang | P1 | PD 分离 D 节点 + lookup 超时 | gsa.py:2575-2587 | 否(死代码) |
-| E4 | `_ensure_store_injected` 非异常静默失败 | P1 | connector/store 未就绪 | gsa.py:955-974 | 否(死代码) |
-| F3 | `req_sparsed_slots=None` 无判空 | P1 | 非 GSA 调度路径构造的 SchedulerOutput | sched_output_patch.py:20-23 | **是** |
-| F4 | `list(kv_cache)` 无判空 | P1 | warmup/profile 阶段 kv_cache=None | sfa_kv_transfer_patch.py:643,649 | **是** |
-| E5 | `attention_finished` gate 反转(行为回归) | P2 | PD 分离 D 节点 | gsa.py:1660 | 否(死代码) |
-| F5 | `init_kvcache_ptrs` 无判空直接索引 | P2 | kv_cache 为 None/空 | gsa.py:2771-2782 | **是** |
-| G1 | 跨文件隐式常量约定 | P2 | 修改任一常量 | sparse/utils.py:64-65 | **是** |
+| 编号 | 标题 | 严重度 | 触发条件 | 主要位置 | PD-mix 是否触发 | 状态 |
+|---|---|---|---|---|---|---|
+| A1 | CopyPreSwapTokens 行索引越界写 | **P0** | MTP + 总 token 数 > dim1 | kvcache_pre_scatter.cpp:1235-1238 | **是** | 待修复 |
+| A2 | CopyPreSwapTokens 负偏移越界写 | **P0** | use_tokens 内容过期 | kvcache_pre_scatter.cpp:1239-1242 | **是** | 待修复 |
+| B1 | 前向/预取互斥闸是死代码 → 设备侧并发踩写 | **P0** | 预取块与前向读写块重叠 | kvcache_pre_scatter.cpp:51-88 | **是** | 待修复 |
+| E1 | P 节点 `init_dsa_data` AttributeError 启动崩溃 | **P0** | PD 分离 P 节点 | gsa.py:1892-1905 | 否(死代码) | ✅ 已修复 |
+| F1 | `when_imported` 单次触发保护静默丢弃后续补丁钩子 | **P0** | 同一模块注册两个补丁 | patch/utils.py:96-100 | **是** | 待修复 |
+| F2 | `indexer_select_post_process` 重复定义相互覆盖 | **P0** | v0.23.0_pmr 补丁生效时 | v0.23.0_pmr/.../device_op_patch.py:13,188 | **是** | 待修复 |
+| A3 | 老引擎 freeBlockPtr 裸写无界 | P1 | 行宽与表大小错配 | sparse/gsa/.../kvcache_pre.cpp:432 | 是(老引擎) | 待修复 |
+| B2 | 块 ID 陈旧 → 跨请求并发踩写 | P1 | 请求抢占/完成时 DMA 在途 | kvcache_pre_scatter.cpp:1305-1313 | **是** | 待修复 |
+| B3 | 裸指针 use-after-free 风险 | P1 | Python 张量先于 C++ 释放 | pybinds.cpp:143-148 + gsa.py:1544-1546 | **是** | 待修复 |
+| C1 | C++ map 跨线程并发读写无锁 | P1 | Python 写 API 与预取线程同时活跃 | kvcache_pre_scatter.cpp:1167-1171 附近 | **是** | 待修复 |
+| D1 | `-1` 槽位索引可达设备侧 scatter | P1 | aclgraph 捕获/回放 | sfa_kv_transfer_patch.py:387-392 | **是** | 待修复 |
+| E2 | `_load_kv_dram` 未捕获 C++ throw | P1 | PD 分离 D 节点 + store 注入未就绪 | gsa.py:2576 | 否(死代码) | 待修复 |
+| E3 | `_load_kv_dram` 超时静默 KV 空洞 + 阻塞 hang | P1 | PD 分离 D 节点 + lookup 超时 | gsa.py:2575-2587 | 否(死代码) | 待修复 |
+| E4 | `_ensure_store_injected` 非异常静默失败 | P1 | connector/store 未就绪 | gsa.py:955-974 | 否(死代码) | 待修复 |
+| F3 | `req_sparsed_slots=None` 无判空 | P1 | 非 GSA 调度路径构造的 SchedulerOutput | sched_output_patch.py:20-23 | **是** | 待修复 |
+| F4 | `list(kv_cache)` 无判空 | P1 | warmup/profile 阶段 kv_cache=None | sfa_kv_transfer_patch.py:643,649 | **是** | 待修复 |
+| E5 | `attention_finished` gate 反转(行为回归) | P2 | PD 分离 D 节点 | gsa.py:1660 | 否(死代码) | 待修复 |
+| F5 | `init_kvcache_ptrs` 无判空直接索引 | P2 | kv_cache 为 None/空 | gsa.py:2771-2782 | **是** | 待修复 |
+| G1 | 跨文件隐式常量约定 | P2 | 修改任一常量 | sparse/utils.py:64-65 | **是** | 待修复 |
 
 > 注意:**A/B/C/D/F/G 类问题与是否开启 PD 分离无关,PD-mix 日常部署同样暴露在风险之下**;E 类仅在 PD 分离部署时进入执行路径(PD-mix 下 agent 不创建,是死代码)。
 
@@ -254,6 +254,21 @@ torch_npu.npu_scatter_nd_update_(
 **注意**:真正的判据是 `is_kv_consumer=False`(误配置两个角色 flag 都为 False 时,即使无意做 PD 分离同样触发)。
 
 **修复建议**:`init_dsa_data` 开头补 `if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node: return`(与 `build_sparse_meta` 同款 gate)——这是最小止血修复。
+
+### ✅ 修复记录(E1)
+
+- **修复内容**:`gsa.py` `init_dsa_data`(`ucm/sandbox/sparse/gsav2/gsa.py:1892`)开头新增早退 gate:
+  ```python
+  if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
+      logger.info("[GSA] skip init_dsa_data on non-decode node (is_decode_node=%s)", self.is_decode_node)
+      return
+  ```
+- **修复原因**:
+  1. buffer 分配端(`__init__` worker 块 `gsa.py:495-498`、`init_gsa_metadata` `gsa.py:753-754`)均带 `is_decode_node` gate,P 节点上 `gsa_swap_topk` 等属性从未创建;`init_dsa_data` 作为消费端补齐同款 gate,与 `build_sparse_meta`(`gsa.py:2221` 一带)的 gate 风格一致;
+  2. **P 节点上 `self.log`(GSALogger,`gsa.py:636` 于 `_init_worker_logger_and_pools` 内创建)同样不存在**,因此 guard 内只能使用模块级 `logger`(`gsa.py:97` `init_logger(__name__)`),否则 guard 自身就会 AttributeError——这是修复过程中规避的一个二次陷阱;
+  3. `self.is_decode_node` 由 `_init_runtime_state()`(`gsa.py:492` 无条件调用,`:527` 赋值)保证在任意节点上先于 `init_dsa_data` 存在。
+- **影响面**:P 节点跳过 buffer 挂载;P 节点上所有 GSA 数据流(`build_sparse_meta`/`execute_begin` 等)本就带 `is_decode_node` gate 不消费这些属性,model_runner 上无其它无 gate 消费点。PD-mix(D 节点)行为不变。
+- **验证**:`py_compile`/`ast.parse` 语法通过;PD 分离部署 P 节点启动冒烟(预期不再 AttributeError,日志出现 skip 记录)。
 
 ---
 
