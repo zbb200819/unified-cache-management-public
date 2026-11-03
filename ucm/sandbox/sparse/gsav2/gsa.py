@@ -458,7 +458,20 @@ class GSAMetaData(UcmSparseMetadata):
                 )
         for new_req in scheduler_output.scheduled_new_reqs:
             if new_req.req_id in self.gsa_stats:
-                del self.gsa_stats[new_req.req_id]
+                # [I13] 同 req_id 重调度且旧 stat 残留(preempt 释放路径未执行):
+                # 原 `del` 静默丢弃旧 GSAReqStat —— slab_host_slot /
+                # indexer_slab_host_slot / req_dump_blocks 三个池 slot 永久泄漏,
+                # 长跑后 GSASharedCPUPool.allocate 的 assert 崩;C++ 侧
+                # mAllTopkIndicesTensor/mBlocksMap 等残留旧条目。改走与
+                # preempt 路径一致的完整释放:drain → 池归还 → 墓碑 → hash 清理。
+                while self.prefetch_engine.prefetch_engine_c.get_prefetch_status():
+                    time.sleep(0.001)
+                if IS_INDEXER_OFFLOAD:
+                    while self.prefetch_engine.prefetch_engine_c.get_indexer_status():
+                        time.sleep(0.001)
+                self._release_preempted_gsa_stats(new_req.req_id)
+                self.prefetch_engine.del_finish_meta(new_req.req_id)
+                self._block_hash_injected_reqs.discard(new_req.req_id)
             self.gsa_stats[new_req.req_id] = GSAReqStat(
                 new_req.req_id, self._vllm_config, self.topk_layer_num
             )
@@ -783,7 +796,12 @@ class GSA(UcmSparseBase):
         )
 
         self.gsa_prefetch_index = DSAInputStruct(
-            (max_graph_bs), self.device, torch.int64
+            # [I17] 容量对齐流入上界:流入的 token 位置索引上界与 gsa_swap_index
+            # 相同(= max_graph_bs + 2,由 CopyPreSwapTokens 的 spaMaxBs 守卫口径
+            # 证明),此前仅分配 max_graph_bs,当 GSA 总 token 数落在
+            # (max_graph_bs, max_graph_bs+2] 且全属预取请求时写入越界
+            # (numpy ValueError)。gsa_swap_index(:805)同模式为 +2。
+            (max_graph_bs + 2), self.device, torch.int64
         )
         self.gsa_prefetch_topk = TopkIndices(  # 78 * bs * 2048 * 4
             (self.topk_layer_num, max_graph_bs, 1, 2048), self.device, torch.int32
@@ -1178,8 +1196,14 @@ class GSA(UcmSparseBase):
                 req_meta.indexer_block_tables[:, req_meta.indexer_sparse_len() - 1] = (
                     slots[-1]
                 )
+                # [I16] 传给 C++ 的 idx 必须与 numpy 侧同一口径(稀疏位置
+                # indexer_sparse_len()-1)。此前误用稠密块计数
+                # len(slab_host_slot)-1(两者相差 prompt_block_len-prompt_sparse_len,
+                # 稀疏率 0.2 时相差数倍),该值经 UpdateIndexerMap emplace 进
+                # mUseBlockTableIdx 后被 TokenIndexMapInter 用作 dense→sparse
+                # 映射,错位映射/越界(与 I5 越界读叠加)。
                 self.prefetch_engine.prefetch_engine_c.update_indexer_map(
-                    req_id, len(req_meta.slab_host_slot) - 1, slots[-1], "add"
+                    req_id, req_meta.indexer_sparse_len() - 1, slots[-1], "add"
                 )
             self.dsa_block_table.np[
                 :, index_in_batch, : req_meta.indexer_sparse_len()
@@ -1280,6 +1304,17 @@ class GSA(UcmSparseBase):
             self.log.error(
                 f"[GSA] ERROR num_computed_tokens {req_meta.num_computed_tokens}"
                 f"num_output_tokens {req_meta.num_output_tokens}\n"
+            )
+            # [I18] 原 fail-continue:4 条 ERROR 后直接返回,slot_mapping 保持
+            # []、dump 列表为 None → 半初始化状态继续推理(该步新 token 不写
+            # slot_mapping 也不 dump 进 indexer cache,indexer topk 基于缺失
+            # 数据),静默质量退化。slab 分配与 seq_len 失配是状态机破坏,
+            # 改为 fail-loud(与 E3 同精神)。
+            raise RuntimeError(
+                f"[GSA] indexer slab slot count {len(slots)} does not cover "
+                f"seq_len {req_meta.get_seq_len()} (block_size "
+                f"{self.block_size}) for req {req_id}; refusing to continue "
+                f"with a half-initialized indexer state"
             )
 
     def _update_req_slot_mapping(
@@ -1606,6 +1641,16 @@ class GSA(UcmSparseBase):
             self.gsa_swap_topk.copy_to_npu(-1)
         self.gsa_swap_index.np[: len(self.swap_index)] = [x for x in self.swap_index]
         index_flattened = [x for sublist in self.prefetch_topk for x in sublist[0]]
+        # [I17] 写入守卫:缓冲容量对齐后仍防御性校验(配置漂移/未来改动),
+        # 超限截断 + ERROR,不在 numpy 深处抛难定位的 ValueError。
+        prefetch_index_capacity = self.gsa_prefetch_index.np.shape[0]
+        if len(index_flattened) > prefetch_index_capacity:
+            self.log.error(
+                f"[GSA] gsa_prefetch_index overflow: {len(index_flattened)} > "
+                f"{prefetch_index_capacity}, truncating (prefetch reqs will be "
+                f"partially indexed)"
+            )
+            index_flattened = index_flattened[:prefetch_index_capacity]
         self.gsa_prefetch_index.np[: len(index_flattened)] = index_flattened
         warmup_index = []
         for info in self.warmup_topk:
@@ -1621,6 +1666,18 @@ class GSA(UcmSparseBase):
             flattened = [
                 x for sublist in self.indexer_last_q_index_tmp for x in sublist
             ]
+            # [I17] indexer_last_q_index 容量为 max_graph_bs,但非 last-chunk 的
+            # indexer req 贡献整段 prefill chunk 的 query 区间,展平总长可达
+            # max_num_scheduled_tokens(如 8192)≫ max_graph_bs;此前无守卫,
+            # 越界直接 ValueError。超限截断 + ERROR(fail-safe 截断优于半途崩)。
+            last_q_capacity = self.indexer_last_q_index.np.shape[0]
+            if len(flattened) > last_q_capacity:
+                self.log.error(
+                    f"[GSA] indexer_last_q_index overflow: {len(flattened)} > "
+                    f"{last_q_capacity}, truncating (non-last-chunk indexer reqs "
+                    f"contribute whole prefill query ranges)"
+                )
+                flattened = flattened[:last_q_capacity]
             self.indexer_last_q_index.np[: len(flattened)] = flattened
             self.indexer_last_q_index.copy_to_npu(self.num_padding_reqs)
             indexer_len = len(flattened)
@@ -1837,6 +1894,20 @@ class GSA(UcmSparseBase):
         # 不得与计算流上的 attention kernel 并发读写 vLLM KV cache;
         # 与 execute_finished 的 set_modelrunning_status(False) 配对。
         self.prefetch_engine.prefetch_engine_c.set_modelrunning_status(True)
+        # [I14] begin 与 finished 之间任何异常都会跳过 execute_finished 的
+        # set_modelrunning_status(False),预取线程闸门永久卡死,后续步的
+        # drain 循环(preempt / _update_prefetch_status_all)将无界自旋挂死。
+        # 异常路径先恢复闸门再 re-raise,让上层看到原始错误(不吞异常)。
+        try:
+            self._execute_begin_body(scheduler_output, attn_metadata)
+        except BaseException:
+            self.prefetch_engine.prefetch_engine_c.set_modelrunning_status(False)
+            raise
+
+    # [I14] execute_begin 的主体:提取为独立方法,使上方的 try/except 闸门
+    # 保护成为可能(原函数体约 440 行,整体重缩进会使 diff 不可审阅)。
+    def _execute_begin_body(self, scheduler_output, attn_metadata):
+
         if IS_PERFORMANCE_LOG:
             start_total = time.perf_counter()
         self.prefetch_engine.step_time += 1
@@ -1871,6 +1942,8 @@ class GSA(UcmSparseBase):
         if IS_PERFORMANCE_LOG:
             time_total = (time.perf_counter() - start_total) * 1_000_000
             self.log.info(f"[GSA Time] execute_begin time_total {time_total}")
+
+
 
     def _process_scheduled_req(
         self,
@@ -2421,6 +2494,19 @@ class GSA(UcmSparseBase):
             else:
                 req_seq_len[index] = req_meta.get_seq_len()
                 index_list.append(index)
+                if self.num_spec_tokens != 1:
+                    # [I15] spec>1 且 rec_result=None(调用方未传接受长度)时,
+                    # select_gsa_prefetch_topk[:, index] 的唯一写入点在上方
+                    # rec_result 分支——不在此清零会把上一步的陈旧 topk 当作
+                    # 当前结果静默提交(_submit_prefetch_task 提交整个张量)。
+                    # 显式清零为确定值并告警,拒绝静默错预取。
+                    self.log.warning(
+                        f"[GSA] rec_result is None with num_spec_tokens="
+                        f"{self.num_spec_tokens}; zeroing stale prefetch topk "
+                        f"for req {req_id} at step "
+                        f"{self.prefetch_engine.step_time}"
+                    )
+                    self.select_gsa_prefetch_topk[:, index].zero_()
             if IS_INDEXER_OFFLOAD:
                 is_index_offload[index] = req_meta.is_indexer_init
         return topk_len_list, req_id_list, is_index_offload, req_seq_len

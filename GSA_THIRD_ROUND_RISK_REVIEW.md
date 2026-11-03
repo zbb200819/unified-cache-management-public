@@ -27,16 +27,16 @@
 | I10 | 预取结果 shm 偏移无 i < mMaxBs 校验 → OOB 写共享内存 | P1 | batch 超配置 mMaxBs | scatter:352 / pre:531 | ✅ 已修复 |
 | I11 | 增块路径写 mPrefetchBlockTableIdx/mIndexerLoadResultT 无容量校验 | P1 | 活跃块数增长超初始容量 | scatter:667 / 671-672 | ✅ 已修复 |
 | I12 | Get* 访问器无锁 + operator[] 插入 + 空指针解引用 | P1 | 任务在飞或请求已删时 Python 查询 | scatter:1498-1523 | ✅ 已修复 |
-| I13 | get_model_input 静默 del 旧 stat:池 slot 永久泄漏 + C++ map 残留 | P2 | 同 req_id 重调度残留旧条目 | gsa.py:459-461 | 待修复 |
-| I14 | set_modelrunning_status(True) 无 try/finally,异常路径闸门永久卡死 | P2 | begin→finished 之间任何异常 | gsa.py:1834 / 2334 | 待修复 |
-| I15 | MTP + rec_result=None 时陈旧 topk 静默提交 | P2 | spec>1 且调用方未传 rec_result | gsa.py:2389-2412 | 待修复 |
-| I16 | _update_dsa_block_table 稀疏/稠密索引口径不一致 | P2 | IS_INDEXER_OFFLOAD + decode 增块 | gsa.py:1178 vs 1182 | 待修复 |
-| I17 | 缓冲尺寸与守卫上界脱节;indexer_last_q_index 无越界守卫 | P2 | token 数贴边界 / 大 chunk indexer req | gsa.py:786/797/826/1624 | 待修复 |
-| I18 | slot 不足仅打日志后 fail-continue,半初始化状态继续推理 | P2 | slab 分配与 seq_len 失配 | gsa.py:1269-1283 | 待修复 |
-| I19 | UCMLoadSSD 丢弃 handle,TaskWrapper::tasks_ 每次调用永久泄漏 | P2 | 每次调用即泄漏(长跑累积) | kvcache_prefetch.h:94-96 | 待修复 |
-| I20 | ObtainStream malloc 后 throw 泄漏 + worker 线程外异常 terminate | P2 | 启动期 ACL 初始化失败 | trans_ascend.cpp:57-75 | 待修复 |
+| I13 | get_model_input 静默 del 旧 stat:池 slot 永久泄漏 + C++ map 残留 | P2 | 同 req_id 重调度残留旧条目 | gsa.py:459-461 | ✅ 已修复 |
+| I14 | set_modelrunning_status(True) 无 try/finally,异常路径闸门永久卡死 | P2 | begin→finished 之间任何异常 | gsa.py:1834 / 2334 | ✅ 已修复 |
+| I15 | MTP + rec_result=None 时陈旧 topk 静默提交 | P2 | spec>1 且调用方未传 rec_result | gsa.py:2389-2412 | ✅ 已修复 |
+| I16 | _update_dsa_block_table 稀疏/稠密索引口径不一致 | P2 | IS_INDEXER_OFFLOAD + decode 增块 | gsa.py:1178 vs 1182 | ✅ 已修复 |
+| I17 | 缓冲尺寸与守卫上界脱节;indexer_last_q_index 无越界守卫 | P2 | token 数贴边界 / 大 chunk indexer req | gsa.py:786/797/826/1624 | ✅ 已修复 |
+| I18 | slot 不足仅打日志后 fail-continue,半初始化状态继续推理 | P2 | slab 分配与 seq_len 失配 | gsa.py:1269-1283 | ✅ 已修复 |
+| I19 | UCMLoadSSD 丢弃 handle,TaskWrapper::tasks_ 每次调用永久泄漏 | P2 | 每次调用即泄漏(长跑累积) | kvcache_prefetch.h:94-96 | ✅ 已修复 |
+| I20 | ObtainStream malloc 后 throw 泄漏 + worker 线程外异常 terminate | P2 | 启动期 ACL 初始化失败 | trans_ascend.cpp:57-75 | ✅ 已修复 |
 | I21 | GetAclDataType 无 float8_e4m3fn 映射(c8 模式) | P2(待验证) | A5 + enable_sparse_sfa_c8 | trans_ascend.cpp:138-152 | 待验证 |
-| I22 | 杂项:空输入 UB / 累积泄漏 / vector\<bool\> data race / 32 位截断 / 输入无界 | P2 | 各自条件 | 见分项 | 待修复 |
+| I22 | 杂项:空输入 UB / 累积泄漏 / vector\<bool\> data race / 32 位截断 / 输入无界 | P2 | 各自条件 | 见分项 | ✅ 已修复 |
 
 ---
 
@@ -203,6 +203,24 @@ std::vector<int> GetTokenBlockMap(int layerID, std::string reqID)
 
 # 三、P2:资源泄漏 / 脆弱约定 / 降级
 
+> **✅ I13~I20 + I22 修复记录(第四批 P2;I21 保持"待验证",本批不改)**
+>
+> Python 侧(gsa.py,均通过 `ast.parse` 语法验证):
+> - **I13**:`get_model_input` 的残留 stat 分支由静默 `del` 改为与 preempt 路径一致的完整释放——drain(prefetch + indexer)→ `_release_preempted_gsa_stats`(三池归还 + `update_slot_num`)→ `del_finish_meta`(墓碑)→ `_block_hash_injected_reqs.discard`;
+> - **I14**:`execute_begin` 的 `set_modelrunning_status(True)` 之后全部主体提取为 `_execute_begin_body`,原函数以 `try/except BaseException` 包裹(异常先恢复闸门 `set_modelrunning_status(False)` 再 re-raise;不用 finally——正常路径必须由 `execute_finished` 在前向结束后恢复)。提取法避免 440 行整体重缩进,diff 可审阅;
+> - **I15**:`_prepare_prefetch_requests` 的 else 分支中,spec>1 且 rec_result=None 时显式 `select_gsa_prefetch_topk[:, index].zero_()` + WARNING 日志,拒绝把上一步陈旧 topk 当作当前结果静默提交;
+> - **I16**:`_update_dsa_block_table` 传给 `update_indexer_map` 的 idx 由稠密块计数 `len(slab_host_slot)-1` 改为与 numpy 侧同口径的稀疏位置 `indexer_sparse_len()-1`;
+> - **I17**:`gsa_prefetch_index` 容量由 `max_graph_bs` 扩为 `max_graph_bs + 2`(对齐流入上界与 gsa_swap_index/A1 守卫口径);两处写入(`gsa_prefetch_index`/`indexer_last_q_index`)各加防御守卫:超限截断 + ERROR(不在 numpy 深处抛难定位的 ValueError);
+> - **I18**:slot 不足分支保留 4 条诊断 ERROR 后改为 fail-loud 抛 `RuntimeError`(与 E3 同精神),不再带半初始化状态继续推理。
+>
+> C++ 侧:
+> - **I19**:`UCMKVPrefetch` 新增 `mPendingLoadHandle/mHasPendingLoad`;`UCMLoadSSD` 在提交新任务前先收尾上一次的 handle(先 Check,未完成也 Wait——store 侧 timeoutMs_ + Cancel 兜底,条目必然被 erase,只放弃该次预取),`StoreInit` 时重置。消除"每次调用泄漏一条 TaskWrapper::tasks_ 条目"的累积泄漏;
+> - **I20**:`ObtainStream` 失败路径先释放已分配资源(context / 已创建 stream / stream 数组)再 throw;TaskManager worker lambda 全程 try-catch(ObtainStream 在 ExecuteTask 的 try-catch 之外,启动期 ACL 异常原会 std::terminate 整进程无声死亡),改为记日志后让该 worker 退出(预取能力降级而非进程死亡);
+> - **I22 杂项**:`SetIndexerMapForLayer` 开头空输入/越界防御(空 blockTableList 的 back() UB、空 blockSlot 的 size()-1 下溢、prefetch+remain 越界 blockTableList 的越界读,校验失败 ERROR + return 不产生半初始化 map 条目);`DelReqIDRun` erase 清单补上 `mAllBlocksHash`/`mLastKVBlockAddress`(消除每请求 16B×块数的累积泄漏);`mIsIndexerOffload` 由 `vector<bool>`(位压缩共享字读-改-写 data race)改为 `vector<char>`,pybind 入参保持 vector<bool> 赋值时转换;`TransferAndScatterPrefetchLayer` 的 `mLoadNum × mKVSizeBytesToken` 32 位域截断改为先 `static_cast<size_t>`(对齐 :477 处的正确写法);`IndexerInitLoad` 开头输入防御(空表/行数不齐/行长不齐 ERROR + return)。shm 版本计数协议为已知脆弱约定(TP lockstep 下配对成立),列为残余风险不改动。
+>
+> - **测试**:新增 2 个 UT——`UCMLoadSSDDrainsPreviousHandleOnNextCall`(I19,连续三次调用断言 calls 序列 Load→Wait(前 handle)→Load→Wait(前 handle)→Load)、`SetIndexerMapForLayerSkipsInvalidInputs`(I22,空输入/索引越界不产生 map 条目)。I13~I18 为 Python 侧逻辑(gsa.py 无 UT 框架),I20 为线程启动路径,均需构建后 e2e/TSAN 验证。
+> - **验证**:C++ 无法本地编译,UT 需随构建跑;I19 另需长跑压测断言 store 侧 tasks_/内存不增长。
+
 ## I13【P2】get_model_input 静默 del 旧 stat:池 slot 永久泄漏 + C++ map 残留
 
 **位置**:gsa.py:459-461。同一 req_id 在 `scheduled_new_reqs` 出现而 `gsa_stats` 仍留有旧条目时,`del self.gsa_stats[req_id]` 丢弃旧 GSAReqStat:① `slab_host_slot/indexer_slab_host_slot/req_dump_blocks` 未归还三个池 → 永久泄漏,长期运行后 `GSASharedCPUPool.allocate` 的 assert 崩;② C++ `mAllTopkIndicesTensor[reqID]` 仍按值持有 tensor、`mBlocksMap` 等映射残留;③ `_block_hash_injected_reqs` 残留旧 req_id。被注释掉的 `# assert req_id in self.gsa_stats`(452 行)说明作者实测碰到过该分支。**修复方向**:del 前走完整释放路径(等 drain → free 池 → del_finish_meta → discard hash 集合)。
@@ -284,4 +302,4 @@ std::vector<int> GetTokenBlockMap(int layerID, std::string reqID)
 
 ---
 
-> **备注**:本清单为第三轮(结构性并发专项)审阅结论,与主清单《GSA_ISSUES_AND_FIX_PLAN.md》(A~G 类 + H 类)互补;H 类修复(`b85c3b1` 及此前 17 项)已生效的部分在本轮审阅中视为基线,未重复报告。I 类尚未修复,状态均为"待修复"。
+> **备注**:本清单为第三轮(结构性并发专项)审阅结论,与主清单《GSA_ISSUES_AND_FIX_PLAN.md》(A~G 类 + H 类)互补;H 类修复(`b85c3b1` 及此前 17 项)已生效的部分在本轮审阅中视为基线,未重复报告。I 类 22 项已按四批修复计划完成 **21 项**(I1~I20、I22,分四个 fix commit + 一个 docs commit);**I21(fp8 映射)保持"待验证"**——需构建后确认 c8 路径是否实际经过 `AtTensorToAclTensorShared` 再决定是否补 `at::kFloat8_e4m3fn` 映射。C++ 修改无法本地编译,全部 UT(本批及此前各批新增)需随下一次构建执行验证。

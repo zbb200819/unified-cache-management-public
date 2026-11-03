@@ -80,7 +80,10 @@ public:
     std::unique_ptr<TaskManager> mTaskManger;
     std::unique_ptr<TaskManager> mIndexerTaskManger;
     std::vector<int> mPrefetchLen;
-    std::vector<bool> mIsIndexerOffload;
+    // [I22] 跨线程整体赋值(Python 线程)vs 预取线程逐元素读:data race 在
+    // 位压缩的共享字上做读-改-写,可翻转邻位 offload 判定;改 vector<char>
+    // (每元素独立字节)。pybind 入参保持 vector<bool>(接口不变),赋值时转换。
+    std::vector<char> mIsIndexerOffload;
     std::vector<void*> mDumpKBuffer;
     std::vector<void*> mDumpVBuffer;
     std::map<std::string, std::vector<std::vector<int>>> mUseBlockTableIdx;

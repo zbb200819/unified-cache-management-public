@@ -57,6 +57,11 @@ class __attribute__((visibility("hidden"))) UCMKVPrefetch {
 private:
     UC::StoreV1* mStoreV1_{nullptr};
     uint32_t mLayerNum = 78;
+    // [I19] UCMLoadSSD 的上一次异步 Load 的未收尾 handle:
+    // TaskWrapper::tasks_ 的条目只在 Wait() 中 erase,丢弃 handle 即每调用
+    // 泄漏一条;收尾动作顺延到下一次调用(见 UCMLoadSSD)。
+    UC::Detail::TaskHandle mPendingLoadHandle{0};
+    bool mHasPendingLoad{false};
 
     enum class PrefetchStatus : int32_t {
         GSA_PREFETCH_DONE = 0,
@@ -76,6 +81,8 @@ public:
         mStoreV1_ = reinterpret_cast<UC::StoreV1*>(storePtr);
         if (mStoreV1_ == nullptr) { throw std::runtime_error("storeV1 is null"); }
         mLayerNum = layerNum;
+        // [I19] 新 store 实例:上一次的 pending handle 已失效,不再收尾。
+        mHasPendingLoad = false;
     }
 
     int32_t UCMLoadSSD(const std::vector<UC::Detail::BlockId>& blockIds)
@@ -83,6 +90,23 @@ public:
         if (mStoreV1_ == nullptr) { return static_cast<int32_t>(PrefetchStatus::GSA_STORE_EMPTY); }
 
         if (blockIds.empty()) { return static_cast<int32_t>(PrefetchStatus::GSA_BLOCKID_EMPTY); }
+        // [I19] 收尾上一次调用的 load handle:TaskWrapper::tasks_ 的条目
+        // (TaskPtr + WaiterPtr + map 节点)只在 Wait() 中 erase——此前 handle
+        // 被直接丢弃,每次调用泄漏一条,长跑缓慢增长。本调用为异步语义,
+        // 收尾动作顺延到下一次调用(通常隔一步,任务大概率已完成):先
+        // Check,完成则 Wait(立即返回并清理);未完成也 Wait(store 侧
+        // timeoutMs_ + Cancel 兜底,条目必然被 erase,只放弃该次预取)。
+        if (mHasPendingLoad) {
+            auto checkResult = mStoreV1_->Check(mPendingLoadHandle);
+            if (!checkResult || !checkResult.Value()) {
+                std::fprintf(stderr,
+                             "[GSA] UCMLoadSSD: previous async load (handle=%llu) still "
+                             "in flight, draining it via Wait before submitting a new one\n",
+                             static_cast<unsigned long long>(mPendingLoadHandle));
+            }
+            (void)mStoreV1_->Wait(mPendingLoadHandle);
+            mHasPendingLoad = false;
+        }
         UC::Detail::TaskDesc task;
         task.reserve(blockIds.size() * mLayerNum);
 
@@ -93,6 +117,8 @@ public:
         }
         auto loadHandle = mStoreV1_->Load(std::move(task));
         if (!loadHandle) { return static_cast<int32_t>(PrefetchStatus::GSA_HANDLE_ERROR); }
+        mPendingLoadHandle = loadHandle.Value();
+        mHasPendingLoad = true;
         return static_cast<int32_t>(PrefetchStatus::GSA_PREFETCH_DONE);
     }
 

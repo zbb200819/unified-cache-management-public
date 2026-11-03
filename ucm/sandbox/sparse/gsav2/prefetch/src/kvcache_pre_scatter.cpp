@@ -509,8 +509,11 @@ void GSAPrefetchEngineC::TransferAndScatterPrefetchLayer(ThreadInfo& threadInfo,
                                                          int streamIdx, PrefetchTiming& timing,
                                                          PrefetchTimePoint syncEnd)
 {
-    size_t kSizeBytes = mLoadNum[layerID] * mKVSizeBytesToken;
-    size_t vSizeBytes = mLoadNum[layerID] * mKVSizeBytesTokenRe;
+    // [I22] mLoadNum(int)× mKVSizeBytesToken(uint32)先在 32 位域相乘再转
+    // size_t:累计 token 数 × 每 token 字节 > 4GiB 时 H2D 拷贝字节数错误
+    // (对比本文件 :477 处先 static_cast<size_t> 的正确写法,统一口径)。
+    size_t kSizeBytes = static_cast<size_t>(mLoadNum[layerID]) * mKVSizeBytesToken;
+    size_t vSizeBytes = static_cast<size_t>(mLoadNum[layerID]) * mKVSizeBytesTokenRe;
     size_t indexSizeBytes = mLoadNum[layerID] * sizeof(uint64_t);
     int32_t ret = CopyTrans(static_cast<void**>(&mH2DPtrInfo[streamIdx][0]),
                             static_cast<void**>(&mH2DPtrInfo[streamIdx][2]), kSizeBytes, 1, "h2d",
@@ -791,7 +794,28 @@ void GSAPrefetchEngineC::IndexerInitLoad(std::vector<std::vector<int>>& blockTab
     mLogger.log(LogLevel::INFO, "Decode step: %u, |KVCache Prefetch| Start IndexerInitLoad\n",
                 mDecodeStep);
     auto start = std::chrono::high_resolution_clock::now();
+    // [I22] 输入防御:blockTable/slabIdx 为空时按行 0 长度索引所有层是 UB;
+    // 各层行长不齐时后续逐层索引越界读。校验失败记 ERROR 返回(不产生
+    // 半初始化状态)。
+    if (blockTable.empty() || slabIdx.empty() ||
+        blockTable.size() != slabIdx.size()) {
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] IndexerInitLoad invalid input: blockTable rows %lu, slabIdx rows "
+                    "%lu, reqID %s\n",
+                    blockTable.size(), slabIdx.size(), reqID.c_str());
+        return;
+    }
     int number = blockTable[0].size();
+    for (size_t row = 0; row < blockTable.size(); ++row) {
+        if (blockTable[row].size() != static_cast<size_t>(number) ||
+            slabIdx[row].size() != static_cast<size_t>(number)) {
+            mLogger.log(LogLevel::ERROR,
+                        "[ERROR] IndexerInitLoad ragged input: row %lu size %lu/%lu vs row0 "
+                        "%d, reqID %s\n",
+                        row, blockTable[row].size(), slabIdx[row].size(), number, reqID.c_str());
+            return;
+        }
+    }
 
     auto ret = aclrtSetCurrentContext(*(static_cast<aclrtContext*>(mContext)));
     if (ret != ACL_SUCCESS) {
@@ -1273,7 +1297,10 @@ void GSAPrefetchEngineC::SubmitTask(std::vector<int>& topkLensInput, std::vector
     auto start = std::chrono::high_resolution_clock::now();
     mDecodeStep = stepTime;
     TaskInfo inputInfo(totalTaskNum, -1, topkLists, topkLensInput, bsIndexInput, reqIDList);
-    mIsIndexerOffload = isIndexerOffload;
+    // [I22] vector<bool> 位压缩(共享字读-改-写)存在 Python 无锁整体赋值 vs
+    // 预取线程读的 data race,可翻转邻位 offload 判定;改为逐元素转换存入
+    // vector<char> 成员(每元素独立字节)。
+    mIsIndexerOffload.assign(isIndexerOffload.begin(), isIndexerOffload.end());
     {
         // [C1 修复] mRealTimeIdx/mSeqLen 的写入与 mUseBlockTableIdx 的读取均与
         // indexer 工作线程(IndexerLoadProcess/DelReqIDRun 持 mUpdateReqMutex)和
@@ -1545,6 +1572,11 @@ void GSAPrefetchEngineC::DelReqIDRun()
         } else {
             mAllTopkIndicesTensor.erase(*it);
             mSparseSeqLen.erase(*it);
+            // [I22] 此前 erase 清单遗漏 mAllBlocksHash/mLastKVBlockAddress:
+            // 每请求 16B×块数的 hash vector 与块地址 map 永不释放(累积泄漏,
+            // 与 I13 的 Python 侧残留叠加)。
+            mAllBlocksHash.erase(*it);
+            mLastKVBlockAddress.erase(*it);
             mAllReqIdSlots.erase(*it);
             mPromptLen.erase(*it);
             mHBMMangers.erase(*it);

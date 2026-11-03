@@ -823,6 +823,28 @@ void GSAPrefetchEngineC::SetIndexerMapForLayer(const std::string& reqID, int lay
                                                std::vector<std::vector<int>>& prefetchIdx,
                                                std::vector<int>& blockSlot)
 {
+    // [I22] 空输入防御:blockTableList 为空时 back() 是 UB;blockSlot 为空时
+    // size()-1 下溢为 SIZE_MAX;prefetchIdx+remainIdx 索引越界 blockTableList
+    // 时越界读。校验失败记 ERROR 并跳过该层(不产生半初始化的 map 条目)。
+    if (blockTableList.empty() || blockSlot.empty() || layerID < 0 ||
+        static_cast<size_t>(layerID) >= remainIdx.size() ||
+        static_cast<size_t>(layerID) >= prefetchIdx.size()) {
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] SetIndexerMapForLayer invalid input: blockTableList %lu, "
+                    "blockSlot %lu, layerID %d, remainIdx layers %lu, prefetchIdx layers %lu, "
+                    "reqID %s\n",
+                    blockTableList.size(), blockSlot.size(), layerID, remainIdx.size(),
+                    prefetchIdx.size(), reqID.c_str());
+        return;
+    }
+    if (prefetchIdx[layerID].size() + remainIdx[layerID].size() > blockTableList.size()) {
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] SetIndexerMapForLayer index overflow: prefetch %lu + remain %lu "
+                    "> blockTableList %lu, layerID %d, reqID %s\n",
+                    prefetchIdx[layerID].size(), remainIdx[layerID].size(), blockTableList.size(),
+                    layerID, reqID.c_str());
+        return;
+    }
     std::map<int, int> oneDocTable;
     std::map<int, int> oneBlockMap;
     std::vector<int> onePrefetchIdx;

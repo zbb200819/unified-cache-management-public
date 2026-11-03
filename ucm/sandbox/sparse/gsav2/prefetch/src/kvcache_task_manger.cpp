@@ -55,42 +55,58 @@ TaskManager::TaskManager(int deviceID, int dpRank, int tpSize, void* args, size_
     for (size_t i = 0; i < threadNum; ++i) {
         worker_threads_.emplace_back([this, i, deviceID, dpRank, tpSize, args, mStreamNum, type,
                                       cpuToBind]() {
-            void* stream;
-            void* context;
-            SetupCpuAffinity(cpuToBind, type, deviceID);
-            ObtainStream(&stream, &context, deviceID, mStreamNum);
-            ThreadInfo local_thread_info(static_cast<uint64_t>(hasher(std::this_thread::get_id())),
-                                         deviceID, stream, context, args);
-            // Store thread information into a global array
-            {
-                std::lock_guard<std::mutex> lock(queue_mutex_);
-                threadInfos[i] = local_thread_info;
-            }
-            while (!should_stop_.load(std::memory_order_acquire)) {
-                std::shared_ptr<TaskWrapper> task_to_execute;
+            // [I20] worker lambda 全程 try-catch:ObtainStream(ACL 初始化)位于
+            // ExecuteTask 的 try-catch 之外,启动期 ACL 环境异常时未捕获异常会
+            // std::terminate 整个进程无声死亡;改为记日志后让该 worker 退出。
+            try {
+                void* stream;
+                void* context;
+                SetupCpuAffinity(cpuToBind, type, deviceID);
+                ObtainStream(&stream, &context, deviceID, mStreamNum);
+                ThreadInfo local_thread_info(
+                    static_cast<uint64_t>(hasher(std::this_thread::get_id())), deviceID, stream,
+                    context, args);
+                // Store thread information into a global array
                 {
-                    std::unique_lock<std::mutex> lock(queue_mutex_);
-                    queue_cv_.wait(lock, [this] {
-                        return !task_queue_.empty() || should_stop_.load(std::memory_order_acquire);
-                    });
-                    if (should_stop_.load(std::memory_order_acquire) && task_queue_.empty()) {
-                        break;
-                    }
-                    if (!task_queue_.empty()) {
-                        auto front_it = task_queue_.begin();
-                        task_to_execute = *front_it;
-                        task_queue_.erase(front_it);
-                        // Update the task status
-                        task_to_execute->status.store(TaskStatus::RUNNING,
-                                                      std::memory_order_release);
-                        // add running_tasks_count_
-                        running_tasks_count_.fetch_add(1, std::memory_order_relaxed);
-                    }
+                    std::lock_guard<std::mutex> lock(queue_mutex_);
+                    threadInfos[i] = local_thread_info;
                 }
-                if (task_to_execute) { ExecuteTask(task_to_execute, local_thread_info); }
+                while (!should_stop_.load(std::memory_order_acquire)) {
+                    std::shared_ptr<TaskWrapper> task_to_execute;
+                    {
+                        std::unique_lock<std::mutex> lock(queue_mutex_);
+                        queue_cv_.wait(lock, [this] {
+                            return !task_queue_.empty() ||
+                                   should_stop_.load(std::memory_order_acquire);
+                        });
+                        if (should_stop_.load(std::memory_order_acquire) && task_queue_.empty()) {
+                            break;
+                        }
+                        if (!task_queue_.empty()) {
+                            auto front_it = task_queue_.begin();
+                            task_to_execute = *front_it;
+                            task_queue_.erase(front_it);
+                            // Update the task status
+                            task_to_execute->status.store(TaskStatus::RUNNING,
+                                                          std::memory_order_release);
+                            // add running_tasks_count_
+                            running_tasks_count_.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    if (task_to_execute) { ExecuteTask(task_to_execute, local_thread_info); }
+                }
+                DestroyStream(local_thread_info.stream_, local_thread_info.context_,
+                              local_thread_info.deviceID_, mStreamNum);
+            } catch (const std::exception& e) {
+                std::cerr << "[GSA] TaskManager worker thread " << i
+                          << " aborted during startup: " << e.what()
+                          << "; this worker exits (prefetch capacity is degraded)" << std::endl;
+            } catch (...) {
+                std::cerr << "[GSA] TaskManager worker thread " << i
+                          << " aborted during startup with unknown exception; this worker exits "
+                             "(prefetch capacity is degraded)"
+                          << std::endl;
             }
-            DestroyStream(local_thread_info.stream_, local_thread_info.context_,
-                          local_thread_info.deviceID_, mStreamNum);
         });
     }
 }

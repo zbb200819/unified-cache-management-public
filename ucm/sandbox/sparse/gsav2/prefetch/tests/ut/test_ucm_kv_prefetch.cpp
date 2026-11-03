@@ -137,6 +137,32 @@ TEST(UCMKVPrefetch, UCMLoadSSDNoLongerEnqueuesAsyncWait_BugFixed)
     EXPECT_EQ(store.calls[0].name, "Load");
 }
 
+TEST(UCMKVPrefetch, UCMLoadSSDDrainsPreviousHandleOnNextCall)
+{
+    /* [I19] Load 返回的 handle 此前被直接丢弃:TaskWrapper::tasks_ 的条目
+     * (TaskPtr + WaiterPtr + map 节点)只在 Wait() 中 erase,每调用泄漏一条。
+     * 修复后收尾动作顺延到下一次调用:先 Check(mock 的 Check 不记录,
+     * 经 Wait 观察)收尾上一次的 handle,再提交新的 Load。 */
+    MockStoreV1 store;
+    UCMKVPrefetch p;
+    p.StoreInit(reinterpret_cast<uintptr_t>(&store), /*layerNum=*/2);
+    std::vector<UC::Detail::BlockId> ids = {MakeBlockId(1)};
+    EXPECT_EQ(p.UCMLoadSSD(ids), kStatusPrefetchDone);
+    ASSERT_EQ(store.calls.size(), 1u);
+    EXPECT_EQ(store.calls[0].name, "Load");
+    EXPECT_EQ(p.UCMLoadSSD(ids), kStatusPrefetchDone);
+    /* Second call drains the FIRST handle via Wait, then submits a new Load. */
+    ASSERT_EQ(store.calls.size(), 3u);
+    EXPECT_EQ(store.calls[1].name, "Wait");
+    EXPECT_EQ(store.calls[1].handle, store.calls[0].handle);  // previous handle
+    EXPECT_EQ(store.calls[2].name, "Load");
+    EXPECT_EQ(p.UCMLoadSSD(ids), kStatusPrefetchDone);
+    ASSERT_EQ(store.calls.size(), 5u);
+    EXPECT_EQ(store.calls[3].name, "Wait");
+    EXPECT_EQ(store.calls[3].handle, store.calls[2].handle);  // previous handle
+    EXPECT_EQ(store.calls[4].name, "Load");
+}
+
 TEST(UCMKVPrefetch, UCMLookupReturnsEmptyWhenStoreNull)
 {
     UCMKVPrefetch p;

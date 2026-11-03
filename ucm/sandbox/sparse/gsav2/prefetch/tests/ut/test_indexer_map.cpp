@@ -185,6 +185,30 @@ TEST_F(IndexerMapTest, SetIndexerMapForLayerBuildsDocAndBlockMaps)
     EXPECT_EQ(engine->mUseBlockTableIdx["req1"][0].size(), 2u);
 }
 
+TEST_F(IndexerMapTest, SetIndexerMapForLayerSkipsInvalidInputs)
+{
+    /* [I22] 空输入防御:空 blockTableList(back() 是 UB)/空 blockSlot
+     * (size()-1 下溢为 SIZE_MAX)/prefetch+remain 索引超 blockTableList
+     * (越界读)——一律记 ERROR 返回,不产生半初始化的 map 条目。 */
+    engine = MakeEngine(/*layerNum=*/1);
+    std::vector<std::vector<int>> remainIdx = {{0}};
+    std::vector<std::vector<int>> prefetchIdx = {{1}};
+    // Empty blockTableList + empty blockSlot.
+    std::vector<int> emptyList;
+    std::vector<int> emptySlot;
+    engine->SetIndexerMapForLayer("req1", /*layerID=*/0, emptyList, remainIdx, prefetchIdx,
+                                  emptySlot);
+    EXPECT_EQ(engine->mDocsTables.count("req1"), 0u);
+    EXPECT_EQ(engine->mBlocksMap.count("req1"), 0u);
+    EXPECT_EQ(engine->mPrefetchIdx.count("req1"), 0u);
+    // Index overflow: prefetch(1) + remain(1) > blockTableList size(1).
+    std::vector<int> smallList = {10};
+    std::vector<int> slot = {0, 1};
+    engine->SetIndexerMapForLayer("req2", /*layerID=*/0, smallList, remainIdx, prefetchIdx, slot);
+    EXPECT_EQ(engine->mDocsTables.count("req2"), 0u);
+    EXPECT_EQ(engine->mBlocksMap.count("req2"), 0u);
+}
+
 /* ---------------- UpdateIndexerMap ---------------- */
 
 TEST_F(IndexerMapTest, UpdateIndexerMapAddAppendsToUseBlockTableIdx)

@@ -62,6 +62,8 @@ void ObtainStream(void** outputStream, void** outputContext, int32_t deviceID, i
     aclrtContext* context = (aclrtContext*)malloc(sizeof(aclrtContext));
     ret = aclrtCreateContext(context, deviceID);
     if (ret != ACL_SUCCESS) {
+        // [I20] 失败路径先释放已分配资源再抛出(原实现直接 throw,context 泄漏)。
+        free(context);
         throw std::runtime_error(std::string("aclrtCreateContext failed: ") + std::to_string(ret));
     }
 
@@ -69,6 +71,11 @@ void ObtainStream(void** outputStream, void** outputContext, int32_t deviceID, i
     for (int i = 0; i < mStreamNum; i++) {
         ret = aclrtCreateStream(stream_ + i);
         if (ret != ACL_SUCCESS) {
+            // [I20] 失败路径释放已创建的 stream、stream 数组与 context
+            // (原实现直接 throw,已创建的 stream/数组/context 全部泄漏)。
+            for (int j = 0; j < i; j++) { (void)aclrtDestroyStream(stream_[j]); }
+            free(stream_);
+            free(context);
             throw std::runtime_error(std::string("AscendStreamCreateWithFlags failed: ") +
                                      std::to_string(ret));
         }
