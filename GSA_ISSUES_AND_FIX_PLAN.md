@@ -19,7 +19,7 @@
 | B1 | 前向/预取互斥闸是死代码 → 设备侧并发踩写 | **P0** | 预取块与前向读写块重叠 | kvcache_pre_scatter.cpp:51-88 | **是** | 待修复 |
 | E1 | P 节点 `init_dsa_data` AttributeError 启动崩溃 | **P0** | PD 分离 P 节点 | gsa.py:1892-1905 | 否(死代码) | ✅ 已修复 |
 | F1 | `when_imported` 单次触发保护静默丢弃后续补丁钩子 | **P0** | 同一模块注册两个补丁 | patch/utils.py:96-100 | **是** | ✅ 已修复 |
-| F2 | `indexer_select_post_process` 重复定义相互覆盖 | **P0** | v0.23.0_pmr 补丁生效时 | v0.23.0_pmr/.../device_op_patch.py:13,188 | **是** | 待修复 |
+| F2 | `indexer_select_post_process` 重复定义相互覆盖 | **P0** | v0.23.0_pmr 补丁生效时 | v0.23.0_pmr/.../device_op_patch.py:13,188 | **是** | ✅ 已修复 |
 | A3 | 老引擎 freeBlockPtr 裸写无界 | P1 | 行宽与表大小错配 | sparse/gsa/.../kvcache_pre.cpp:432 | 是(老引擎) | 待修复 |
 | B2 | 块 ID 陈旧 → 跨请求并发踩写 | P1 | 请求抢占/完成时 DMA 在途 | kvcache_pre_scatter.cpp:1305-1313 | **是** | 待修复 |
 | B3 | 裸指针 use-after-free 风险 | P1 | Python 张量先于 C++ 释放 | pybinds.cpp:143-148 + gsa.py:1544-1546 | **是** | 待修复 |
@@ -408,6 +408,19 @@ if module_name in sys.modules:
 **原因**:第一个实现(:13 起)的全部逻辑成为死代码,实际生效的是第二个;若二者行为有差异(不同模型拓扑的 select 后处理),走 pmr 路径时前一种模型的行为被静默替换。
 
 **修复建议**:把 `v0_23_0` 的修复方案(`_a5` 改名)同步到 `v0.23.0_pmr/device_op_patch.py:188`。
+
+### ✅ 修复记录(F2)
+
+- **修复内容**(`v0.23.0_pmr/vllm_ascend/device_op_patch.py`):
+  1. 第二个定义(`:188` 起,A5 路径)改名为 `indexer_select_post_process_a5`(现 `:201`),并在其前移植了 `v0_23_0` 版本的 NOTE 注释块,说明两个实现(A3/DSV3.2 走 `torch.ops._C_ascend.*` 避免图编译问题;A5 走 `torch_npu.*` 直连)为何**必须**不同名;
+  2. `_patch` 中 `A5DeviceAdaptor` 补丁块的 6 处引用同步改为 `indexer_select_post_process_a5`。
+- **修复原因**:
+  - 两个同名 `def` 在模块导入时第二个遮蔽第一个,`_patch` 按模块级名字取函数,导致 `BaseDeviceAdaptor` 上绑定的实际是 **A5 变体**——A3 路径(A3/DSV3.2 模型)静默走错 indexer 实现(图编译问题回归),第一个实现整体成为死代码;
+  - `v0_23_0` 目录此前已修复(第二定义改名 `_a5`),但 `v0.23.0_pmr` 目录未同步——本修复即把现成方案移植过来,保证两个版本目录行为一致。
+- **修复后结构**(与 `v0_23_0` 对齐):
+  - `:13 indexer_select_post_process`(A3/DSV3.2 路径)→ `_patch` 绑定到 `BaseDeviceAdaptor`;
+  - `:201 indexer_select_post_process_a5`(A5 路径)→ `_patch` 绑定到 `A5DeviceAdaptor`。
+- **验证**:`ast.parse` 语法通过;grep 确认文件中两个定义名唯一、`A5DeviceAdaptor` 块引用全部指向 `_a5`。
 
 ---
 
