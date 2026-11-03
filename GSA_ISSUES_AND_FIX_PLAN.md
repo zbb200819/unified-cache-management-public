@@ -24,7 +24,7 @@
 | B2 | 块 ID 陈旧 → 跨请求并发踩写 | P1 | 请求抢占/完成时 DMA 在途 | kvcache_pre_scatter.cpp:1305-1313 | **是** | 待修复 |
 | B3 | 裸指针 use-after-free 风险 | P1 | Python 张量先于 C++ 释放 | pybinds.cpp:143-148 + gsa.py:1544-1546 | **是** | 待修复 |
 | C1 | C++ map 跨线程并发读写无锁 | P1 | Python 写 API 与预取线程同时活跃 | kvcache_pre_scatter.cpp:1167-1171 附近 | **是** | ✅ 已修复 |
-| D1 | `-1` 槽位索引可达设备侧 scatter | P1 | aclgraph 捕获/回放 | sfa_kv_transfer_patch.py:387-392 | **是** | 待修复 |
+| D1 | `-1` 槽位索引可达设备侧 scatter | P1 | aclgraph 捕获/回放 | sfa_kv_transfer_patch.py:387-392 | **是** | ✅ 已修复 |
 | E2 | `_load_kv_dram` 未捕获 C++ throw | P1 | PD 分离 D 节点 + store 注入未就绪 | gsa.py:2576 | 否(死代码) | ✅ 已修复 |
 | E3 | `_load_kv_dram` 超时静默 KV 空洞 + 阻塞 hang | P1 | PD 分离 D 节点 + lookup 超时 | gsa.py:2575-2587 | 否(死代码) | ✅ 已修复 |
 | E4 | `_ensure_store_injected` 非异常静默失败 | P1 | connector/store 未就绪 | gsa.py:955-974 | 否(死代码) | ✅ 已修复 |
@@ -274,6 +274,25 @@ torch_npu.npu_scatter_nd_update_(
 3. 后果二选一:CANN 按负索引回绕 → 写到 `dsa_k_cache` 最后一行(静默脏数据);或 C++ 不校验负值 → 设备侧 OOB 写。
 
 **修复建议**:scatter 前过滤 `dsa_slot_mapping < 0`(或捕获路径强制填 0);顺带说明一个已自洽点:槽位 id 池 1..11999(`MAX_SLOTS_BLOCK_NUM=12000`)× block_size < `dsa_k_cache` dim0=17000(`MAX_INDEXER_BLOCK_NUM`)——但这是跨文件隐式常量约定,见 G1。
+
+### ✅ 修复记录(D1)
+
+- **修复内容**(`v0_23_0` 与 `v0.23.0_pmr` 两个 `sfa_kv_transfer_patch.py`,各两处 GSA 路径 scatter——k 缓存与 k_scale 缓存):
+  ```python
+  slot_idx = attn_metadata.dsa_slot_mapping[: attn_metadata.gsa_slot_len].view(-1)
+  valid = slot_idx >= 0
+  torch_npu.npu_scatter_nd_update_(
+      self.dsa_k_cache.view(-1, k_li.shape[-1]),
+      slot_idx[valid].view(-1, 1),                       # 索引过滤
+      k_li.view(-1, k_li.shape[-1])[valid],              # 源数据同步过滤
+  )
+  ```
+- **修复原因**:
+  - `dsa_slot_mapping` 缓冲以 `fill_(-1)` 初始化(`utils.py:82`),常规步 `gsa_slot_len` = 实际填充数(-1 不进入 scatter);但 **aclgraph 捕获路径**(`model_runner_v1_patch.py:2006`)`gsa_slot_len = num_input_tokens`(含 padding)→ 捕获/回放中 -1 索引可达 scatter → CANN 负索引回绕写 `dsa_k_cache` 最后一行(静默脏数据)或设备侧越界;
+  - 索引与源数据(k_li / k_li_scale)必须**同步**过滤(布尔掩码作用于两者),否则索引与更新值错位。
+- **实现约束**:补丁函数经 `FunctionType(code, vars(mod))` 以 **sfa_v1 模块全局**运行——不能引入新的模块级名字,但**局部变量**不受限,故用局部 `slot_idx`/`valid` 实现且只调用张量方法(`>=`、`[mask]`),零新全局依赖。
+- **影响面/性能**:常规步 `valid` 全真,增加一次比较 + 两次掩码 gather(每层);全 -1 时(warmup 捕获)scatter 空操作。捕获/回放正确性优先,该开销可接受;如压测敏感,可后续在 `attn_metadata` 上预计算一次掩码(需改 metadata 结构,列为后续项)。
+- **验证**:两文件 `ast.parse` 语法通过;aclgraph 捕获/回放场景冒烟 + `dsa_k_cache` 最后一行 canary 数据比对。
 
 ---
 
