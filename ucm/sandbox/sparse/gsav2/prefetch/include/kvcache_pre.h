@@ -168,6 +168,12 @@ public:
 
     void SetModelRunningStatus(bool flag);
 
+    // [H1b] 跨 rank fatal 感知:任一 rank 的 KVPackAbort/KVPackFail 置位共享
+    // 内存 fatalError 后,本 rank 可步级查询。Python 侧 execute_begin 每步
+    // 检查,fatal 时抛 Python 异常——把"跨 rank 半死 hang 到 NCCL watchdog
+    // (默认 10 分钟)或永久挂死"变为第一时间带上下文的显式报错。
+    bool HasFatalError() const;
+
     std::vector<int> GetTokenBlockMap(int layerID, std::string reqID);
 
     std::vector<int> GetBlockTokenMap(int layerID, std::string reqID);

@@ -161,6 +161,8 @@ PYBIND11_MODULE(gsa_prefetch, m)
         .def("set_kv_buffer", &ucmprefetch::GSAPrefetchEngineC::SetKvBuffer)
         .def("get_prefetch_status", &ucmprefetch::GSAPrefetchEngineC::GetPrefetchStatus)
         .def("set_modelrunning_status", &ucmprefetch::GSAPrefetchEngineC::SetModelRunningStatus)
+        // [H1b] fatal 感知链:暴露共享 KVPack fatalError 供 Python 步级检查。
+        .def("has_fatal_error", &ucmprefetch::GSAPrefetchEngineC::HasFatalError)
         .def("get_token_map", &ucmprefetch::GSAPrefetchEngineC::GetTokenBlockMap)
         .def("get_block_map", &ucmprefetch::GSAPrefetchEngineC::GetBlockTokenMap)
         .def("get_block_table", &ucmprefetch::GSAPrefetchEngineC::GetReqUseBlockTable)

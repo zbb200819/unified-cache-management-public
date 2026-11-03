@@ -1816,6 +1816,18 @@ class GSA(UcmSparseBase):
         """每步推理前的 GSA 预取准备：注入 store、处理请求、同步块表、构造输入"""
         if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
             return
+        # [H1b] 跨 rank fatal 感知:任一 rank 因 KVPackAbort(不变式破坏/
+        # KVPackWait 30s 超时)或 KVPackFail 终止时,会在共享内存置位
+        # fatalError。本步第一步即显式报错,而不是带着残缺的 TP 组挂死到
+        # NCCL watchdog(默认 10 分钟)或永久 hang;死因见 kvcache_pre 日志
+        # 与该 rank 的 stderr(KVPackAbortWithReason 直写)。
+        if self.prefetch_engine.prefetch_engine_c.has_fatal_error():
+            raise RuntimeError(
+                "[GSA] KV pack fatal error detected in this TP group "
+                "(another rank aborted or hit a fatal pack invariant); "
+                "check the kvcache_pre log and the aborted rank's stderr "
+                "for the reason"
+            )
         # [B1] 暂停预取线程:本步前向即将执行,预取线程的 scatter 写
         # 不得与计算流上的 attention kernel 并发读写 vLLM KV cache;
         # 与 execute_finished 的 set_modelrunning_status(False) 配对。

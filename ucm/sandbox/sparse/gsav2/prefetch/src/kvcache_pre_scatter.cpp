@@ -1487,6 +1487,14 @@ bool GSAPrefetchEngineC::GetIndexerStatus()
 
 void GSAPrefetchEngineC::SetModelRunningStatus(bool flag) { mStopPrefetch = flag; }
 
+bool GSAPrefetchEngineC::HasFatalError() const
+{
+    // null 安全:mKVPackControl 懒初始化(首次 SubmitTask 时创建),
+    // 未初始化视为无 fatal(此时也不存在共享 fatal 标志)。
+    return mKVPackControl != nullptr &&
+           mKVPackControl->fatalError.load(std::memory_order_acquire) != 0;
+}
+
 std::vector<int> GSAPrefetchEngineC::GetTokenBlockMap(int layerID, std::string reqID)
 {
     return mHBMMangers[reqID][layerID]->mGlobalToSlot;

@@ -33,7 +33,7 @@
 | E5 | `attention_finished` gate 反转(行为回归) | P2 | PD 分离 D 节点 | gsa.py:1660 | 否(死代码) | ✅ 已修复 |
 | F5 | `init_kvcache_ptrs` 无判空直接索引 | P2 | kv_cache 为 None/空 | gsa.py:2771-2782 | **是** | ✅ 已修复 |
 | G1 | 跨文件隐式常量约定 | P2 | 修改任一常量 | sparse/utils.py:64-65 | **是** | ✅ 已修复 |
-| H1 | `KVPackAbort` 无日志裸调用 → 静默死亡 + 跨 rank 半死 | P1 | 8 处无前置日志的 abort 点触发 | kvcache_pre_detail.h:56-64 + scatter:316/410/421 + pre:538/1581-1607 | **是** | 🔧 修复中(H1a/H1c 已修复,H1b fatal 感知链下一 commit) |
+| H1 | `KVPackAbort` 无日志裸调用 → 静默死亡 + 跨 rank 半死 | P1 | 8 处无前置日志的 abort 点触发 | kvcache_pre_detail.h:56-64 + scatter:316/410/421 + pre:538/1581-1607 | **是** | ✅ 已修复 |
 | H2 | `mStoreV1_->Wait` 无界阻塞 → 预取链路/Python 主线程挂死 | **P0** | store 实现无超时或超时失效(psync 卡死 IO / dram future.get / timeout_ms=0) | kvcache_pre.cpp:1184,1279 + scatter:844,1082 | **是** | ✅ 已修复 |
 
 > 注意:**A/B/C/D/F/G 类问题与是否开启 PD 分离无关,PD-mix 日常部署同样暴露在风险之下**;E 类仅在 PD 分离部署时进入执行路径(PD-mix 下 agent 不创建,是死代码)。
@@ -713,6 +713,15 @@ MAX_SLOTS_BLOCK_NUM = 12000
   - pre `ValidateUCMMergeRequest`:`mStoreV1_` 为空补 `return false;`(原先只 log 不 return,继续用空 store 走 `LoadUCMMergeHostAddress` → 未定义行为;`UCMTensorMerge` 对 false 返回已有失败兜底)。
 - **修复效果**:8 个死亡点现场三处可见——kvcache_pre 日志文件(死因+上下文)、stderr(reason 直写)、共享内存 fatalError(跨 rank);死亡不再静默,跨 rank 半死现场可定位。
 - **验证**:C++ 无法本地编译;新增 2 个 gtest death test(`KVPackAbortWithReason` 带/不带 header,断言 SIGABRT + stderr 匹配 reason 文本)及全部既有 UT 需随构建跑(death test 依赖 gtest fork 模式,Linux 标准支持)。
+
+### ✅ 修复记录(H1b,fatal 感知链:消除跨 rank 半死 / Python 盲区)
+
+- **修复内容**(建议 4):
+  - `kvcache_pre.h` + `kvcache_pre_scatter.cpp`:新增 `bool HasFatalError() const`——null 安全读 `mKVPackControl->fatalError`(懒初始化于首次 SubmitTask,未初始化视为无 fatal),一次 acquire 原子读;
+  - `pybinds.cpp`:新增绑定 `.def("has_fatal_error", ...)`(风格同 `set_modelrunning_status`);
+  - `gsa.py` `execute_begin`(`set_modelrunning_status(True)` 之前):`has_fatal_error()` 为真即 `raise RuntimeError`,消息注明"本 TP 组另一 rank 已 abort 或命中致命不变式,死因见 kvcache_pre 日志与该 rank 的 stderr"。
+- **修复效果**:此前某 rank 静默 abort 后,其余 rank 若阻塞在别处(等新任务/Python 侧/NCCL 集合通信)会带着残缺 TP 组继续运行,最终挂死到 NCCL watchdog(默认 10 分钟)或永久 hang,Python 层只有"EngineCore 无响应"没有死因;现在其余 rank 的 Python 主线程**下一步第一步**即抛带上下文的异常,vLLM 正常报错链路接管,fatal 感知链闭合:**置位(abort 前)→ 共享内存 → pybinds → Python 步级检查 → 显式异常**。
+- **验证**:`gsa.py` 已 `ast.parse` 通过;故障注入(kill -ABRT 一个 rank / 构造不变式破坏)断言其余 rank 第一步即抛 `RuntimeError` 而非 10 分钟 NCCL 超时;C++ 侧需随构建跑。
 
 
 ## H2【P0】`mStoreV1_->Wait` 无界阻塞 → 预取链路 / Python 主线程挂死
