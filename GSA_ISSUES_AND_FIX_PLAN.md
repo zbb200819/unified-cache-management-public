@@ -14,7 +14,7 @@
 
 | 编号 | 标题 | 严重度 | 触发条件 | 主要位置 | PD-mix 是否触发 | 状态 |
 |---|---|---|---|---|---|---|
-| A1 | CopyPreSwapTokens 行索引越界写 | **P0** | MTP + 总 token 数 > dim1 | kvcache_pre_scatter.cpp:1235-1238 | **是** | 待修复 |
+| A1 | CopyPreSwapTokens 行索引越界写 | **P0** | MTP + 总 token 数 > dim1 | kvcache_pre_scatter.cpp:1235-1238 | **是** | ✅ 已修复 |
 | A2 | CopyPreSwapTokens 负偏移越界写 | **P0** | use_tokens 内容过期 | kvcache_pre_scatter.cpp:1239-1242 | **是** | 待修复 |
 | B1 | 前向/预取互斥闸是死代码 → 设备侧并发踩写 | **P0** | 预取块与前向读写块重叠 | kvcache_pre_scatter.cpp:51-88 | **是** | 待修复 |
 | E1 | P 节点 `init_dsa_data` AttributeError 启动崩溃 | **P0** | PD 分离 P 节点 | gsa.py:1892-1905 | 否(死代码) | ✅ 已修复 |
@@ -75,6 +75,20 @@ for (int index = swapRange[0]; index < swapRange[1]; index++) {
 **修复建议**:
 1. C++ 侧:`index` 加边界检查(可复用同仓库 `CheckInputIndex()`,见 `sparse/gsa/prefetch/src/kvcache_pre.cpp:188-196` 的实现),违例 abort 并带上下文;
 2. Python 侧(根本修):`gsa_swap_topk`/`gsa_swap_index` 的 dim1 改为 token 口径 `max_graph_bs * num_spec_tokens + 2`,并在 `_pre_swap_tokens_all` 前断言 `len(swap_index) ≤ shape[1]`,把越界挡在 Python 层。
+
+### ✅ 修复记录(A1)
+
+- **修复内容**(双层防御,fail-loud):
+  1. **C++ 侧** `CopyPreSwapTokens`(`prefetch/src/kvcache_pre_scatter.cpp:1226`)在 OpenMP 并行区**之前**(omp 区域内抛异常是 UB)新增两个校验:
+     - `swapRange` 合法性:size==2、start ≥ 0、start ≤ end;
+     - **关键校验** `swapRange[1] > spaMaxBs` → 抛 `std::out_of_range`,错误信息带区间端点、spaMaxBs、并提示 "accumulated token position vs request-count dim mismatch, MTP num_spec_tokens > 1?"。
+     - 校验整个区间端点即可覆盖区间内所有 `index`(区间连续递增),无需逐 index 检查,零热路径开销。
+  2. **Python 侧** `_pre_swap_tokens_all`(`gsa.py:1541`)调用 C++ 前新增拦截:`max_row_end = max(rng[1]) > self.gsa_swap_topk_bs` 时抛 `IndexError`,带 num_spec_tokens、请求数、dim1 等上下文,把堆踩写变成进入 C++ 之前即可定位的错误。
+- **修复原因**:
+  - 根因是 index 的"token 口径"与 buffer dim1 的"请求口径"错位;口径重排(dim1 改为 `max_graph_bs * num_spec_tokens + 2`)是根本修,但会改变 buffer 形状、影响所有 shape 消费方(NPU 侧 kernel、aclgraph 捕获),需要独立验证,本次先落地确定性防御,把静默堆损坏升级为带上下文的显式失败;根本修作为后续项;
+  - 选择抛异常而非 clamp:文档原则"违例 abort 带上下文(而非默默 clamp)"——clamp 只会掩盖口径错位并继续产生错误结果。
+- **影响面**:无 MTP 常规路径 `max_row_end ≤ dim1`,两个校验均零行为变化;开 MTP 且 batch 超限时从"静默踩写 20KB×8 线程"变为首次越界即报错。
+- **验证**:Python 语法 `ast.parse` 通过;C++ 需随构建跑(改动为纯前置校验,不动拷贝逻辑);单测可仿 `test_kvcache_pre_scatter_indexer.cpp` 构造 swapRange 越界用例断言 throw。
 
 ---
 

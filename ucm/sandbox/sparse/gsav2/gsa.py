@@ -1537,6 +1537,19 @@ class GSA(UcmSparseBase):
     def _pre_swap_tokens_all(self, use_tokens_ptrs, seq_lens, swap_index, use_req_ids):
         if not use_tokens_ptrs:
             return
+        # [A1 防御] swap_index 的行号是全 batch 累计 token 位置,而 gsa_swap_topk 的
+        # dim1(gsa_swap_topk_bs)是请求数量级(max_graph_bs+2)。MTP(num_spec_tokens>1)
+        # 下两者口径不一致时 C++ 会越界写 pinned 内存;在进入 C++ 前显式拦截,
+        # 把堆踩写变成带上下文的可定位错误。
+        max_row_end = max((rng[1] for rng in swap_index), default=0)
+        if max_row_end > self.gsa_swap_topk_bs:
+            raise IndexError(
+                f"[GSA] _pre_swap_tokens_all: swap row end {max_row_end} exceeds "
+                f"gsa_swap_topk dim1 {self.gsa_swap_topk_bs} "
+                f"(num_spec_tokens={self.num_spec_tokens}, "
+                f"num_reqs={len(use_req_ids)}); token-count vs request-count "
+                f"dim mismatch (issue A1, MTP?)"
+            )
         if self.gsa_swap_topk_cpu_ptr is None:
             self.gsa_swap_topk_cpu_ptr = self.gsa_swap_topk.cpu.data_ptr()
             self.gsa_swap_topk_npu_ptr = self.gsa_swap_topk.npu.data_ptr()

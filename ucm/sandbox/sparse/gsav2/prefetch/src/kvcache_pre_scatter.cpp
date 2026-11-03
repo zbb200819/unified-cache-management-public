@@ -1228,6 +1228,27 @@ void GSAPrefetchEngineC::CopyPreSwapTokens(uintptr_t useTokenBase, uintptr_t spa
                                            const std::vector<int>& needAppend, int sparseLen,
                                            int spaMaxBs, int mtpToken, int changeLen)
 {
+    // [A1 防御] 行索引越界校验(必须在 omp 并行区之前,omp 区域内抛异常是 UB):
+    // swapRange 是该请求在全 batch 中占用的累计 token 位置区间,而 spaTokenBase
+    // 指向的缓冲区 dim1 是请求数量级(spaMaxBs ≈ max_num_seqs + 2)。
+    // MTP(num_spec_tokens > 1)下两者口径不一致,总 token 数可超过 dim1,
+    // 不校验则每越界一行踩写 sparseLen * 4 字节 pinned 宿主内存(8 线程并发踩)。
+    // 违例带上下文抛出(fail-loud),绝不默默 clamp 掩盖越界。
+    if (swapRange.size() != 2 || swapRange[0] < 0 || swapRange[0] > swapRange[1]) {
+        throw std::out_of_range(
+            "CopyPreSwapTokens: invalid swapRange (size=" + std::to_string(swapRange.size()) +
+            ", start=" + (swapRange.empty() ? std::string("n/a")
+                                           : std::to_string(swapRange[0])) +
+            ", end=" + (swapRange.size() < 2 ? std::string("n/a") : std::to_string(swapRange[1])) +
+            ")");
+    }
+    if (swapRange[1] > spaMaxBs) {
+        throw std::out_of_range(
+            "CopyPreSwapTokens: swap range end " + std::to_string(swapRange[1]) +
+            " exceeds spaMaxBs " + std::to_string(spaMaxBs) +
+            " (accumulated token position vs request-count dim mismatch, "
+            "MTP num_spec_tokens > 1?)");
+    }
 #pragma omp parallel for num_threads(8) proc_bind(master)
     for (int layerID = 0; layerID < mTopkIndexerNum; layerID++) {
         void* usePtr =
