@@ -2,7 +2,7 @@
 """ucm/sandbox/sparse/gsav2/gsa.py 单元测试。
 
 覆盖策略：
-- C++ 扩展（GSAPrefetchEngineC / UCMKVPrefetch / torch.ops._C_gsa）使用
+- C++ 扩展（GSAPrefetchEngineC / UCMKVPrefetch / torch.ops._C_ascend）使用
   conftest 注入的 mock；
 - 模块常量（IS_INDEXER_OFFLOAD / PTOPK_PREFETCH_ENABLE / IS_PERFORMANCE_LOG /
   SEG_PREFILL_THRESHOLD 等）通过 monkeypatch 构造分支矩阵；
@@ -774,15 +774,15 @@ def _register_kvcaches(g, n_blocks=32):
 
 
 def _record_ops(monkeypatch):
-    """把 torch.ops._C_gsa 的 copy op 替换为计数记录器"""
+    """把 torch.ops._C_ascend 的 copy op 替换为计数记录器"""
     rec = {"gather": 0, "scatter": 0}
     monkeypatch.setattr(
-        torch.ops._C_gsa,
+        torch.ops._C_ascend,
         "gsa_gather_copy",
         lambda *a, **k: rec.__setitem__("gather", rec["gather"] + 1),
     )
     monkeypatch.setattr(
-        torch.ops._C_gsa,
+        torch.ops._C_ascend,
         "gsa_scatter_copy",
         lambda *a, **k: rec.__setitem__("scatter", rec["scatter"] + 1),
     )
