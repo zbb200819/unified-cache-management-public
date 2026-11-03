@@ -797,9 +797,14 @@ bool GSAPrefetchEngineC::ProcessIndexerInitLoadLayer(std::vector<std::vector<int
                         reqID.c_str(), layerID, blockIdx, hashVec.size());
             continue;
         }
-        task.emplace_back(UC::Detail::Shard{
-            hashVec[blockIdx], shardIndex, std::vector<void*>{nullptr, nullptr, indexerAddr}
-        });
+        /* One address per store tensor slot: the store's H2D path walks
+         * tensorSizes_ and reads addrs[i] for every slot, so pad the vector
+         * to the full slot count with the indexer address at
+         * kIndexerTensorIndex (ghost slots stay nullptr). */
+        std::vector<void*> tensorAddrs(kStoreTensorCount, nullptr);
+        tensorAddrs[kIndexerTensorIndex] = indexerAddr;
+        task.emplace_back(UC::Detail::Shard{hashVec[blockIdx], shardIndex,
+                                            std::move(tensorAddrs)});
     }
     return SubmitIndexerInitLoadTask(task, reqID, layerID);
 }
@@ -1002,9 +1007,12 @@ bool GSAPrefetchEngineC::BuildIndexerLoadTask(const std::string& reqID, int laye
                         reqID.c_str(), layerID, missBlockIdx, hashVec.size());
             continue;
         }
-        task.emplace_back(UC::Detail::Shard{
-            hashVec[missBlockIdx], shardIndex, std::vector<void*>{nullptr, nullptr, indexerAddr}
-        });
+        /* Same slot-padded addrs contract as the init load: the store's H2D
+         * path indexes addrs[i] for every tensorSizes_ slot. */
+        std::vector<void*> tensorAddrs(kStoreTensorCount, nullptr);
+        tensorAddrs[kIndexerTensorIndex] = indexerAddr;
+        task.emplace_back(UC::Detail::Shard{hashVec[missBlockIdx], shardIndex,
+                                            std::move(tensorAddrs)});
     }
     return true;
 }

@@ -80,16 +80,19 @@ struct UCMMergeBlockContext {
     bool owned;
 };
 
-/* UCM store cache-slot tensor layout expected by the GSA deployment: the
- * layer block cache slot is laid out as [full K cache][full V cache][full
- * indexer cache], matching the indexer load task whose shards carry
- * {nullptr, nullptr, indexerAddr}. LoadOnToken filters must therefore have
- * exactly kStoreTensorCount range groups, with K ranges under kKTensorIndex
- * and V ranges under kVTensorIndex (indexer group left empty). */
+/* UCM store cache-slot tensor layout expected by the GSA deployment
+ * (SharedIndexerKVCacheLayout, li_c8 mode): the layer block cache slot is
+ * laid out as [full K cache][full V cache][full indexer cache][full scale
+ * cache], matching the indexer load task whose shards carry
+ * {nullptr, nullptr, indexerAddr, nullptr}. LoadOnToken filters must
+ * therefore have exactly kStoreTensorCount range groups, with K ranges under
+ * kKTensorIndex and V ranges under kVTensorIndex (indexer/scale groups left
+ * empty). */
 constexpr size_t kKTensorIndex = 0;
 constexpr size_t kVTensorIndex = 1;
 constexpr size_t kIndexerTensorIndex = 2;
-constexpr size_t kStoreTensorCount = 3;
+constexpr size_t kScaleTensorIndex = 3;
+constexpr size_t kStoreTensorCount = 4;
 
 /* LoadOnToken plan. K and V are staged into two separate destination buffers
  * (mLastCHunkKPtr/VPtr, mSharedKBufferHostPtr/VBufferHostPtr), so each tensor

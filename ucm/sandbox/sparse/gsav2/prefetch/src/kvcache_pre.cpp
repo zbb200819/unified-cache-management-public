@@ -272,6 +272,9 @@ float average2d(const std::vector<std::vector<float>>& matrix)
 
     size_t count = 0;
     for (const auto& row : matrix) { count += row.size(); }
+    /* Non-empty matrix of empty rows: count==0 must return 0.0f instead of
+     * dividing by zero (NaN). */
+    if (count == 0) { return 0.0f; }
 
     return static_cast<float>(sum / count);
 }
@@ -1165,6 +1168,12 @@ bool GSAPrefetchEngineC::SubmitUCMTokenLoadLeg(const UC::Detail::TaskDesc& task,
                                                int layerID, const std::string& reqID)
 {
     if (task.empty()) { return true; }
+    if (!mStoreV1_) {
+        mLogger.log(LogLevel::ERROR,
+                    "|%s| LoadOnToken(%s) mStoreV1_ is nullptr, reqID=%s layerID=%d\n", stage,
+                    tensorName, reqID.c_str(), layerID);
+        return false;
+    }
     if (filters.size() != task.size()) {
         mLogger.log(LogLevel::ERROR,
                     "|%s| LoadOnToken(%s) filter size mismatch, reqID=%s layerID=%d "

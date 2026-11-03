@@ -624,10 +624,12 @@ TEST_F(PreLogicTest, BuildUCMMergeLoadPlanBuildsShardsForOwnedUcmBlocks)
     EXPECT_EQ(plan.kTask[0].addrs.front(), static_cast<void*>(kBuf + 3 * 8));
     EXPECT_EQ(plan.vTask[0].addrs.front(), static_cast<void*>(vBuf + 3 * 8));
     EXPECT_EQ(plan.kTask[1].addrs.front(), static_cast<void*>(kBuf + (3 + 2) * 8));
-    // 3-tensor filter layout; K ranges under tensor 0, V under tensor 1.
-    ASSERT_EQ(plan.kFilters[0].ranges.size(), 3u);
+    // 4-tensor filter layout; K ranges under tensor 0, V under tensor 1,
+    // indexer/scale groups left empty.
+    ASSERT_EQ(plan.kFilters[0].ranges.size(), 4u);
     EXPECT_TRUE(plan.kFilters[0].ranges[1].empty());
     EXPECT_TRUE(plan.kFilters[0].ranges[2].empty());
+    EXPECT_TRUE(plan.kFilters[0].ranges[3].empty());
     ASSERT_EQ(plan.kFilters[0].ranges[0].size(), 2u);
     // Token 1 of block 0: offset = 1*8 (block-relative), length = 8 (one
     // token), dstOffset = 1*8 (relative to the shard base).
@@ -1239,11 +1241,13 @@ TEST_F(PreLogicTest, PrepareLastChunkSourcesBuildsUcmShards)
     ASSERT_EQ(plan.kTask[0].addrs.size(), 1u);
     EXPECT_EQ(plan.kTask[0].addrs.front(), static_cast<void*>(kDst));
     EXPECT_EQ(plan.vTask[0].addrs.front(), static_cast<void*>(vDst));
-    // 3-tensor filter layout: K ranges under tensor 0, V under tensor 1.
-    ASSERT_EQ(plan.kFilters[0].ranges.size(), 3u);
+    // 4-tensor filter layout: K ranges under tensor 0, V under tensor 1,
+    // indexer/scale groups left empty.
+    ASSERT_EQ(plan.kFilters[0].ranges.size(), 4u);
     ASSERT_EQ(plan.kFilters[0].ranges[0].size(), 4u);
     EXPECT_TRUE(plan.kFilters[0].ranges[1].empty());
     EXPECT_TRUE(plan.kFilters[0].ranges[2].empty());
+    EXPECT_TRUE(plan.kFilters[0].ranges[3].empty());
     ASSERT_EQ(plan.vFilters[0].ranges[1].size(), 4u);
     EXPECT_TRUE(plan.vFilters[0].ranges[0].empty());
     // Token 2: offset = 2*8 (block-relative), length = 8 (one token),
