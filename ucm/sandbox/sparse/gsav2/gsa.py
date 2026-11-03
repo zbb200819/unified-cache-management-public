@@ -1041,14 +1041,14 @@ class GSA(UcmSparseBase):
         hit_num = self.indexer_pc_hit_num[index_in_batch]
         block_view = self.block_size * vllm_indexer_cache.shape[-1]
         gathered = indexer_tmp[:hit_num].view(-1, block_view)
-        torch.ops._C_ascend.gsa_gather_copy(
+        torch.ops._C_gsa.gsa_gather_copy(
             gathered,
             vllm_indexer_cache.view(-1, block_view),
             self.indexer_pc_hit_index.npu[0][index_in_batch][:hit_num]
             .view(-1, 1)
             .expand((hit_num, block_view)),
         )
-        torch.ops._C_ascend.gsa_scatter_copy(
+        torch.ops._C_gsa.gsa_scatter_copy(
             indexer_cache.view(-1, block_view),
             gathered,
             self.indexer_pc_hit_index.npu[1][index_in_batch][:hit_num]
@@ -1065,14 +1065,14 @@ class GSA(UcmSparseBase):
         """c8 场景：将命中块的 scale gather/scatter 到 indexer 缓存"""
         hit_num = self.indexer_pc_hit_num[index_in_batch]
         gathered = self.indexer_pc_dump_scale_tmp[:hit_num].view(-1, self.block_size)
-        torch.ops._C_ascend.gsa_gather_copy(
+        torch.ops._C_gsa.gsa_gather_copy(
             gathered,
             vllm_indexer_scale.view(-1, self.block_size),
             self.indexer_pc_hit_index.npu[0][index_in_batch][:hit_num]
             .view(-1, 1)
             .expand((hit_num, self.block_size)),
         )
-        torch.ops._C_ascend.gsa_scatter_copy(
+        torch.ops._C_gsa.gsa_scatter_copy(
             indexer_scale.view(-1, self.block_size),
             gathered,
             self.indexer_pc_hit_index.npu[1][index_in_batch][:hit_num]
@@ -1670,14 +1670,14 @@ class GSA(UcmSparseBase):
             indexer_tmp = self.indexer_pc_dump_tmp_c8
         else:
             indexer_tmp = self.indexer_pc_dump_tmp
-        torch.ops._C_ascend.gsa_gather_copy(
+        torch.ops._C_gsa.gsa_gather_copy(
             indexer_tmp[: self.indexer_pc_dump_num].view(-1, self.block_size * 128),
             self.indexer_k_cache_sparse[layer_id].view(-1, self.block_size * 128),
             self.indexer_pc_dump_index.npu[1][: self.indexer_pc_dump_num]
             .view(-1, 1)
             .expand((self.indexer_pc_dump_num, self.block_size * 128)),
         )
-        torch.ops._C_ascend.gsa_scatter_copy(
+        torch.ops._C_gsa.gsa_scatter_copy(
             self.kv_caches[layer_id][2].view(-1, self.block_size * 128),
             indexer_tmp[: self.indexer_pc_dump_num].view(-1, self.block_size * 128),
             self.indexer_pc_dump_index.npu[0][: self.indexer_pc_dump_num]
@@ -1685,7 +1685,7 @@ class GSA(UcmSparseBase):
             .expand((self.indexer_pc_dump_num, self.block_size * 128)),
         )
         if use_li_c8:
-            torch.ops._C_ascend.gsa_gather_copy(
+            torch.ops._C_gsa.gsa_gather_copy(
                 self.indexer_pc_dump_scale_tmp[: self.indexer_pc_dump_num].view(
                     -1, self.block_size
                 ),
@@ -1694,7 +1694,7 @@ class GSA(UcmSparseBase):
                 .view(-1, 1)
                 .expand((self.indexer_pc_dump_num, self.block_size)),
             )
-            torch.ops._C_ascend.gsa_scatter_copy(
+            torch.ops._C_gsa.gsa_scatter_copy(
                 self.kv_caches[layer_id][3].view(-1, self.block_size),
                 self.indexer_pc_dump_scale_tmp[: self.indexer_pc_dump_num].view(
                     -1, self.block_size

@@ -19,6 +19,7 @@ USE_NINJA = os.getenv("USE_NINJA") == "1"
 # get source files
 source_files = [
     os.path.join(BASE_DIR, "torch_binding.cpp"),
+    os.path.join(BASE_DIR, "torch_binding_meta.cpp"),
     os.path.join(BASE_DIR, "aclnn_torch_adapter/NPUBridge.cpp"),
     os.path.join(BASE_DIR, "aclnn_torch_adapter/NPUStorageImpl.cpp"),
 ]

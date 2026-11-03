@@ -168,11 +168,11 @@ def install_stubs():
         UCMKVPrefetch=fakes.FakeUCMPrefetch,
     )
 
-    # ---------------- torch.ops._C_ascend（ACL 自定义 op）----------------
+    # ---------------- torch.ops._C_gsa（ACL 自定义 op）----------------
     # 无条件覆盖：UT 不依赖真实 ACL op（NPU 环境同理，保证跨环境确定性）
     import torch
 
-    torch.ops._C_ascend = SimpleNamespace(
+    torch.ops._C_gsa = SimpleNamespace(
         gsa_gather_copy=lambda *a, **k: None,
         gsa_scatter_copy=lambda *a, **k: None,
     )
