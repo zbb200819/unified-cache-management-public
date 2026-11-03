@@ -2039,6 +2039,32 @@ def _build_attention_metadata(
                         attn_metadata_i.num_spec_decodes :
                     ].fill_(0)
 
+            # [D1 dummy row] The DSA/DCP builders have no
+            # build_for_cudagraph_capture fast path, so their capture steps
+            # fall through to build() with gsa_slot_len left at the builder
+            # default (0): the in-graph GSA scatter then sees empty indices
+            # against a full update tensor (shape mismatch, CANN error).
+            # Align with the non-DSA-builder capture branch above and use
+            # the full-length gsa_slot_len so the scatter keeps a fixed
+            # shape; the -1 tail sentinels of dsa_slot_mapping are
+            # redirected to the dummy row in sfa_kv_transfer_patch.
+            if (
+                for_cudagraph_capture
+                and hasattr(self.vllm_config.model_config, "hf_text_config")
+                and hasattr(
+                    self.vllm_config.model_config.hf_text_config, "index_topk"
+                )
+                and has_ucm_sparse()
+                and PTOPK_PREFETCH_ENABLE
+                and (
+                    is_pdmix
+                    or not self.vllm_config.kv_transfer_config.is_kv_producer
+                )
+            ):
+                attn_metadata_i.gsa_slot_len = (
+                    common_attn_metadata.num_input_tokens
+                )
+
         if (
             hasattr(self.vllm_config.model_config, "hf_text_config")
             and hasattr(self.vllm_config.model_config.hf_text_config, "index_topk")

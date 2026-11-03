@@ -24,7 +24,7 @@
 | B2 | 块 ID 陈旧 → 跨请求并发踩写 | P1 | 请求抢占/完成时 DMA 在途 | kvcache_pre_scatter.cpp:1305-1313 | **是** | ✅ 已修复(窗口收窄) |
 | B3 | 裸指针 use-after-free 风险 | P1 | Python 张量先于 C++ 释放 | pybinds.cpp:143-148 + gsa.py:1544-1546 | **是** | ✅ 已修复 |
 | C1 | C++ map 跨线程并发读写无锁 | P1 | Python 写 API 与预取线程同时活跃 | kvcache_pre_scatter.cpp:1167-1171 附近 | **是** | ✅ 已修复 |
-| D1 | `-1` 槽位索引可达设备侧 scatter | P1 | aclgraph 捕获/回放 | sfa_kv_transfer_patch.py:387-392 | **P1** | ⏸ 已回退(见 D1 回退记录) |
+| D1 | `-1` 槽位索引可达设备侧 scatter | P1 | aclgraph 捕获/回放 | sfa_kv_transfer_patch.py:387-392 | **P1** | ✅ 已修复(哑行方案,见 D1 修复记录) |
 | E2 | `_load_kv_dram` 未捕获 C++ throw | P1 | PD 分离 D 节点 + store 注入未就绪 | gsa.py:2576 | 否(死代码) | ✅ 已修复 |
 | E3 | `_load_kv_dram` 超时静默 KV 空洞 + 阻塞 hang | P1 | PD 分离 D 节点 + lookup 超时 | gsa.py:2575-2587 | 否(死代码) | ✅ 已修复 |
 | E4 | `_ensure_store_injected` 非异常静默失败 | P1 | connector/store 未就绪 | gsa.py:955-974 | 否(死代码) | ✅ 已修复 |
@@ -332,11 +332,33 @@ torch_npu.npu_scatter_nd_update_(
   1. **第一次运行(error.log,14:32)**:当前配置走 DSA/DCP builder 的捕获路径(`model_runner_v1_patch.py:1997` 的 else 分支,`gsa_slot_len` 保持默认 **0**)——D1 假设的"gsa_slot_len=num_input_tokens"仅是**非 DSA builder** 的路径①,当前配置不触发;`k_li.view(...)[valid]` 掩码长度 0 vs 张量 96 行 → **IndexError**;
   2. **第二次运行(error2.log,15:17,D1b 修完 IndexError 之后)**:布尔掩码索引底层是 **`aclnnNonzeroV2`**(NonZero 算子)——输出形状**数据依赖**且内部有**隐式流同步**,二者均与 aclgraph 捕获硬性冲突("Stream during the capture stage is not supported",错误码 107027)→ **图捕获必炸**。这是方案层死路,不是实现瑕疵:aclgraph 下该 forward 只在捕获时执行一次,任何"按数据过滤"手段都不可行。
 - **回退后的状态**:常规 eager 步恢复原始行为(`gsa_slot_len`=实际填充数,无 -1,一直正常);**aclgraph + GSA 组合暂时不支持**(回退后的原始代码在路径②上为空 indices + 满额 updates 的形状失配调用,CANN 大概率报错;路径① -1 脏写风险回归但当前配置不触发)。**运行时需关闭 aclgraph(enforce eager)**直到后续方案落地。
-- **后续正确方案(设计已定,待专项实施)**:**哑行 + `torch.where` 重定向**——
+- **后续正确方案(已按此实施,见下方修复记录)**:**哑行 + `torch.where` 重定向**——
   1. `sfa_v1_patch.py`:`dsa_k_cache`/`dsa_k_scale` 分配 `num_slots + 1` 行(末行作哑行,读侧按有效槽位索引不会读到);
   2. 两份 `sfa_kv_transfer_patch.py`:`safe_idx = torch.where(slot_idx >= 0, slot_idx, dummy_row)` 后散列——`torch.where` 元素级、固定形状、无同步,**图捕获安全**;-1 垃圾只写哑行;
   3. 两份 `model_runner_v1_patch.py`:给 **DSA/DCP builder 的捕获分支**(else 路径)同样赋 `gsa_slot_len = num_input_tokens`(对齐路径①的全量形状设计,消除空 indices 形状失配);
   4. 回放语义:图内散列形状固定为全量,`dsa_slot_mapping` 回放时填实际槽位 + -1 尾哨兵,哑行吸收无效写。
+
+### ✅ D1 修复记录(哑行方案,2026-11-03)
+
+- **修复内容**(6 个文件,`v0_23_0` 与 `v0.23.0_pmr` 两份目录镜像,diffstat 对称 26/26、47/47、11/11):
+  1. **分配 +1 哑行**(两份 `sfa_v1_patch.py`,`num_slots = MAX_INDEXER_BLOCK_NUM + 1`):`dsa_k_cache`(17001×block_size×1×128×dtype,较原 +4KB 量级)与 `dsa_k_scale`(+32B 量级)各多一行,末行作哑行;
+  2. **散列前 -1 重定向**(两份 `sfa_kv_transfer_patch.py`,各两处 GSA 路径 scatter——k cache 与 k_scale):
+     ```python
+     slot_idx = attn_metadata.dsa_slot_mapping[: attn_metadata.gsa_slot_len].view(-1)
+     safe_idx = torch.where(
+         slot_idx >= 0,
+         slot_idx,
+         torch.full_like(slot_idx, cache.shape[0] * cache.shape[1] - 1),
+     )
+     torch_npu.npu_scatter_nd_update_(cache.view(-1, d), safe_idx.view(-1, 1), flat_src)
+     ```
+  3. **路径②捕获对齐**(两份 `model_runner_v1_patch.py`):DSA/DCP builder 的捕获分支(else 路径,`builder.build()` 之后)同样赋 `gsa_slot_len = num_input_tokens`(条件与路径①完全镜像,外加 `for_cudagraph_capture` 门控)——消除"空 indices + 满额 updates"的形状失配。
+- **图捕获安全论证**:`torch.where`/`torch.full_like` 元素级、输出形状 = 输入形状(固定全量)、无隐式流同步——不触发 D1 掩码方案的 NonZero 死路(动态形状 + 隐式同步,107027);`dummy_row = shape[0]*shape[1] - 1` 即展平视图末行,索引粒度为 `slot*block_size + 块内偏移`(`gsa.py:1216` `_calc_decode_slot_mapping` 可证),有效槽位域上界(`MAX_SLOTS_BLOCK_NUM*block_size` = 192000)远小于哑行(272015),永不重叠。
+- **行为影响**:
+  - 常规 eager 步:槽位无 -1,`where` 全透传,行为与原始一致(每层仅增加一次元素级比较+选择);
+  - 捕获/回放:-1 尾哨兵写哑行(下标 ≥ 有效槽位域,读侧 `device_op_patch` 按 `dsa_block_table` 有效槽位索引,不会读到);**aclgraph + GSA 组合恢复支持**(路径①非 DSA builder 与路径② DSA/DCP builder 均覆盖);
+  - G1 不变量不受影响:`indexer_sparse_num_all`(host 池,gsa.py:578)仍为 `MAX_INDEXER_BLOCK_NUM`=17000,仅设备张量 +1 行;全仓审计无任何消费方假设 `dsa_k_cache.shape[0] == MAX_INDEXER_BLOCK_NUM`(sfa_v1_patch 的 :210/:604/:619 仅为 import 与模块全局注入)。
+- **验证**:本机无 Python(仅 Store 占位),ast.parse 不可行——已用镜像一致性(两目录 no-index diff 基线 3/1/75 行不变)+ diffstat 对称替代静态检查;**aclgraph 捕获/回放冒烟 + 哑行 canary 数据比对需随 NPU 环境验证**。
 
 ---
 

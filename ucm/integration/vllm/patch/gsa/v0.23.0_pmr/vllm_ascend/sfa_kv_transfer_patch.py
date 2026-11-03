@@ -384,11 +384,32 @@ def forward(
             and PTOPK_PREFETCH_ENABLE
             and self.layer_id < self.layer_num
         ):
+            # [D1 dummy row] dsa_slot_mapping can carry -1 tail sentinels
+            # (buffer initialized with fill_(-1); the aclgraph capture path
+            # runs with gsa_slot_len = num_input_tokens, padding included).
+            # Negative indices into npu_scatter_nd_update_ wrap around and
+            # corrupt the cache or write out of bounds, and any
+            # data-dependent filtering (boolean mask -> aclnnNonzeroV2) is
+            # incompatible with graph capture (dynamic output shape +
+            # implicit stream sync, error 107027). Redirect -1 to the dummy
+            # row at the end of the flattened cache view instead:
+            # torch.where is element-wise with a fixed shape and
+            # capture-safe. Valid slot indices never reach the dummy row,
+            # and eager steps without -1 pass through unchanged.
+            slot_idx = attn_metadata.dsa_slot_mapping[
+                : attn_metadata.gsa_slot_len
+            ].view(-1)
+            safe_idx = torch.where(
+                slot_idx >= 0,
+                slot_idx,
+                torch.full_like(
+                    slot_idx,
+                    self.dsa_k_cache.shape[0] * self.dsa_k_cache.shape[1] - 1,
+                ),
+            )
             torch_npu.npu_scatter_nd_update_(
                 self.dsa_k_cache.view(-1, k_li.shape[-1]),
-                attn_metadata.dsa_slot_mapping[: attn_metadata.gsa_slot_len].view(
-                    -1, 1
-                ),
+                safe_idx.view(-1, 1),
                 k_li.view(-1, k_li.shape[-1]),
             )  # b, s, n, d
         elif get_ascend_config().c8_enable_reshape_optim:
@@ -428,11 +449,25 @@ def forward(
                         and PTOPK_PREFETCH_ENABLE
                         and self.layer_id < self.layer_num
                     ):
+                        # [D1 dummy row] Same -1 redirect as the k cache
+                        # scatter above; the k_scale cache carries the same
+                        # extra dummy row.
+                        slot_idx = attn_metadata.dsa_slot_mapping[
+                            : attn_metadata.gsa_slot_len
+                        ].view(-1)
+                        safe_idx = torch.where(
+                            slot_idx >= 0,
+                            slot_idx,
+                            torch.full_like(
+                                slot_idx,
+                                self.dsa_k_scale.shape[0]
+                                * self.dsa_k_scale.shape[1]
+                                - 1,
+                            ),
+                        )
                         torch_npu.npu_scatter_nd_update_(
                             self.dsa_k_scale.view(-1, k_li_scale.shape[-1]),
-                            attn_metadata.dsa_slot_mapping[
-                                : attn_metadata.gsa_slot_len
-                            ].view(-1, 1),
+                            safe_idx.view(-1, 1),
                             k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
                     else:

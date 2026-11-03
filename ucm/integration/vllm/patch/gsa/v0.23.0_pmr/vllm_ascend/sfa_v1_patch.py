@@ -369,7 +369,16 @@ def __init__(
             self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer
         ):
             # gsa param
-            num_slots = MAX_INDEXER_BLOCK_NUM
+            # [D1 dummy row] One extra row beyond the valid slot domain.
+            # dsa_slot_mapping carries -1 tail sentinels (buffer initialized
+            # with fill_(-1); the aclgraph capture path runs with the full
+            # gsa_slot_len = num_input_tokens, padding included). Those -1
+            # indices are redirected to this extra row by torch.where in
+            # sfa_kv_transfer_patch before npu_scatter_nd_update_, so
+            # garbage writes land in the dummy row instead of wrapping to
+            # the last valid row or writing out of bounds. Readers index by
+            # valid slot ids and never read the dummy row.
+            num_slots = MAX_INDEXER_BLOCK_NUM + 1
             if self.enable_sparse_li_c8:
                 indexer_type = self.c8_k_cache_dtype
             else:
