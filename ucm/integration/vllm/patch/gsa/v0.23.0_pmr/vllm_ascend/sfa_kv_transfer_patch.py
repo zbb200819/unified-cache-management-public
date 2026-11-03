@@ -384,16 +384,12 @@ def forward(
             and PTOPK_PREFETCH_ENABLE
             and self.layer_id < self.layer_num
         ):
-            # [D1 修复] dsa_slot_mapping 尾部为 -1(缓冲 fill_(-1),常规步 gsa_slot_len
-            # 为实际填充数;aclgraph 捕获路径 gsa_slot_len=num_input_tokens 含 padding,
-            # 索引可含 -1)。负索引进 npu_scatter_nd_update_ 会按 CANN 语义回绕写脏数据
-            # 或设备侧越界,必须先过滤;只使用张量方法,不向 sfa_v1 命名空间引入新名字。
-            slot_idx = attn_metadata.dsa_slot_mapping[: attn_metadata.gsa_slot_len].view(-1)
-            valid = slot_idx >= 0
             torch_npu.npu_scatter_nd_update_(
                 self.dsa_k_cache.view(-1, k_li.shape[-1]),
-                slot_idx[valid].view(-1, 1),
-                k_li.view(-1, k_li.shape[-1])[valid],
+                attn_metadata.dsa_slot_mapping[: attn_metadata.gsa_slot_len].view(
+                    -1, 1
+                ),
+                k_li.view(-1, k_li.shape[-1]),
             )  # b, s, n, d
         elif get_ascend_config().c8_enable_reshape_optim:
             torch.ops._C_ascend.store_kv_block(
@@ -432,15 +428,12 @@ def forward(
                         and PTOPK_PREFETCH_ENABLE
                         and self.layer_id < self.layer_num
                     ):
-                        # [D1 修复] 同上:过滤 -1 槽位索引(aclgraph 捕获路径可达)。
-                        slot_idx = attn_metadata.dsa_slot_mapping[
-                            : attn_metadata.gsa_slot_len
-                        ].view(-1)
-                        valid = slot_idx >= 0
                         torch_npu.npu_scatter_nd_update_(
                             self.dsa_k_scale.view(-1, k_li_scale.shape[-1]),
-                            slot_idx[valid].view(-1, 1),
-                            k_li_scale.view(-1, k_li_scale.shape[-1])[valid],
+                            attn_metadata.dsa_slot_mapping[
+                                : attn_metadata.gsa_slot_len
+                            ].view(-1, 1),
+                            k_li_scale.view(-1, k_li_scale.shape[-1]),
                         )
                     else:
                         torch_npu.npu_scatter_nd_update_(
