@@ -65,6 +65,13 @@ public:
     // 此前该标志从未被生产代码消费(仅单测),互斥闸是死代码。
     std::atomic<bool> mStopPrefetch{false};
     std::atomic<bool> mIsPrefetchRunning{false};
+    // [I2] 预取任务排队计数:SubmitTask 入队 +1,MultiBSThreadFun 收尾
+    // (含异常路径,经 finishPrefetchTask)-1。此前"预取在跑"仅由
+    // mIsPrefetchRunning 表达,而它只在 SubmitTask 入队时置位、worker 取
+    // 任务不置位——背靠背排队任务在上一任务结束后、本任务执行期间全程
+    // 标志为 false(假空闲),DelBlocksMap 的立即删除分支会在此窗口并发
+    // erase 正在使用的 per-request map。计数 + 执行标志双条件消除该窗口。
+    std::atomic<int> mPrefetchTaskCount{0};
     std::atomic<bool> mIsIndexerLoadRunning{false};
     int mRank = -1;
     uint32_t mSpaTopkLen = 5120;
@@ -144,6 +151,15 @@ public:
     bool IsReqDeleted(const std::string& reqID);
 
     void DelReqIDRun();
+
+    // [I1][I2] 预取任务收尾:双锁(锁序 mMutexUseToken → mUpdateReqMutex)
+    // 执行延迟删除 DelReqIDRun,随后复位 mIsPrefetchRunning 并递减
+    // mPrefetchTaskCount。DelReqIDRun erase 的 per-request map 与
+    // SetTokensMap(持 mMutexUseToken 写)及 SetBlocksMap/SetIndexerMap
+    // (持 mUpdateReqMutex 写)重叠,必须双锁串行化。收尾动作必须经由
+    // 本函数(而非散落的三行代码),保证异常路径下标志/计数也被复位,
+    // 否则 Python 侧 drain 循环将永久挂死。
+    void finishPrefetchTask();
 
     // Task assignment and execution
     void SubmitTask(std::vector<int>& topkLensInput, std::vector<int>& bsIndexInput,

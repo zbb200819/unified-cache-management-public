@@ -1214,7 +1214,6 @@ void GSAPrefetchEngineC::SubmitTask(std::vector<int>& topkLensInput, std::vector
     auto start = std::chrono::high_resolution_clock::now();
     mDecodeStep = stepTime;
     TaskInfo inputInfo(totalTaskNum, -1, topkLists, topkLensInput, bsIndexInput, reqIDList);
-    mIsPrefetchRunning.store(true, std::memory_order_release);
     mIsIndexerOffload = isIndexerOffload;
     {
         // [C1 修复] mRealTimeIdx/mSeqLen 的写入与 mUseBlockTableIdx 的读取均与
@@ -1235,6 +1234,10 @@ void GSAPrefetchEngineC::SubmitTask(std::vector<int>& topkLensInput, std::vector
             }
         }
     }
+    // [I2] 排队计数紧贴入队前递增(执行标志由 MultiBSThreadFun 入口置位):
+    // 计数与执行标志共同表达"预取在跑",消除背靠背排队任务的假空闲窗口;
+    // 必须在入队前(若在入队后,worker 可能已执行完收尾把计数减成负数)。
+    mPrefetchTaskCount.fetch_add(1, std::memory_order_release);
     mTaskManger->SubmitTask(inputInfo, MultiBSThreadFun);
     totalTaskNum += 1;
     auto endLoadPre = std::chrono::high_resolution_clock::now();
@@ -1420,12 +1423,39 @@ void GSAPrefetchEngineC::PreSwapTokens(std::vector<uintptr_t>& useTokenPtrs,
 
 void GSAPrefetchEngineC::DelBlocksMap(std::string reqID)
 {
-    mUpdateReqMutex.lock();
+    // [I1] 立即删除分支必须持双锁(锁序 mMutexUseToken → mUpdateReqMutex):
+    // DelReqIDRun erase 的 17 个 per-request map 与 SetTokensMap(持
+    // mMutexUseToken 写 mHBMMangers/mAllReqIdSlots/mReqUseBlockTable 等)及
+    // SetBlocksMap/SetIndexerMap(持 mUpdateReqMutex 写)的写路径重叠,此前
+    // 仅持 mUpdateReqMutex,与 SetTokensMap 无公共锁,erase 与写并发会
+    // 损坏堆。锁序与 worker 侧 CallPrefetchProcess→IsReqDeleted 的嵌套方向
+    // (token→req)一致,无死锁。
+    // [I2] 空闲判定改为"排队计数 + 执行标志"双条件:原标志存在背靠背排队
+    // 任务的假空闲 false 窗口(置 true 仅发生在入队时刻,worker 取任务
+    // 不置位),会误判空闲并发删除正在使用的 map。
+    std::lock_guard<std::mutex> tokenLock(mMutexUseToken);
+    std::lock_guard<std::mutex> reqLock(mUpdateReqMutex);
     mDelSeqIds.insert(reqID);
-    // Only run the deletion when neither prefetch nor indexer load is running,
-    // so that the shared per-request maps are not erased mid-update.
-    if (!GetPrefetchStatus() && !GetIndexerStatus()) { DelReqIDRun(); }
-    mUpdateReqMutex.unlock();
+    // Only run the deletion when no prefetch task is queued or running and
+    // the indexer load is idle, so that the shared per-request maps are not
+    // erased mid-use.
+    if (mPrefetchTaskCount.load(std::memory_order_acquire) == 0 &&
+        !mIsPrefetchRunning.load(std::memory_order_acquire) && !GetIndexerStatus()) {
+        DelReqIDRun();
+    }
+}
+
+void GSAPrefetchEngineC::finishPrefetchTask()
+{
+    // [I1] 延迟删除双锁(锁序同 DelBlocksMap);[I2] 标志复位 + 计数递减。
+    // 收尾动作集中在本函数,保证异常路径(见 MultiBSThreadFun)也完整收尾。
+    {
+        std::lock_guard<std::mutex> tokenLock(mMutexUseToken);
+        std::lock_guard<std::mutex> reqLock(mUpdateReqMutex);
+        DelReqIDRun();
+    }
+    mIsPrefetchRunning.store(false, std::memory_order_release);
+    mPrefetchTaskCount.fetch_sub(1, std::memory_order_release);
 }
 
 bool GSAPrefetchEngineC::IsReqDeleted(const std::string& reqID)
@@ -1477,7 +1507,12 @@ void GSAPrefetchEngineC::DelReqIDRun()
 
 bool GSAPrefetchEngineC::GetPrefetchStatus()
 {
-    return mIsPrefetchRunning.load(std::memory_order_acquire);
+    // [I2] 语义:任务执行中(mIsPrefetchRunning)或仍有排队任务
+    // (mPrefetchTaskCount > 0)均视为"预取在跑"——Python 侧 drain 循环
+    // (preempt/finish 路径)由此等待队列真正清空,而不是在背靠背任务
+    // 之间的假空闲窗口提前放行。
+    return mIsPrefetchRunning.load(std::memory_order_acquire) ||
+           mPrefetchTaskCount.load(std::memory_order_acquire) > 0;
 }
 
 bool GSAPrefetchEngineC::GetIndexerStatus()

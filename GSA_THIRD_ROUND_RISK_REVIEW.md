@@ -15,8 +15,8 @@
 
 | 编号 | 标题 | 严重度 | 触发条件 | 主要位置 | 状态 |
 |---|---|---|---|---|---|
-| I1 | 双锁域无公共互斥:DelReqIDRun erase 与 Python 写路径并发 | **P0** | 稳态每步存在窗口 | pre:293-295 / scatter:1421-1429 | 待修复 |
-| I2 | mIsPrefetchRunning 生命周期缺陷:背靠背任务的假空闲窗口 | **P0** | 任务积压 + 恰逢 DelBlocksMap | scatter:1217 / pre:296 / task_manger:79-90 | 待修复 |
+| I1 | 双锁域无公共互斥:DelReqIDRun erase 与 Python 写路径并发 | **P0** | 稳态每步存在窗口 | pre:293-295 / scatter:1421-1429 | ✅ 已修复 |
+| I2 | mIsPrefetchRunning 生命周期缺陷:背靠背任务的假空闲窗口 | **P0** | 任务积压 + 恰逢 DelBlocksMap | scatter:1217 / pre:296 / task_manger:79-90 | ✅ 已修复 |
 | I3 | preempt 路径先 free 后 drain,与正常路径顺序相反 | P1 | 抢占时预取任务在飞 + 块被重分配 | gsa.py:1779-1786 | 待修复 |
 | I4 | cal_indexer_topk_blocks 覆写与 indexer 线程共享的 numpy 视图 | P1 | IS_INDEXER_OFFLOAD + 加载跨步 | gsa.py:2133-2135 / 2208-2210 | 待修复 |
 | I5 | "仅日志不拦截"链:脏 token → 越界 slot → 设备索引越界 | P1 | mRealTimeIdx 过期 / topk 脏数据 | pre:900-915 + hbm_manger:101-108 | 待修复 |
@@ -41,6 +41,16 @@
 ---
 
 # 一、P0:结构性并发缺陷
+
+> **✅ I1 + I2 联动修复记录(P0 批次)**
+
+- **修复内容**(锁序统一为 **mMutexUseToken → mUpdateReqMutex**,与 worker 临界区内 `CallPrefetchProcess→IsReqDeleted` 的既有嵌套方向一致,经审计全仓无反向嵌套):
+  - **I1**:`DelBlocksMap`(scatter)的立即删除分支改为持**双锁**(token→req)执行 `DelReqIDRun`;worker 收尾路径同样收编——新增 `GSAPrefetchEngineC::finishPrefetchTask()`:双锁内执行 `DelReqIDRun`,随后复位 `mIsPrefetchRunning`、递减 `mPrefetchTaskCount`。`MultiBSThreadFun` 的收尾三行散落代码改为统一调用 `finishPrefetchTask()`(含异常路径:`CallPrefetchProcess` 抛异常时先 `finishPrefetchTask()` 再 rethrow,保持 TaskManager 的 FAILED 语义,且标志/计数必然复位,Python drain 不挂死);
+  - **I2**:新增 `std::atomic<int> mPrefetchTaskCount`(public 成员):`SubmitTask` 在**入队前** `fetch_add(1)`(紧贴入队,缩小异常泄漏窗口);`MultiBSThreadFun` 入口置 `mIsPrefetchRunning=true`(替代原 SubmitTask 入队时置位),经 `finishPrefetchTask` 递减计数;`GetPrefetchStatus()` 语义改为"执行中 **或** 排队计数>0";`DelBlocksMap` 空闲判定改为"排队计数==0 且 !执行中 且 !indexer 在跑"三条件;
+  - 死锁论证:`mMutexUseToken` 全仓仅两处获取(worker `CallPrefetchProcess`、Python `SetTokensMap`),二者临界区内仅嵌套获取 `mUpdateReqMutex`(worker 经 `IsReqDeleted`),方向一致 token→req;`DelBlocksMap`/`finishPrefetchTask` 按 token→req 双锁,无反向路径 → 无锁环;
+  - 同族缺口(I7/I8/I12 等 worker 读 vs Python 单锁写的部分)**未**随本修复自动消解(worker 写/读路径本身仍持单锁),按批次计划在第三批处理;
+  - **测试**:新增 4 个 UT(排队计数语义 `PrefetchStatusReflectsQueuedTaskCount`、排队中延迟删除 `DelBlocksMapDefersWhileTaskQueued`、收尾函数行为 `FinishPrefetchTaskRunsDeferredDeletionAndResetsCount`、原有原子标志测试保持);既有 `DelBlocksMapQueuesDeletionWhenPrefetchRunning`/`DelBlocksMapRunsImmediatelyWhenIdle`/mst 并发双删测试语义兼容。
+- **验证**:C++ 无法本地编译,新旧 UT 需随构建跑;TSAN 下高频 SubmitTask+DelBlocksMap 打窗口(原为堆损坏)。
 
 ## I1【P0】双锁域无公共互斥:DelReqIDRun 的 map erase 与 Python 写路径并发
 

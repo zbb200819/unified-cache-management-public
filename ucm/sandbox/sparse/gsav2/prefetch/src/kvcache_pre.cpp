@@ -289,11 +289,21 @@ float average2d(const std::vector<std::vector<float>>& matrix)
 void MultiBSThreadFun(const TaskInfo& taskInfo, ThreadInfo& threadInfo)
 {
     GSAPrefetchEngineC* engine = static_cast<GSAPrefetchEngineC*>(threadInfo.args_);
-    int ret = engine->CallPrefetchProcess(taskInfo, threadInfo);
-    engine->mUpdateReqMutex.lock();
-    engine->DelReqIDRun();
-    engine->mUpdateReqMutex.unlock();
-    engine->mIsPrefetchRunning.store(false, std::memory_order_release);
+    // [I2] "执行中"标志由任务函数入口置位(替代原 SubmitTask 入队时置位):
+    // worker 从队列取任务不置位,原实现下背靠背排队任务存在整段执行期
+    // 标志为 false 的假空闲窗口;排队状态由 mPrefetchTaskCount 覆盖。
+    engine->mIsPrefetchRunning.store(true, std::memory_order_release);
+    int ret = 0;
+    try {
+        ret = engine->CallPrefetchProcess(taskInfo, threadInfo);
+    } catch (...) {
+        // [I2] 异常路径同样必须收尾(复位标志/递减计数/延迟删除),再向上
+        // 抛出保持 TaskManager 的 FAILED 语义;否则 GetPrefetchStatus 永真,
+        // Python 侧 drain 循环挂死。
+        engine->finishPrefetchTask();
+        throw;
+    }
+    engine->finishPrefetchTask();
     if (ret == 0) { return; }
 }
 

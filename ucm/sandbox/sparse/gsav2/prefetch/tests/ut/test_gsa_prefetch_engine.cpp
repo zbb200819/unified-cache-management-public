@@ -343,6 +343,55 @@ TEST_F(GSAEngineTest, PrefetchStatusFlagReflectsAtomic)
     EXPECT_FALSE(engine_->GetPrefetchStatus());
 }
 
+TEST_F(GSAEngineTest, PrefetchStatusReflectsQueuedTaskCount)
+{
+    /* [I2] 排队任务也视为"预取在跑":仅 mPrefetchTaskCount>0(无任务执行中)
+     * 时 GetPrefetchStatus 必须为 true——原实现在此状态返回 false,形成
+     * 背靠背排队任务的假空闲窗口。 */
+    engine_ = MakeEngine();
+    EXPECT_FALSE(engine_->GetPrefetchStatus());
+    engine_->mPrefetchTaskCount.store(1);
+    EXPECT_TRUE(engine_->GetPrefetchStatus());
+    engine_->mIsPrefetchRunning.store(true);  // 执行中 + 排队中
+    EXPECT_TRUE(engine_->GetPrefetchStatus());
+    engine_->mPrefetchTaskCount.store(0);
+    EXPECT_TRUE(engine_->GetPrefetchStatus());
+    engine_->mIsPrefetchRunning.store(false);
+    EXPECT_FALSE(engine_->GetPrefetchStatus());
+}
+
+TEST_F(GSAEngineTest, DelBlocksMapDefersWhileTaskQueued)
+{
+    /* [I2] 排队计数 > 0(即使执行标志为 false)时必须延迟删除,
+     * 否则会与刚取走任务、尚未置位执行标志的 worker 并发 erase。 */
+    engine_ = MakeEngine();
+    engine_->mSparseSeqLen["req1"] = 128;
+    engine_->mPrefetchTaskCount.store(1);
+    engine_->DelBlocksMap("req1");
+    EXPECT_EQ(engine_->mDelSeqIds.count("req1"), 1u);
+    EXPECT_EQ(engine_->mSparseSeqLen.count("req1"), 1u);  // not yet deleted
+    /* 队列清空后的下一次删除立即执行。 */
+    engine_->mSparseSeqLen["req2"] = 128;
+    engine_->mPrefetchTaskCount.store(0);
+    engine_->DelBlocksMap("req2");
+    EXPECT_EQ(engine_->mSparseSeqLen.count("req2"), 0u);
+}
+
+TEST_F(GSAEngineTest, FinishPrefetchTaskRunsDeferredDeletionAndResetsCount)
+{
+    /* [I1][I2] 收尾函数:双锁延迟删除 + 标志复位 + 计数递减;
+     * MultiBSThreadFun 的异常路径同样经由它收尾。 */
+    engine_ = MakeEngine();
+    engine_->mSparseSeqLen["req1"] = 128;
+    engine_->DelBlocksMap("req1");
+    EXPECT_EQ(engine_->mSparseSeqLen.count("req1"), 1u);
+    engine_->mPrefetchTaskCount.store(1);
+    engine_->finishPrefetchTask();
+    EXPECT_EQ(engine_->mPrefetchTaskCount.load(), 0);
+    EXPECT_FALSE(engine_->mIsPrefetchRunning.load());
+    EXPECT_EQ(engine_->mSparseSeqLen.count("req1"), 0u);  // deferred delete ran
+}
+
 TEST_F(GSAEngineTest, IndexerStatusFlagReflectsAtomic)
 {
     engine_ = MakeEngine(/*indexerOffload=*/true);
