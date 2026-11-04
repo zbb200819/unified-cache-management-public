@@ -168,7 +168,7 @@ public:
             .DataTypeList({ge::DT_FLOAT})
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
-        aicore_config_95->Input("actual_sparse_lengths")
+        aicore_config_95.Input("actual_sparse_lengths")
             .ParamType(OPTIONAL)
             .DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})

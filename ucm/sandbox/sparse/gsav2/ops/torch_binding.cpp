@@ -190,7 +190,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_kv_quant_sparse_flash_attenti
                  layoutQueryStr, layoutKVStr, sparseMode_,
                  preTokens_, nextTokens_, attentionMode_, quantScaleRepoMode_,
                  tileSize_, ropeDim, returnSoftmaxLse_,
-                 attentionOut, softmaxMax, softmaxSum,);
+                 attentionOut, softmaxMax, softmaxSum);
     return std::make_tuple(attentionOut, softmaxMax, softmaxSum);
 }
 

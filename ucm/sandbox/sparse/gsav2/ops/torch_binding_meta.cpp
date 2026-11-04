@@ -4,7 +4,7 @@
 
 #include <torch/extension.h>
 #include <torch/library.h>
-#include "utils"
+#include "utils.h"
 
 namespace gsa {
 
