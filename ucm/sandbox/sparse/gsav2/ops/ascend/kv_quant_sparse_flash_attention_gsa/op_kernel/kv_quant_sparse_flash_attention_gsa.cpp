@@ -34,7 +34,7 @@ using namespace AscendC;
         templateClass<CubeBlockType, VecBlockType> op;                                                    \
         op.Init(query, key, value, sparseIndices, keyScale, valueScale, blocktable,                       \
             actualSeqLengthsQuery, actualSeqLengthsKV, sinks, attentionOut, softmaxMax, softmaxSum,       \
-	        actualSparseLengths, user, nullptr, &tPipe);                                                      \
+	        actualSparseLengths, user, nullptr, &tPipe);                                                  \
         op.Process();                                                                                     \
     } while (0)
 #else
@@ -49,7 +49,7 @@ using namespace AscendC;
         const tilingdataClass *__restrict tilingData = &tilingDataIn;                                     \
         op.Init(query, key, value, sparseIndices, keyScale, valueScale, blocktable,                       \
             actualSeqLengthsQuery, actualSeqLengthsKV, sinks, attentionOut, softmaxMax, softmaxSum,       \
-	        actualSparseLengths, user, tilingData, &tPipe);                                                   \
+	        actualSparseLengths, user, tilingData, &tPipe);                                               \
         op.Process();                                                                                     \
     } while (0)
 #endif
