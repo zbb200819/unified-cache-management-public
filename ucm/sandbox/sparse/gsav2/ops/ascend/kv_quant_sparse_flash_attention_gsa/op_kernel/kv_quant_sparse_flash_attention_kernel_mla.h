@@ -339,16 +339,16 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::GetSparseActualSeq
         // GSA-P1: 使用 effectiveSparseCount（host侧扫描的有效topk数）替代 sparseBlockCount
         // 这是 5120-padding-1 场景性能从 429us 回到 ~95us 的关键改动
         // 
-        uint32_t effCout = constInfo.effectiveSparseCount;
+        uint32_t effCount = constInfo.effectiveSparseCount;
         if (hasActualSparseLengths) {
             int32_t perBatch = actualSparseLengthsGm.GetValue(bIdx);
-            if (perBatch > 0 && static_cast<uint32_t>(perBatch) < effCout) {
-                effCout = static_cast<uint32_t>(perBatch);
+            if (perBatch > 0 && static_cast<uint32_t>(perBatch) < effCount) {
+                effCount = static_cast<uint32_t>(perBatch);
             }
         }
-        tempLoopInfo.curActualSeqLen = (effCout * constInfo.sparseBlockSize > threshold) ?
+        tempLoopInfo.curActualSeqLen = (effCount * constInfo.sparseBlockSize > threshold) ?
                                            threshold :
-                                           effCout * constInfo.sparseBlockSize;
+                                           effCount * constInfo.sparseBlockSize;
     } else {
         uint64_t topKBaseOffset = 0;
         if constexpr (LAYOUT_T == QSFA_LAYOUT::BSND) { // B,S1,N2 K
