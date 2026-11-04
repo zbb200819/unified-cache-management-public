@@ -15,8 +15,8 @@ from vllm.forward_context import ForwardContext
 from ucm.logger import init_logger
 from ucm.sparse.base import UcmSparseBase, UcmSparseRole
 from ucm.sparse.factory import UcmSparseFactory
-from ucm.utils import Config
 from ucm.sparse.utils import IS_OPEN_GSA
+from ucm.utils import Config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -175,7 +175,7 @@ def maybe_execute_sparse_attention_begin(
         decode_ql_nope,
         decode_q_pe,
         has_indexer,
-        use_li_c8
+        use_li_c8,
     )
 
 
@@ -208,5 +208,5 @@ def maybe_execute_sparse_attention_finished(
         forward_context,
         phase,
         has_indexer,
-        use_li_c8
+        use_li_c8,
     )
