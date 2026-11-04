@@ -482,10 +482,10 @@ void GSAPrefetchEngineC::AttachPrefetchResultShm()
     // Other ranks: Wait for rank 0 to create, then attach with read-only access
     int retryCount = 0;
     int shmFd = -1;
-    while (shmFd == -1 && retryCount < 100) {
+    while (shmFd == -1 && retryCount < 3000) {
         shmFd = shm_open(mPrefetchResultShmName.c_str(), O_RDONLY, 0666);
         if (shmFd == -1) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));  // Wait 1ms before retry
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));  // Wait 1ms before retry
             retryCount++;
         }
     }
