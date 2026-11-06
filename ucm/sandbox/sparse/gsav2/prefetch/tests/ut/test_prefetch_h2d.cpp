@@ -260,12 +260,12 @@ TEST_F(PrefetchH2DTest, ProcessPrefetchRequestProcessesTopkAndWritesShm)
     // Values in [0, dramTensorCount-1] = [0, 1] (DRAM path, all hits).
     auto topkList = torch::zeros({1, 1, engine->mSpaTopkLen}, torch::dtype(torch::kInt32));
     auto acc = topkList.accessor<int32_t, 3>();
-    for (int j = 0; j < engine->mSpaTopkLen; ++j) {
+    for (uint32_t j = 0; j < engine->mSpaTopkLen; ++j) {
         acc[0][0][j] = j % 2;  // values 0, 1 (both in DRAM range)
     }
     TaskInfo taskInfo{};
     taskInfo.reqIdList = {reqID};
-    taskInfo.topkLenList = {engine->mSpaTopkLen};  // == mSpaTopkLen -> size check passes
+    taskInfo.topkLenList = {static_cast<int>(engine->mSpaTopkLen)};  // == mSpaTopkLen -> size check passes
     taskInfo.topkList = topkList;
     PrefetchShmLayout layout{};
     layout.versionSize = 4;

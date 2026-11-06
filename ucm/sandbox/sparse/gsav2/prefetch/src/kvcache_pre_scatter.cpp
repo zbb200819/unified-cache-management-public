@@ -405,13 +405,20 @@ void GSAPrefetchEngineC::MergeAndCopyPrefetchLayer(const TaskInfo& taskInfo, Thr
     if (BeginKVPackSlot(streamIdx, epoch) != 0) { KVPackAbort(mKVPackControl); }
     std::vector<uint64_t> hbmSlotIndex;
     auto cpuStart = std::chrono::high_resolution_clock::now();
+    mLogger.log(LogLevel::DEBUG, "IS_UCM_BUFFER_OPEN is: %d\n", IS_UCM_BUFFER_OPEN);
+    /* Whole-batch merge: one LoadOnToken task per leg for all valid requests
+     * of this layer (backend IO of all requests overlaps; the load runs on a
+     * worker thread in parallel with the engine-side non-UCM token copies).
+     * Shared staging capacity is still guarded per request (cumulative
+     * mLoadNum vs mKVBufferLen / mLoadIndexBufferLen in ValidateUCMMergeRequest). */
+    std::vector<uint32_t> requestIndices;
+    requestIndices.reserve(oneRunBsLen);
     for (size_t i = 0; i < oneRunBsLen; i++) {
-        std::string oneReqID = taskInfo.reqIdList[i];
-        int oneTopkLen = taskInfo.topkLenList[i];
-        if (oneTopkLen <= 0) { continue; }
-        mLogger.log(LogLevel::DEBUG, "IS_UCM_BUFFER_OPEN is: %d\n", IS_UCM_BUFFER_OPEN);
-        UCMTensorMerge(layerID, streamIdx, hbmSlotIndex, oneReqID, static_cast<uint32_t>(i));
+        if (taskInfo.topkLenList[i] > 0) {
+            requestIndices.push_back(static_cast<uint32_t>(i));
+        }
     }
+    UCMTensorMergeBatch(taskInfo, requestIndices, layerID, streamIdx, hbmSlotIndex);
     if (FinishKVPack(streamIdx, epoch) != 0) { KVPackAbort(mKVPackControl); }
     auto cpuEnd = std::chrono::high_resolution_clock::now();
     timing.cpuMove +=
@@ -797,9 +804,14 @@ bool GSAPrefetchEngineC::ProcessIndexerInitLoadLayer(std::vector<std::vector<int
                         reqID.c_str(), layerID, blockIdx, hashVec.size());
             continue;
         }
-        task.emplace_back(UC::Detail::Shard{
-            hashVec[blockIdx], shardIndex, std::vector<void*>{nullptr, nullptr, indexerAddr}
-        });
+        /* One address per store tensor slot: the store's H2D path walks
+         * tensorSizes_ and reads addrs[i] for every slot, so pad the vector
+         * to the full slot count with the indexer address at
+         * kIndexerTensorIndex (ghost slots stay nullptr). */
+        std::vector<void*> tensorAddrs(kStoreTensorCount, nullptr);
+        tensorAddrs[kIndexerTensorIndex] = indexerAddr;
+        task.emplace_back(UC::Detail::Shard{hashVec[blockIdx], shardIndex,
+                                            std::move(tensorAddrs)});
     }
     return SubmitIndexerInitLoadTask(task, reqID, layerID);
 }
@@ -1002,9 +1014,12 @@ bool GSAPrefetchEngineC::BuildIndexerLoadTask(const std::string& reqID, int laye
                         reqID.c_str(), layerID, missBlockIdx, hashVec.size());
             continue;
         }
-        task.emplace_back(UC::Detail::Shard{
-            hashVec[missBlockIdx], shardIndex, std::vector<void*>{nullptr, nullptr, indexerAddr}
-        });
+        /* Same slot-padded addrs contract as the init load: the store's H2D
+         * path indexes addrs[i] for every tensorSizes_ slot. */
+        std::vector<void*> tensorAddrs(kStoreTensorCount, nullptr);
+        tensorAddrs[kIndexerTensorIndex] = indexerAddr;
+        task.emplace_back(UC::Detail::Shard{hashVec[missBlockIdx], shardIndex,
+                                            std::move(tensorAddrs)});
     }
     return true;
 }

@@ -43,6 +43,10 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     backend_ = config.storeBackend;
     deviceId_ = config.deviceId;
     tensorSizes_ = config.tensorSizes;
+    tensorBaseOffsets_.assign(tensorSizes_.size(), 0);
+    for (size_t t = 1; t < tensorSizes_.size(); ++t) {
+        tensorBaseOffsets_[t] = tensorBaseOffsets_[t - 1] + tensorSizes_[t - 1];
+    }
     shardSize_ = config.shardSize;
     nShardPerBlock_ = config.blockSize / config.shardSize;
     streamNumber_ = config.EffectiveStreamNumber();
@@ -282,15 +286,15 @@ void LoadQueue::TransferDdrLoadOnToken(ShardTask&& task)
             s = Status::InvalidParam();
             UC_ERROR("DDR load-on-token shard({}) requires one host address.", task.shard.index);
         } else {
-            // TODO: for each tensor t, use tensorSizes_[t] layout in the cache slot (src)
-            // and task.tokenFilter.ranges[t] to select TokenRanges, then concatenate the
-            // covered bytes into the caller DDR buffer (dst).
+            /* Cache-slot layout is [full K][full V][indexer][scale]: a range's
+             * offset is relative to its tensor, so add the tensor's base. */
             size_t tokenNum = task.tokenFilter.ranges.size();
             for (size_t t = 0; t < tokenNum; ++t) {
+                const auto* tensorSrc = static_cast<const std::byte*>(src) + TensorBaseOffset(t);
                 const auto& ranges = task.tokenFilter.ranges[t];
                 for (const auto& range : ranges) {
                     std::memcpy(static_cast<std::byte*>(dst) + range.dstOffset,
-                                static_cast<std::byte*>(src) + range.offset, range.length);
+                                tensorSrc + range.offset, range.length);
                 }
             }
         }

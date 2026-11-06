@@ -12,6 +12,7 @@
 #include "status/status.h"
 #include "type/dictionary.h"
 #include "type/types.h"
+#include "kvcache_pre_detail.h"
 #include "ucmstore_v1.h"
 
 namespace ucmprefetch_test {
@@ -37,6 +38,9 @@ public:
     struct CallRecord {
         std::string name;
         UC::Detail::TaskDesc task;
+        /* LoadOnToken only: per-shard token filters, recorded so tests can
+         * verify the splice address contract (offset/dstOffset). */
+        std::vector<UC::Detail::TokenFilter> filters;
         UC::Detail::TaskHandle handle{0};
         size_t blockCount{0};
     };
@@ -69,6 +73,13 @@ public:
         bytesPerBlock_ = bytesPerBlock;
         kvLayerBytes_ = kvLayerBytes;
     }
+
+    /* Expected tensor-slot count of every LoadOnToken TokenFilter, mirroring
+     * CacheStore's DispatchOneTask validation (filter.ranges.size() must
+     * equal the store's tensorSizes_.size()). Defaults to the GSA
+     * deployment's li_c8 slot layout so a sandbox/store layout drift fails
+     * the tests instead of the production runtime. */
+    std::size_t loadOnTokenTensorCount{ucmprefetch::kStoreTensorCount};
 
     std::vector<CallRecord> calls;
     std::mutex mu_;
@@ -132,6 +143,7 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         CallRecord r{"LoadOnToken"};
         r.task = task;
+        r.filters = filter;
         r.handle = NextHandle();
         r.blockCount = task.size();
         calls.push_back(std::move(r));
@@ -145,6 +157,11 @@ public:
         for (const auto& shard : task) {
             if (shard.addrs.size() != 1 || shard.addrs.front() == nullptr) {
                 return UC::Status::Error("load-on-token-requires-one-host-address");
+            }
+        }
+        for (const auto& tokenFilter : filter) {
+            if (tokenFilter.ranges.size() != loadOnTokenTensorCount) {
+                return UC::Status::Error("load-on-token-tensor-filter-size-mismatch");
             }
         }
         if (loadOnTokenFails) { return UC::Status::Error("load-on-token-failed-injected"); }

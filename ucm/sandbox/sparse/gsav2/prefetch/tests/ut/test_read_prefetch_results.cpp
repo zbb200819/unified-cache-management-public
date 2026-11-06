@@ -130,7 +130,7 @@ TEST_F(ReadPrefetchResultsTest, WriteThenReadRoundTripsMissTokensAndSlots)
     // Read back.
     TaskInfo taskInfo{};
     taskInfo.reqIdList = {reqID};
-    taskInfo.topkLenList = {engine->mSpaTopkLen};  // > 0 -> process
+    taskInfo.topkLenList = {static_cast<int>(engine->mSpaTopkLen)};  // > 0 -> process
     engine->ReadPrefetchResults(taskInfo, layout);
 
     EXPECT_EQ(engine->mMissGlobalToken[reqID][0], (std::vector<int>{10, 20}));
@@ -166,7 +166,7 @@ TEST_F(ReadPrefetchResultsTest, ReadPrefetchResultsHandlesZeroMissTokens)
     engine->mLoadSlot[reqID][0].clear();
     TaskInfo taskInfo{};
     taskInfo.reqIdList = {reqID};
-    taskInfo.topkLenList = {engine->mSpaTopkLen};
+    taskInfo.topkLenList = {static_cast<int>(engine->mSpaTopkLen)};
     engine->ReadPrefetchResults(taskInfo, layout);
     EXPECT_TRUE(engine->mMissGlobalToken[reqID][0].empty());
     EXPECT_TRUE(engine->mLoadSlot[reqID][0].empty());
@@ -202,7 +202,7 @@ TEST_F(ReadPrefetchResultsTest, PreparePrefetchResultsNonRank0ReadsBackShm)
     __atomic_store_n(versionPtr, expectedVersion, __ATOMIC_RELEASE);
     TaskInfo taskInfo{};
     taskInfo.reqIdList = {reqID};
-    taskInfo.topkLenList = {engine->mSpaTopkLen};
+    taskInfo.topkLenList = {static_cast<int>(engine->mSpaTopkLen)};
     // PreparePrefetchResults (rank != 0) -> wait loop (passes immediately) ->
     // ReadPrefetchResults.
     engine->PreparePrefetchResults(taskInfo);
@@ -221,7 +221,6 @@ TEST_F(ReadPrefetchResultsTest, PreparePrefetchResultsNonRank0SkipsZeroTopkLen)
     TaskInfo taskInfo{};
     taskInfo.reqIdList = {"req1"};
     taskInfo.topkLenList = {0};  // <= 0 -> ReadPrefetchResults skips
-    auto layout = MakeLayout();
     engine->PreparePrefetchResults(taskInfo);
     // No crash; skip branch exercised.
     SUCCEED();

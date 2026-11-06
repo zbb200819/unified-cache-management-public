@@ -4,6 +4,7 @@
 
 #include <torch/extension.h>
 #include <torch/library.h>
+#include "utils.h"
 
 namespace gsa {
 
@@ -15,7 +16,7 @@ void meta_indexer_gather_qw(const at::Tensor& q_src, const at::Tensor& w_src, at
 
 at::Tensor meta_gsa_topk_expand_tmp(at::Tensor& topk_indices, at::Tensor& swap_topk,
                                     at::Tensor& swap_index, at::Tensor& tmp_tensor,
-                                    c10::List<int64_t> pad, int64_t padValue, int64_t expand_len)
+                                    std::vector<int64_t> pad, int64_t padValue, int64_t expand_len)
 {
     // 返回 view，shape = [topk_rows, 1, expand_len]
     return tmp_tensor.view({tmp_tensor.size(0), 1, expand_len})
@@ -33,6 +34,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> meta_kv_quant_sparse_flash_attent
     const c10::optional<at::Tensor>& actualSeqLengthsQuery,
     const c10::optional<at::Tensor>& actualSeqLengthsKV,
     const c10::optional<at::Tensor>& sinks,
+    const c10::optional<at::Tensor>& actualSparseLengths,
     c10::optional<int64_t> sparseBlockSize,
     c10::string_view layoutQuery,
     c10::string_view layoutKV,

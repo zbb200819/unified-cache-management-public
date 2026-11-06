@@ -126,7 +126,9 @@ struct RunInfo {
     uint32_t actMBaseSize;
     int32_t nextTokensPerBatch = 0;
     bool isLastS2Loop;
-    uint8_t resv[3];
+    // splitKV(C): 当前(task,part)子任务在全局sub序列中的编号，用于FD workspace寻址
+    // sub编号 = taskIdx<tailStart ? taskIdx : tailStart+(taskIdx-tailStart)*P+part
+    uint32_t splitSubIdx = 0;
     int64_t threshold;
 };
 
@@ -190,6 +192,17 @@ struct ConstInfo {
     uint32_t s2Start = 0U; // TND场景下，S2的起始位置
     uint32_t s2End = 0U;   // 单核TND场景下S2循环index上限
 
+    // splitKV(P0/C): 本核在全局sub序列上的区间 [splitSubStart, splitSubEnd)
+    uint32_t splitSubStart = 0U;
+    uint32_t splitSubEnd = 0U;
+    // splitKV(P0/C): 本核首个被枚举任务的全局编号
+    uint32_t splitTaskStart = 0U;
+    // splitKV(C): 尾波切分参数——kernel按真实任务总数推导tailStart=taskNumKernel-tailTaskNum
+    uint32_t splitTailTaskNum = 0U;
+    uint32_t splitTailStart = 0U;   // 真实尾波起点(=taskNumKernel-tailTaskNum)
+    uint32_t splitTaskNumKernel = 0U; // kernel枚举出的真实任务总数
+    uint32_t splitS2LoopsEst = 0U;  // host估计的每任务s2迭代数L(加权分核用)
+
     uint32_t bN2Start = 0U;
     uint32_t bN2End = 0U;
     uint32_t gS1Start = 0U;
@@ -223,6 +236,15 @@ struct MSplitInfo {
     uint32_t nBufferDealM = 0U;
     uint32_t vecStartM = 0U;
     uint32_t vecDealM = 0U;
+};
+
+// splitKV(P0/C): combine阶段的任务描述符，记录本核持有part 0的尾波切分任务
+// C阶段仅尾波任务(共x个)参与combine，单核owner任务数<=ceil(x/aicNum)+1，数组长度留有余量
+struct SplitKVTaskInfo {
+    uint64_t attenOutOffset = 0ULL; // 任务输出行0在attentionOut上的偏移(元素,TND/BSND各自公式)
+    uint32_t subBase = 0U;          // 任务part 0在全局sub序列中的编号(FD寻址基)
+    uint32_t partNum = 0U;          // 任务切分数P(仅尾波任务>1)
+    uint32_t s2Loops = 0U;          // 任务完整的s2迭代次数L(分part前)
 };
 
 #endif // KV_QUANT_SPARSE_FLASH_ATTENTION_COMMON_H

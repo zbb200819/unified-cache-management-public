@@ -125,14 +125,15 @@ void DestroyStream(void* stream, void* context, int32_t deviceID, int32_t mStrea
         auto ret = aclrtDestroyStream((static_cast<aclrtStream*>(stream))[i]);
         if (ret != ACL_SUCCESS) { std::cout << "aclrtDestroyStream failed: " << ret << std::endl; }
     }
-    free(stream);
-    aclrtDestroyContext(*(static_cast<aclrtContext*>(context)));
-    free(context);
-    aclrtResetDevice(deviceID);
+    /* Log before free: the pointers are dangling after free(). */
     std::cout << "====================================================" << std::endl;
     std::cout << "Destroy ascend streams and context done! stream: " << stream
               << " context: " << context << std::endl;
     std::cout << "====================================================" << std::endl;
+    free(stream);
+    aclrtDestroyContext(*(static_cast<aclrtContext*>(context)));
+    free(context);
+    aclrtResetDevice(deviceID);
 }
 
 aclDataType GetAclDataType(at::ScalarType dtype)

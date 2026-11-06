@@ -32,6 +32,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <future>
 #include <kvcache_log.h>
 #include <map>
 #include <mutex>
@@ -272,6 +273,9 @@ float average2d(const std::vector<std::vector<float>>& matrix)
 
     size_t count = 0;
     for (const auto& row : matrix) { count += row.size(); }
+    /* Non-empty matrix of empty rows: count==0 must return 0.0f instead of
+     * dividing by zero (NaN). */
+    if (count == 0) { return 0.0f; }
 
     return static_cast<float>(sum / count);
 }
@@ -479,10 +483,10 @@ void GSAPrefetchEngineC::AttachPrefetchResultShm()
     // Other ranks: Wait for rank 0 to create, then attach with read-only access
     int retryCount = 0;
     int shmFd = -1;
-    while (shmFd == -1 && retryCount < 100) {
+    while (shmFd == -1 && retryCount < 3000) {
         shmFd = shm_open(mPrefetchResultShmName.c_str(), O_RDONLY, 0666);
         if (shmFd == -1) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));  // Wait 1ms before retry
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));  // Wait 1ms before retry
             retryCount++;
         }
     }
@@ -1165,6 +1169,12 @@ bool GSAPrefetchEngineC::SubmitUCMTokenLoadLeg(const UC::Detail::TaskDesc& task,
                                                int layerID, const std::string& reqID)
 {
     if (task.empty()) { return true; }
+    if (!mStoreV1_) {
+        mLogger.log(LogLevel::ERROR,
+                    "|%s| LoadOnToken(%s) mStoreV1_ is nullptr, reqID=%s layerID=%d\n", stage,
+                    tensorName, reqID.c_str(), layerID);
+        return false;
+    }
     if (filters.size() != task.size()) {
         mLogger.log(LogLevel::ERROR,
                     "|%s| LoadOnToken(%s) filter size mismatch, reqID=%s layerID=%d "
@@ -1304,9 +1314,9 @@ bool GSAPrefetchEngineC::MemcpyUCMMergeTokens(std::vector<UCMMergeBlockContext>&
                                                std::vector<uint64_t>& hbmSlotIndex,
                                                const std::string& reqID, size_t previousLoadNum)
 {
-    constexpr int kMaxTokenThreadNum = 4;
-    constexpr size_t kTwoThreadTokenThreshold = 256;
-    constexpr size_t kFourThreadTokenThreshold = 512;
+    // constexpr int kMaxTokenThreadNum = 4;
+    // constexpr size_t kTwoThreadTokenThreshold = 256;
+    // constexpr size_t kFourThreadTokenThreshold = 512;
     int curTopkIndex = mTopkLayerMap[layerID];
     const size_t tokenCount = mMissGlobalToken[reqID][curTopkIndex].size();
     const size_t finalLoadNum = previousLoadNum + tokenCount;
@@ -1316,11 +1326,11 @@ bool GSAPrefetchEngineC::MemcpyUCMMergeTokens(std::vector<UCMMergeBlockContext>&
     hbmSlotIndex.resize(finalLoadNum);
     if (!PrepareUCMMergeSources(blockContexts, layerID, reqID)) { return false; }
     int tokenThreadNum = 1;
-    if (tokenCount >= kFourThreadTokenThreshold) {
-        tokenThreadNum = kMaxTokenThreadNum;
-    } else if (tokenCount >= kTwoThreadTokenThreshold) {
-        tokenThreadNum = 2;
-    }
+    // if (tokenCount >= kFourThreadTokenThreshold) {
+    //     tokenThreadNum = kMaxTokenThreadNum;
+    // } else if (tokenCount >= kTwoThreadTokenThreshold) {
+    //     tokenThreadNum = 2;
+    // }
     if (tokenThreadNum == 1) {
         CopyUCMMergeTokensSerial(blockContexts, curTopkIndex, streamIdx, hbmSlotIndex, reqID,
                                  previousLoadNum);
@@ -1478,7 +1488,8 @@ void GSAPrefetchEngineC::BuildTokenCopyTasks(const std::vector<UCMMergeBlockCont
 
 size_t GSAPrefetchEngineC::FillFailedUCMMerge(
     const std::vector<UCMMergeBlockContext>& blockContexts, int layerID, int streamIdx,
-    std::vector<uint64_t>& hbmSlotIndex, const std::string& reqID, size_t previousLoadNum)
+    std::vector<uint64_t>& hbmSlotIndex, const std::string& reqID, size_t previousLoadNum,
+    bool zeroUcmOnly)
 {
     const int topkIndex = mTopkLayerMap[layerID];
     const auto& missSlots = mLoadSlot.at(reqID)[topkIndex];
@@ -1500,7 +1511,12 @@ size_t GSAPrefetchEngineC::FillFailedUCMMerge(
     for (const auto& context : blockContexts) {
         const auto& tokenIndices = *context.tokenIndices;
         const size_t dstBase = previousLoadNum + context.tokenBase;
-        if (context.owned && !tokenIndices.empty()) {
+        /* zeroUcmOnly: the store-side load failed AFTER the local non-UCM
+         * copies already landed, so keep them and only zero the UCM windows
+         * (the store never splices a failed task). */
+        const bool zeroThis = context.owned && !tokenIndices.empty() &&
+                              (!zeroUcmOnly || !context.isnoUCMblock);
+        if (zeroThis) {
             std::memset(kDst + dstBase * kTokenBytes, 0, tokenIndices.size() * kTokenBytes);
             if (!mISSPAC8) {
                 std::memset(vDst + dstBase * vTokenBytes, 0, tokenIndices.size() * vTokenBytes);
@@ -1534,46 +1550,157 @@ void GSAPrefetchEngineC::UCMTensorMerge(int layerID, int streamIdx,
                                         std::vector<uint64_t>& hbmSlotIndex,
                                         const std::string& reqID, uint32_t requestIndex)
 {
-    if (!ValidateUCMMergeRequest(layerID, reqID)) { return; }
-
-    // context.tokenIndices 指向此 map 中的 vector。
-    // map 必须存活到正常拷贝和失败兜底全部结束。
-    std::map<int, std::vector<size_t>> blockIdxToTokenIdx;
-    std::vector<UCMMergeBlockContext> blockContexts;
-
-    BuildUCMMergeBlockContexts(layerID, reqID, requestIndex, blockContexts, blockIdxToTokenIdx);
-
-    const auto& missGlobalIds = mMissGlobalToken[reqID][mTopkLayerMap[layerID]];
-    const size_t previousLoadNum = mLoadNum[layerID];
-    const size_t finalLoadNum = previousLoadNum + missGlobalIds.size();
-
-    UCMTokenLoadPlan plan;
-    const char* failedStage = nullptr;
-
-    if (!BuildUCMMergeLoadPlan(plan, blockContexts, layerID, streamIdx, reqID, previousLoadNum)) {
-        failedStage = "plan";
-    } else if (!SubmitUCMTokenLoad(plan, "UCMTensorMerge", layerID, reqID)) {
-        failedStage = "load";
-    } else if (!MemcpyUCMMergeTokens(blockContexts, layerID, streamIdx, hbmSlotIndex,
-                                     reqID, previousLoadNum)) {
-        failedStage = "prepare/copy";
-    }
-
-    if (failedStage != nullptr) {
-        const size_t zeroTokens = FillFailedUCMMerge(blockContexts, layerID, streamIdx,
-                                                     hbmSlotIndex, reqID, previousLoadNum);
-
-        mLogger.log(LogLevel::ERROR,
-                    "|KVPack| zero fallback: rank=%d layer=%d reqID=%s "
-                    "requestIndex=%u stage=%s zeroOwnedTokens=%zu totalTokens=%zu\n",
-                    mRank, layerID, reqID.c_str(), requestIndex, failedStage, zeroTokens,
-                    missGlobalIds.size());
-    }
-
-    mLoadNum[layerID] = static_cast<uint32_t>(finalLoadNum);
+    /* Single-request compatibility entry (tests / legacy callers): delegate to
+     * the whole-batch merge with exactly one request. */
+    TaskInfo one;
+    one.reqIdList = {reqID};
+    one.topkLenList = {1};
+    one.layerID = layerID;
+    UCMTensorMergeBatch(one, {requestIndex}, layerID, streamIdx, hbmSlotIndex);
 }
 
-bool GSAPrefetchEngineC::ValidateUCMMergeRequest(int layerID, const std::string& reqID)
+bool GSAPrefetchEngineC::ValidateMergeStagingWindow(int streamIdx)
+{
+    if (streamIdx < 0 || static_cast<size_t>(streamIdx) >= mSharedKBufferHostPtr.size() ||
+        (!mISSPAC8 && static_cast<size_t>(streamIdx) >= mSharedVBufferHostPtr.size())) {
+        mLogger.log(LogLevel::ERROR,
+                    "|UCMTensorMerge| streamIdx out of range, streamIdx=%d\n", streamIdx);
+        return false;
+    }
+    auto* kDstBase = reinterpret_cast<const std::byte*>(mSharedKBufferHostPtr[streamIdx]);
+    const std::byte* vDstBase =
+        mISSPAC8 ? nullptr
+                 : reinterpret_cast<const std::byte*>(mSharedVBufferHostPtr[streamIdx]);
+    if (kDstBase == nullptr || (!mISSPAC8 && vDstBase == nullptr)) {
+        mLogger.log(LogLevel::ERROR, "|UCMTensorMerge| shared buffer is nullptr\n");
+        return false;
+    }
+    return true;
+}
+
+void GSAPrefetchEngineC::UCMTensorMergeBatch(const TaskInfo& taskInfo,
+                                             const std::vector<uint32_t>& requestIndices,
+                                             int layerID, int streamIdx,
+                                             std::vector<uint64_t>& hbmSlotIndex)
+{
+    /* Per-request state kept alive for the whole batch: contexts hold pointers
+     * into tokenMap. */
+    struct MergeRequest {
+        std::string reqID;
+        std::map<int, std::vector<size_t>> tokenMap;
+        std::vector<UCMMergeBlockContext> contexts;
+        size_t previousLoadNum;
+    };
+
+    const bool stagingOk = ValidateMergeStagingWindow(streamIdx);
+    UCMTokenLoadPlan plan;
+    std::vector<MergeRequest> requests;
+    size_t runningLoadNum = static_cast<size_t>(mLoadNum[layerID]);
+    bool planBuildOk = true;
+
+    /* Phase 1: build the whole-batch plan (one shard per owned UCM block,
+     * concatenated across requests; per-shard dst = the block's landing window
+     * in the shared staging buffer). Ownership stays per-request:
+     * (blockOrdinalInRequest + requestIndex) % mTpSize == mRank. */
+    for (uint32_t requestIndex : requestIndices) {
+        if (requestIndex >= taskInfo.reqIdList.size() ||
+            requestIndex >= taskInfo.topkLenList.size()) {
+            continue;
+        }
+        const std::string& reqID = taskInfo.reqIdList[requestIndex];
+        if (!ValidateUCMMergeRequest(layerID, reqID, runningLoadNum)) { continue; }
+        MergeRequest request;
+        request.reqID = reqID;
+        request.previousLoadNum = runningLoadNum;
+        BuildUCMMergeBlockContexts(layerID, reqID, requestIndex, request.contexts,
+                                   request.tokenMap);
+        if (!BuildUCMMergeLoadPlan(plan, request.contexts, layerID, streamIdx, reqID,
+                                   runningLoadNum)) {
+            /* Plan-build failures are staging-window conditions shared by every
+             * request: keep accumulating so each request still gets its zero
+             * fallback and advances mLoadNum (same as the per-request flow). */
+            mLogger.log(LogLevel::ERROR,
+                        "|UCMTensorMerge| plan build failed, layer=%d reqID=%s\n", layerID,
+                        reqID.c_str());
+            planBuildOk = false;
+            runningLoadNum += mMissGlobalToken[reqID][mTopkLayerMap[layerID]].size();
+            requests.push_back(std::move(request));
+            continue;
+        }
+        runningLoadNum += mMissGlobalToken[reqID][mTopkLayerMap[layerID]].size();
+        requests.push_back(std::move(request));
+    }
+
+    /* Phase 2: submit the batched LoadOnToken (K leg, then V leg) on a worker
+     * thread while the engine thread runs the local non-UCM token copies and
+     * builds hbmSlotIndex. The store splices UCM tokens; the engine copies
+     * non-UCM tokens: the two write disjoint staging windows. */
+    const bool planOk = stagingOk && planBuildOk;
+    std::future<bool> loadFuture;
+    bool loadSubmitted = false;
+    if (planOk && (!plan.kTask.empty() || !plan.vTask.empty())) {
+        const std::string& firstReqID = requests.front().reqID;
+        try {
+            loadFuture = std::async(std::launch::async, [this, &plan, layerID, &firstReqID]() {
+                try {
+                    return SubmitUCMTokenLoad(plan, "UCMTensorMerge", layerID, firstReqID);
+                } catch (const std::exception& e) {
+                    mLogger.log(LogLevel::ERROR,
+                                "|UCMTensorMerge| batched load exception: %s\n", e.what());
+                    return false;
+                }
+            });
+            loadSubmitted = true;
+        } catch (const std::exception& e) {
+            mLogger.log(LogLevel::ERROR,
+                        "|UCMTensorMerge| failed to spawn load worker: %s\n", e.what());
+        }
+    }
+    std::vector<std::string> localFailed;
+    if (planOk) {
+        for (auto& request : requests) {
+            if (!MemcpyUCMMergeTokens(request.contexts, layerID, streamIdx, hbmSlotIndex,
+                                      request.reqID, request.previousLoadNum)) {
+                const size_t zeroTokens =
+                    FillFailedUCMMerge(request.contexts, layerID, streamIdx, hbmSlotIndex,
+                                       request.reqID, request.previousLoadNum);
+                mLogger.log(LogLevel::ERROR,
+                            "|KVPack| zero fallback (local copy): rank=%d layer=%d reqID=%s "
+                            "zeroOwnedTokens=%zu\n",
+                            mRank, layerID, request.reqID.c_str(), zeroTokens);
+                localFailed.push_back(request.reqID);
+            }
+        }
+    }
+    bool loadOk = planOk;
+    if (loadSubmitted) { loadOk = loadFuture.get(); }
+
+    /* Phase 3: fallback. Plan failure: local copies never ran, zero-fill all
+     * owned tokens. Store failure: local copies already landed, only zero the
+     * UCM-owned windows (the store never splices a failed task). In both cases
+     * hbmSlotIndex is (re)validated and filled for ALL tokens of every rank. */
+    if (!planOk || !loadOk) {
+        for (auto& request : requests) {
+            if (std::find(localFailed.begin(), localFailed.end(), request.reqID) !=
+                localFailed.end()) {
+                continue;
+            }
+            const size_t zeroTokens =
+                FillFailedUCMMerge(request.contexts, layerID, streamIdx, hbmSlotIndex,
+                                   request.reqID, request.previousLoadNum, /*zeroUcmOnly=*/planOk);
+            mLogger.log(LogLevel::ERROR,
+                        "|KVPack| zero fallback (batched load): rank=%d layer=%d reqID=%s "
+                        "stage=%s zeroOwnedTokens=%zu\n",
+                        mRank, layerID, request.reqID.c_str(), planOk ? "load" : "plan",
+                        zeroTokens);
+        }
+    }
+
+    mLoadNum[layerID] = static_cast<uint32_t>(runningLoadNum);
+}
+
+bool GSAPrefetchEngineC::ValidateUCMMergeRequest(int layerID, const std::string& reqID,
+                                                 size_t previousLoadNum)
 {
     if (!mStoreV1_) {
         mLogger.log(LogLevel::ERROR, "|UCMTensorMerge| mStoreV1_ is nullptr reqID=%s\n",
@@ -1591,7 +1718,7 @@ bool GSAPrefetchEngineC::ValidateUCMMergeRequest(int layerID, const std::string&
         mReqUseBlockTable.find(reqID) == mReqUseBlockTable.end()) {
         KVPackAbort(mKVPackControl);
     }
-    const size_t finalLoadNum = mLoadNum[layerID] + missGlobalIds.size();
+    const size_t finalLoadNum = previousLoadNum + missGlobalIds.size();
     if (finalLoadNum > static_cast<size_t>(mLoadIndexBufferLen) ||
         finalLoadNum > static_cast<size_t>(mKVBufferLen)) {
         KVPackAbort(mKVPackControl);

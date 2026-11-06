@@ -430,13 +430,22 @@ public:
                               const std::string& reqID, size_t previousLoadNum);
     size_t FillFailedUCMMerge(const std::vector<UCMMergeBlockContext>& blockContexts, int layerID,
                               int streamIdx, std::vector<uint64_t>& hbmSlotIndex,
-                              const std::string& reqID, size_t previousLoadNum);
+                              const std::string& reqID, size_t previousLoadNum,
+                              bool zeroUcmOnly = false);
 
     // UCMTensorMerge 分解辅助方法（huge_method 序号51）
-    bool ValidateUCMMergeRequest(int layerID, const std::string& reqID);
+    bool ValidateUCMMergeRequest(int layerID, const std::string& reqID, size_t previousLoadNum);
     void BuildUCMMergeBlockContexts(int layerID, const std::string& reqID, uint32_t requestIndex,
                                     std::vector<UCMMergeBlockContext>& blockContexts,
                                     std::map<int, std::vector<size_t>>& blockIdxToTokenIdx);
+    /* Whole-batch merge: all valid requests of one decode step are concatenated
+     * into ONE LoadOnToken task per leg (per layer), submitted on a worker
+     * thread while the engine thread runs the local non-UCM token copies, then
+     * joined. Replaces the per-request submit+wait serialization. */
+    void UCMTensorMergeBatch(const TaskInfo& taskInfo,
+                             const std::vector<uint32_t>& requestIndices, int layerID,
+                             int streamIdx, std::vector<uint64_t>& hbmSlotIndex);
+    bool ValidateMergeStagingWindow(int streamIdx);
     // IndexerInitLoad
     bool ProcessIndexerInitLoadLayer(std::vector<std::vector<int>>& blockTable,
                                      std::vector<std::vector<int>>& slabIdx,

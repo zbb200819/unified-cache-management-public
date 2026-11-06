@@ -59,6 +59,9 @@ private:
     StoreV1* backend_{nullptr};
     int32_t deviceId_{-1};
     std::vector<size_t> tensorSizes_{};
+    /* Prefix sums of tensorSizes_: tensorBaseOffsets_[t] is the base offset of
+     * tensor t inside a cache slot (slot layout = [K][V][indexer][scale]). */
+    std::vector<size_t> tensorBaseOffsets_{};
     size_t shardSize_{0};
     size_t nShardPerBlock_{0};
     size_t streamNumber_{1};
@@ -85,6 +88,12 @@ private:
     void TransferOneTask(CopyStream& stream, ShardTask&& task);
     void TransferDdrLoad(ShardTask&& task);
     void TransferDdrLoadOnToken(ShardTask&& task);
+    /* Base offset of tensor t inside a cache slot; TokenRange.offset is
+     * relative to the tensor, not to the slot. */
+    size_t TensorBaseOffset(size_t tensorIdx) const
+    {
+        return tensorIdx < tensorBaseOffsets_.size() ? tensorBaseOffsets_[tensorIdx] : 0;
+    }
     Status WaitBackendTaskReady(ShardTask& task);
     Status HostToDeviceAsync(CopyStream& stream, void* host, void** device);
     void RecordShardResults(const std::vector<ShardTask>& tasks, const ShardTask* extra,
