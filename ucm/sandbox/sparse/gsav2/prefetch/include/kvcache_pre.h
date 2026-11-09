@@ -54,7 +54,7 @@ class __attribute__((visibility("hidden"))) GSAPrefetchEngineC {
 public:
     std::mutex mMutexUseToken;
     // Serializes access to the per-request maps (mReqUseBlockTable, mDocsTables,
-    // mBlocksMap, mIndexerSlot, ...) that are touched concurrently by
+    // mBlocksMap, mUseBlockTableIdx, ...) that are touched concurrently by
     // DelBlocksMap (Python thread), SetIndexerMap (Python thread) and
     // IndexerLoadProcess (indexer worker thread).
     std::mutex mUpdateReqMutex;
@@ -98,6 +98,12 @@ public:
     void SetTokensMap(int layerID, const std::string& reqID, torch::Tensor& qTopkTensor,
                       const std::vector<int>& remainBlockTable, int maxIdx,
                       const std::vector<int>& slots, bool isNeedInit);
+
+    // SetTokensMap 分解辅助（L-6 判别式整改）
+    void ResetReqTokenState(const std::string& reqID, const std::vector<int>& remainBlockTable,
+                            int maxIdx, const std::vector<int>& slots);
+
+    void RunLastChunkMoveGuarded(int layerID, const std::string& reqID, int curTopkIndex);
 
     // kvcache dump
     void SetKvTensor(torch::Tensor kCachesTensor, torch::Tensor vCachesTensor,
@@ -174,11 +180,7 @@ public:
                        std::vector<std::vector<int>>& prefetchIdx, std::vector<int>& blockSlot,
                        torch::Tensor& dsaSBT);
 
-    void UpdateIndexerMap(std::string reqID, int idx, int blockID, std::string type);
-
-    void AddIndexerMap();
-
-    void DeleteIndexerMap();
+    void UpdateIndexerMap(std::string reqID, int idx);
 
     int IndexerLoadProcess(const TaskInfo& taskInfo, ThreadInfo& threadInfo);
 
@@ -260,9 +262,6 @@ public:
     std::map<std::string, std::vector<std::vector<int>>> mPrefetchIdx;
     std::map<std::string, std::vector<std::vector<int>>> allNeedLoadBlock;
     std::map<std::string, std::vector<std::vector<int>>> allMissIdxs;
-    std::map<std::string, std::vector<int>> mIndexerSlot;
-    std::map<std::string, std::vector<std::pair<int, int>>> mIndexerAdd;
-    std::map<std::string, std::vector<int>> mIndexerDel;
 
     //  output tensor
     std::map<std::string, torch::Tensor> mAllTopkIndicesTensor;
@@ -556,10 +555,6 @@ public:
                                const std::vector<int>& moveMap,
                                std::vector<LastChunkSourceBlock>& sourceBlocks,
                                UCMTokenLoadPlan& plan);
-
-    void AddIndexerMapForRequest(const std::string& reqID);
-
-    void DeleteIndexerMapForRequest(const std::string& reqID);
 
     void SetIndexerMapForLayer(const std::string& reqID, int layerID,
                                std::vector<int>& blockTableList,

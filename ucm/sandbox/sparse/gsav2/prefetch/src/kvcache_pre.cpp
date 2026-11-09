@@ -621,6 +621,10 @@ void GSAPrefetchEngineC::SetBlocksMap(const std::string& reqID,
         mLogger.log(LogLevel::ERROR, "|SetBlocksMap| vAddrs size mismatch\n");
         return;
     }
+    /* L-7 整改（最小改动·性能优先）：admission 与 indexer worker（IndexerLoadProcess
+     * 全程持 mUpdateReqMutex find 本函数写入的两张 map）对称加锁，杜绝 std::map
+     * 新 key 插入 vs 并发 find 的结构级 UB。每请求一次，非解码热路径。 */
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     mAllBlocksHash[reqID] = blocksHash;
     mPromptLen[reqID] = maxIdx;
     auto& blockMap = mLastKVBlockAddress[reqID];
@@ -641,6 +645,9 @@ void GSAPrefetchEngineC::SetLastIndexerBlock(const std::string& reqID,
                     reqID.c_str());
         return;
     }
+    /* L-7 整改（最小改动）：与 SetBlocksMap 同理，写侧补 mUpdateReqMutex 对称
+     * （读侧 indexer worker 已持同锁）。 */
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     auto reqIt = mLastKVBlockAddress.find(reqID);
     if (reqIt == mLastKVBlockAddress.end()) {
         mLogger.log(LogLevel::ERROR, "[ERROR] SetLastIndexerBlock no block info, reqID=%s\n",
@@ -667,34 +674,34 @@ void GSAPrefetchEngineC::SetTokensMap(int layerID, const std::string& reqID,
                 " Start SetTokensMap layerID: %d, reqID: %s, isNeedInit: %d\n",
                 mDecodeStep, layerID, reqID.c_str(), isNeedInit);
     const auto start = std::chrono::high_resolution_clock::now();
+    if (static_cast<size_t>(layerID) >= mTopkLayerMap.size()) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| SetTokensMap layerID out of range: "
+                    "reqID=%s layerID=%d mapSize=%zu\n",
+                    mDecodeStep, reqID.c_str(), layerID, mTopkLayerMap.size());
+        return;
+    }
     int curTopkIndex = mTopkLayerMap[layerID];
     if (layerID == 0) {
-        auto it = mHBMMangers.find(reqID);
-        if (it != mHBMMangers.end()) {
-            it->second.clear();
-            mAllReqIdSlots[reqID].clear();
-            mReqUseBlockTable[reqID].clear();
-            mMissGlobalToken[reqID].clear();
-            mLoadSlot[reqID].clear();
-        }
-        mAllReqIdSlots[reqID].assign(slots.begin(), slots.end());
-        mReqUseBlockTable[reqID].assign(remainBlockTable.begin(), remainBlockTable.end());
-        mSparseSeqLen[reqID] = remainBlockTable.size() * static_cast<size_t>(mBlockSize);
-        mPromptLen[reqID] = maxIdx;
-        mHBMMangers[reqID].resize(mTopkIndexerNum);
-        mMissGlobalToken[reqID].resize(mTopkIndexerNum);
-        mLoadSlot[reqID].resize(mTopkIndexerNum);
+        ResetReqTokenState(reqID, remainBlockTable, maxIdx, slots);
+    }
+    /* 提前识别：curTopkIndex 越界即拒绝（后续 mAvgHitRate/[manager] 下标依赖）。 */
+    if (curTopkIndex < 0 || static_cast<size_t>(curTopkIndex) >= mAvgHitRate.size()) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| SetTokensMap topkIndex out of range: "
+                    "reqID=%s layerID=%d topkIndex=%d avgHitRateSize=%zu\n",
+                    mDecodeStep, reqID.c_str(), layerID, curTopkIndex, mAvgHitRate.size());
+        return;
     }
     if (isNeedInit) {
         mAvgHitRate[curTopkIndex].clear();
         const size_t sparseSeqLen = remainBlockTable.size() * static_cast<size_t>(mBlockSize);
         ProcessTokensMapTopk(curTopkIndex, reqID, qTopkTensor, maxIdx, sparseSeqLen);
     }
-    auto& manager = *mHBMMangers[reqID][curTopkIndex];
     const auto managerEnd = std::chrono::high_resolution_clock::now();
     const auto managerDuration =
         std::chrono::duration_cast<std::chrono::microseconds>(managerEnd - start);
-    LastChunkMove(layerID, reqID, manager.mSlotToGlobal);
+    RunLastChunkMoveGuarded(layerID, reqID, curTopkIndex);
     const auto totalEnd = std::chrono::high_resolution_clock::now();
     const auto totalDuration =
         std::chrono::duration_cast<std::chrono::microseconds>(totalEnd - start);
@@ -704,6 +711,52 @@ void GSAPrefetchEngineC::SetTokensMap(int layerID, const std::string& reqID,
                 mDecodeStep, layerID, reqID.c_str(),
                 static_cast<long long>(managerDuration.count()),
                 static_cast<long long>(totalDuration.count()));
+}
+
+void GSAPrefetchEngineC::ResetReqTokenState(const std::string& reqID,
+                                            const std::vector<int>& remainBlockTable, int maxIdx,
+                                            const std::vector<int>& slots)
+{
+    /* layer0 每步重建 per-request 容器（原 SetTokensMap 内联块提取），
+     * managers/miss/loadSlot 三表同步扩容是下游下标访问的相关性前提。 */
+    auto it = mHBMMangers.find(reqID);
+    if (it != mHBMMangers.end()) {
+        it->second.clear();
+        mAllReqIdSlots[reqID].clear();
+        mReqUseBlockTable[reqID].clear();
+        mMissGlobalToken[reqID].clear();
+        mLoadSlot[reqID].clear();
+    }
+    mAllReqIdSlots[reqID].assign(slots.begin(), slots.end());
+    mReqUseBlockTable[reqID].assign(remainBlockTable.begin(), remainBlockTable.end());
+    mSparseSeqLen[reqID] = remainBlockTable.size() * static_cast<size_t>(mBlockSize);
+    mPromptLen[reqID] = maxIdx;
+    mHBMMangers[reqID].resize(mTopkIndexerNum);
+    mMissGlobalToken[reqID].resize(mTopkIndexerNum);
+    mLoadSlot[reqID].resize(mTopkIndexerNum);
+}
+
+void GSAPrefetchEngineC::RunLastChunkMoveGuarded(int layerID, const std::string& reqID,
+                                                 int curTopkIndex)
+{
+    /* L-6 整改：判别式替代无条件 `*mHBMMangers[reqID][curTopkIndex]` 解引用。
+     * ProcessTokensMapTopk 的任何早退（张量判别失败）都会使 manager 停留为
+     * null；reqID 条目被 DelReqIDRun 抹除后的陈旧调用会走 operator[] 插空
+     * 分支。两类情况一律日志 + 跳过 LastChunkMove（允许个别精度问题），
+     * 杜绝 Python 线程空指针 core。 */
+    auto managersIt = mHBMMangers.find(reqID);
+    if (managersIt == mHBMMangers.end() || curTopkIndex < 0 ||
+        static_cast<size_t>(curTopkIndex) >= managersIt->second.size() ||
+        !managersIt->second[static_cast<size_t>(curTopkIndex)]) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| SetTokensMap manager not ready, "
+                    "skip last chunk move: reqID=%s layerID=%d topkIndex=%d tableSize=%zu\n",
+                    mDecodeStep, reqID.c_str(), layerID, curTopkIndex,
+                    managersIt == mHBMMangers.end() ? 0 : managersIt->second.size());
+        return;
+    }
+    LastChunkMove(layerID, reqID,
+                  managersIt->second[static_cast<size_t>(curTopkIndex)]->mSlotToGlobal);
 }
 
 void GSAPrefetchEngineC::ProcessTokensMapTopk(int layerID, const std::string& reqID,
@@ -843,13 +896,11 @@ void GSAPrefetchEngineC::SetIndexerMap(std::string reqID, std::vector<int>& bloc
     if (mBlocksMap.find(reqID) != mBlocksMap.end()) {
         mBlocksMap[reqID].clear();
         mDocsTables[reqID].clear();
-        mIndexerSlot[reqID].clear();
         mPrefetchIdx[reqID].clear();
         mUseBlockTableIdx[reqID].clear();
         mPrefetchBlockTableIdx[reqID].clear();
         mRealTimeIdx[reqID].clear();
     }
-    mIndexerSlot[reqID] = blockSlot;
     mIndexerLoadResultT[reqID] = dsaSBT;
     if (mIndexerSparseLen == 0) { mIndexerSparseLen = dsaSBT.sizes()[1]; }
     mUseBlockTableIdx[reqID].resize(mLayerNum);
@@ -914,136 +965,78 @@ void GSAPrefetchEngineC::SetIndexerMapForLayer(const std::string& reqID, int lay
     }
 }
 
-void GSAPrefetchEngineC::UpdateIndexerMap(std::string reqID, int idx, int blockID, std::string type)
+void GSAPrefetchEngineC::UpdateIndexerMap(std::string reqID, int idx)
 {
-    mLogger.log(LogLevel::INFO,
-                "Decode step: %u, |KVCache Prefetch|Start new UpdateIndexerMap for type: %s "
-                "req_id: %s, idx: %d, blockID: %d\n",
-                mDecodeStep, type.c_str(), reqID.c_str(), idx, blockID);
-    if (type == "add") {
-        for (int layerID = 0; layerID < mLayerNum; layerID++) {
-            mUseBlockTableIdx[reqID][layerID].emplace_back(idx);
-        }
-        mLogger.log(LogLevel::INFO,
-                    "Decode step: %u, |KVCache Prefetch| "
-                    "add mUseBlockTableIdx for reqID: %s. "
-                    "add slot block id: %d, add blockID: %d, "
-                    "ori mIndexerSlot size:%d, after add len: %d \n",
-                    mDecodeStep, reqID.c_str(), idx, blockID, mIndexerSlot[reqID].size(),
-                    mUseBlockTableIdx[reqID][0].size());
-    } else if (type == "lastdel") {
-        for (int layerID = 0; layerID < mLayerNum; layerID++) {
-            mUseBlockTableIdx[reqID][layerID].pop_back();
-        }
-        mLogger.log(LogLevel::INFO,
-                    "Decode step: %u, |KVCache Prefetch| lastdel mUseBlockTableIdx for reqID: %s. "
-                    "lastdel blockID: %d, ori mIndexerSlot size:%d, after add len: %d \n",
-                    mDecodeStep, reqID.c_str(), blockID, mIndexerSlot[reqID].size(),
-                    mUseBlockTableIdx[reqID][0].size());
-    } else {
-        mLogger.log(LogLevel::INFO,
-                    "Decode step: %u, |KVCache Prefetch| del mUseBlockTableIdx for reqID: %s. "
-                    "del blockID: %d, after add len: %d \n",
-                    mDecodeStep, reqID.c_str(), blockID, mUseBlockTableIdx[reqID][0].size());
+    /* L-3 整改：提前识别 + 判别。生产调用链（Python update_indexer_map）只
+     * 使用 "add" 语义（新分配块后追加槽位索引），原 "lastdel"/"del" 分支
+     * 零调用且 "del" 分支仅打印无任何状态变更——死代码，一并删除。
+     * 守卫三连：offload 开关、请求已初始化（find 判别，杜绝 operator[]
+     * 插入空条目后 [layerID] 越界 UB）、层数就绪。 */
+    if (!mOpenIndexerOffload || mLayerNum <= 0) { return; }
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+    auto it = mUseBlockTableIdx.find(reqID);
+    if (it == mUseBlockTableIdx.end() || it->second.size() < static_cast<size_t>(mLayerNum)) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| UpdateIndexerMap skipped: "
+                    "reqID=%s not initialized, idx=%d, layerNum=%d, tableSize=%zu\n",
+                    mDecodeStep, reqID.c_str(), idx, mLayerNum,
+                    it == mUseBlockTableIdx.end() ? 0 : it->second.size());
+        return;
     }
-    mLogger.log(LogLevel::INFO, "Decode step: %u, |KVCache Prefetch| end UpdateIndexerMap\n",
-                mDecodeStep);
+    for (int layerID = 0; layerID < mLayerNum; layerID++) {
+        it->second[static_cast<size_t>(layerID)].emplace_back(idx);
+    }
+    mLogger.log(LogLevel::INFO,
+                "Decode step: %u, |KVCache Prefetch| UpdateIndexerMap add for reqID: %s. "
+                "add slot idx: %d, after add len: %zu\n",
+                mDecodeStep, reqID.c_str(), idx, it->second[0].size());
 }
 
 void GSAPrefetchEngineC::TokenIndexMapInter(std::vector<int>& oneTopkList, int bsIndex, int layerID,
                                             int topkLen, std::string reqID)
 {
     if (!mOpenIndexerOffload) { return; }
+    if (mBlockSize <= 0) {
+        mLogger.log(LogLevel::ERROR, "[ERROR] Trans topk blockSize invalid: %d, reqID %s\n",
+                    mBlockSize, reqID.c_str());
+        return;
+    }
+    /* L-5 整改（提前识别）：循环外一次性 find 取表与 seqLen，杜绝插空+越界 UB。 */
+    auto realTimeIt = mRealTimeIdx.find(reqID);
+    auto seqLenIt = mSeqLen.find(reqID);
+    if (realTimeIt == mRealTimeIdx.end() || seqLenIt == mSeqLen.end() ||
+        static_cast<size_t>(layerID) >= realTimeIt->second.size()) {
+        mLogger.log(LogLevel::ERROR, "[ERROR] Decode step: %u Trans topk state missing: "
+                    "req_id: %s, layer_id %d\n", mDecodeStep, reqID.c_str(), layerID);
+        return;
+    }
+    const auto& realTimeIdx = realTimeIt->second[static_cast<size_t>(layerID)];
+    const int seqLen = seqLenIt->second;
+    /* L-5 整改（判别式门控）：负 token / 块序号越界 / 翻译后越界三类非法输入
+     * 一律"日志 + 跳过翻译（保留原值）"，杜绝 OOB 读与负 slot 伪装。 */
     for (int j = 0; j < topkLen; j++) {
-        int ori = oneTopkList[j];
-        int slot = oneTopkList[j] % mBlockSize;
-        uint32_t revIdx = oneTopkList[j] / mBlockSize;
-        if (revIdx >= mRealTimeIdx[reqID][layerID].size()) {
-            mLogger.log(LogLevel::ERROR,
-                        "[ERROR] revIdx >= mRealTimeIdx[reqID][layerID].size()!!! "
-                        "req_id: %s, layer_id %d, ori token %d, revIdx %d, mRealTimeIdx size %d\n",
-                        reqID.c_str(), layerID, ori, revIdx, mRealTimeIdx[reqID][layerID].size());
-        }
-        int idx = mRealTimeIdx[reqID][layerID][oneTopkList[j] / mBlockSize];
-        oneTopkList[j] = idx * mBlockSize + slot;
-        if (oneTopkList[j] < 0 || oneTopkList[j] >= mSeqLen[reqID]) {
-            mLogger.log(LogLevel::ERROR,
-                        "[ERROR] Decode step: %u Trans topk is < 0 !!! "
-                        "layer_id %d, ori token %d, new token %d, block_index %d, "
-                        "idx: %d seq_len: %d for reqID %s\n",
-                        mDecodeStep, layerID, ori, oneTopkList[j], revIdx, idx, mSeqLen[reqID],
-                        reqID.c_str());
-        }
-    }
-}
-
-void GSAPrefetchEngineC::AddIndexerMap()
-{
-    if (!mOpenIndexerOffload) { return; }
-    mLogger.log(LogLevel::INFO, "Decode step: %u, |KVCache Prefetch| Start AddIndexerMap\n",
-                mDecodeStep);
-    for (auto it = mIndexerAdd.begin(); it != mIndexerAdd.end(); it++) {
-        std::string reqID = it->first;
-        if (mBlocksMap.find(reqID) == mBlocksMap.end()) {
-            mLogger.log(LogLevel::ERROR,
-                        "Decode step: %u, |KVCache Prefetch| reqID is not init: %s\n", mDecodeStep,
-                        reqID.c_str());
+        const int ori = oneTopkList[j];
+        if (ori < 0) {
+            mLogger.log(LogLevel::ERROR, "[ERROR] Decode step: %u Trans topk ori token < 0: "
+                        "layer_id %d, ori token %d, reqID %s\n",
+                        mDecodeStep, layerID, ori, reqID.c_str());
             continue;
         }
-        AddIndexerMapForRequest(reqID);
-    }
-    mIndexerAdd.clear();
-    mLogger.log(LogLevel::INFO, "Decode step: %u, |KVCache Prefetch| End AddIndexerMap\n",
-                mDecodeStep);
-}
-
-void GSAPrefetchEngineC::AddIndexerMapForRequest(const std::string& reqID)
-{
-    for (int i = 0; i < mLayerNum; i++) {
-        for (uint32_t j = 0; j < mIndexerAdd[reqID].size(); j++) {
-            int idx = mIndexerSlot[reqID].size();
-            int blockID = mIndexerAdd[reqID][j].second;
-            mDocsTables[reqID][i][idx] = blockID;
-            mBlocksMap[reqID][i][blockID] = idx;
-        }
-    }
-    for (uint32_t j = 0; j < mIndexerAdd[reqID].size(); j++) {
-        mIndexerSlot[reqID].emplace_back(mIndexerAdd[reqID][j].first);
-    }
-}
-
-void GSAPrefetchEngineC::DeleteIndexerMap()
-{
-    if (!mOpenIndexerOffload) { return; }
-    mLogger.log(LogLevel::INFO, "Decode step: %u, |KVCache Prefetch| Start DeleteIndexerMap\n",
-                mDecodeStep);
-    for (auto it = mIndexerDel.begin(); it != mIndexerDel.end(); it++) {
-        std::string reqID = it->first;
-        if (mBlocksMap.find(reqID) == mBlocksMap.end()) {
-            mLogger.log(LogLevel::ERROR,
-                        "Decode step: %u, |KVCache Prefetch| reqID is not init: %s\n", mDecodeStep,
-                        reqID.c_str());
+        const uint32_t revIdx = static_cast<uint32_t>(ori / mBlockSize);
+        if (revIdx >= realTimeIdx.size()) {
+            mLogger.log(LogLevel::ERROR, "[ERROR] Decode step: %u Trans topk revIdx out of "
+                        "range: layer_id %d, ori %d, revIdx %u, size %zu, reqID %s\n",
+                        mDecodeStep, layerID, ori, revIdx, realTimeIdx.size(), reqID.c_str());
             continue;
         }
-        DeleteIndexerMapForRequest(reqID);
-    }
-    mIndexerDel.clear();
-    mLogger.log(LogLevel::INFO, "Decode step: %u, |KVCache Prefetch| End DeleteIndexerMap\n",
-                mDecodeStep);
-}
-
-void GSAPrefetchEngineC::DeleteIndexerMapForRequest(const std::string& reqID)
-{
-    for (int i = 0; i < mLayerNum; i++) {
-        for (uint32_t j = 0; j < mIndexerDel[reqID].size(); j++) {
-            int blockID = mIndexerDel[reqID][j];
-            int idx = mBlocksMap[reqID][i][blockID];
-            mBlocksMap[reqID][i].erase(blockID);
-            mDocsTables[reqID][i].erase(idx);
-            mPrefetchIdx[reqID][i].erase(
-                std::remove(mPrefetchIdx[reqID][i].begin(), mPrefetchIdx[reqID][i].end(), idx),
-                mPrefetchIdx[reqID][i].end());
+        const int translated = realTimeIdx[revIdx] * mBlockSize + ori % mBlockSize;
+        if (translated < 0 || translated >= seqLen) {
+            mLogger.log(LogLevel::ERROR, "[ERROR] Decode step: %u Trans topk out of range: "
+                        "layer_id %d, ori %d, new %d, block_index %u, seq_len %d, reqID %s\n",
+                        mDecodeStep, layerID, ori, translated, revIdx, seqLen, reqID.c_str());
+            continue;
         }
+        oneTopkList[j] = translated;
     }
 }
 

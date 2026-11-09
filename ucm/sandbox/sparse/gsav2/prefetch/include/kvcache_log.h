@@ -22,7 +22,9 @@ public:
     {
         if (enable) {
             mLogFile.open(fileName, std::ios::app);
-            if (mLogFile.is_open()) {
+            /* L-13 整改：条件写反（成功打开反而打失败横幅）；仅在真实打开失败时
+             * 打印，此后 log() 因 !is_open() 判别自动降级为 no-op。 */
+            if (!mLogFile.is_open()) {
                 std::cerr << "|KVCache Prefetch| Fail to open log file: " << fileName << std::endl;
             }
         }

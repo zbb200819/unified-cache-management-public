@@ -430,7 +430,6 @@ TEST_F(ScatterIndexerTest, RunOneBsPrefetchEndToEndWithHits)
         engine->allMissIdxs[reqID].push_back({});
         engine->mPrefetchBlockTableIdx[reqID].push_back(std::vector<int>(4, -1));
     }
-    engine->mIndexerSlot[reqID].assign(2, 0);
     engine->mIndexerLoadResultT[reqID] = torch::full({2, 4}, -1, torch::dtype(torch::kInt32));
     // topkList: [layer 0] = [0,1], [layer 1] = [0,1] (both hits).
     auto topkList = torch::tensor({0, 1, 0, 1}, torch::dtype(torch::kInt32)).reshape({2, 1, 2});

@@ -73,7 +73,7 @@ protected:
     }
 
     /* Pre-seed the per-(reqID, layer) tables exactly as the engine would after
-       SetBlocksMap + AddIndexerMap ran. This lets the scatter logic find the
+       SetBlocksMap ran. This lets the scatter logic find the
        block tables / docs tables it expects without going through the heavy
        TaskManager + ACL load path. */
     void SeedBlockTables(const std::string& reqID, int layerNum,
@@ -88,7 +88,6 @@ protected:
         // entries, because FinishOneLayerPrefetch writes [pairIdx] directly.
         engine->mPrefetchBlockTableIdx[reqID].assign(
             layerNum, std::vector<int>(docsTableContents.size() + 8, -1));
-        engine->mIndexerSlot[reqID].assign(layerNum, 0);
         for (int layer = 0; layer < layerNum; ++layer) {
             int idx = 0;
             for (int blockID : docsTableContents) {
@@ -413,8 +412,7 @@ TEST_F(ScatterLogicTest, DelReqIDRunClearsPrefetchIdxAndBlocksMap)
     EXPECT_EQ(engine->mPromptLen.count("req1"), 0u);
     EXPECT_EQ(engine->mBlocksMap.count("req1"), 0u);
     EXPECT_EQ(engine->mPrefetchIdx.count("req1"), 0u);
-    // BUG-FOCUS: mAllBlocksHash is NOT cleared (documented bug #9).
-    // (Not seeded here so it is gone anyway; covered in test_gsa_prefetch_engine.)
+    // mAllBlocksHash erasure (L-4 fixed) is covered in test_gsa_prefetch_engine.
 }
 
 /* ---------------- SetKvTensor / SetKvTensorIndex ---------------- */

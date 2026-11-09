@@ -1491,6 +1491,10 @@ void GSAPrefetchEngineC::SubmitTaskIndexer(std::vector<int>& topkLensInput,
                 "Decode step: %u, |KVCache Prefetch| start SubmitTaskIndexer batch size: %lu\n",
                 mDecodeStep, reqIDList.size());
     auto start = std::chrono::high_resolution_clock::now();
+    /* L-7 整改（最小改动）：mPrefetchBlockTableIdx 唯一写者为 indexer worker 的
+     * FinishOneLayerPrefetch（IndexerLoadProcess 全程持 mUpdateReqMutex），读侧
+     * 对称加锁；is_indexer_load 门控保证提交时 indexer worker 空闲，锁无竞争。 */
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     for (uint32_t i = 0; i < reqIDList.size(); i++) {
         for (int layerID = 0; layerID < mLayerNum; layerID++) {
             std::memcpy(mUseBlockTableIdx[reqIDList[i]][layerID].data(),
@@ -1640,9 +1644,12 @@ void GSAPrefetchEngineC::DelReqIDRun()
             mMissGlobalToken.erase(*it);
             mLoadSlot.erase(*it);
             mReqUseBlockTable.erase(*it);
+            /* L-4 修复：SetBlocksMap 写入的两兄弟成员一并清理，
+             * 否则每完成请求泄漏 16B×块数（BlockId/LastKVBlockAddress 条目）。 */
+            mAllBlocksHash.erase(*it);
+            mLastKVBlockAddress.erase(*it);
             mBlocksMap.erase(*it);
             mDocsTables.erase(*it);
-            mIndexerSlot.erase(*it);
             mPrefetchIdx.erase(*it);
             mIndexerLoadResultT.erase(*it);
             mPrefetchBlockTableIdx.erase(*it);

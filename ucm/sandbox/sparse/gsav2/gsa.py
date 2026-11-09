@@ -1151,7 +1151,7 @@ class GSA(UcmSparseBase):
                     slots[-1]
                 )
                 self.prefetch_engine.prefetch_engine_c.update_indexer_map(
-                    req_id, len(req_meta.slab_host_slot) - 1, slots[-1], "add"
+                    req_id, len(req_meta.slab_host_slot) - 1
                 )
             self.dsa_block_table.np[
                 :, index_in_batch, : req_meta.indexer_sparse_len()
