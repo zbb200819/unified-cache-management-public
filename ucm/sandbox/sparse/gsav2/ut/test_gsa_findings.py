@@ -26,14 +26,14 @@ from ucm.sparse.base import UcmSparseRole
 
 
 # ===========================================================================
-# S1-1 / A2：build_sparse_meta 传对象而非 req_id
+# S1-1 / A2（已修复 P0-F2）：build_sparse_meta 传对象而非 req_id
 # ===========================================================================
 class _PlainNewReq:
     """模拟 vLLM NewRequestData：req_id 是字符串，对象本身不是键。
 
-    与 test_gsa.py 的 _SelfRefNewReq（自引用 hack）不同，本类还原真实键控
-    方式（GSAMetaData.get_model_input 以 new_req.req_id 查 requests /
-    input_batch / num_scheduled_tokens），从而暴露类型不一致缺陷。
+    与 test_gsa.py 历史上的 _SelfRefNewReq（自引用 hack）不同，本类还原真实
+    键控方式（GSAMetaData.get_model_input 以 new_req.req_id 查 requests /
+    input_batch / num_scheduled_tokens）。
     """
 
     def __init__(self, req_id):
@@ -62,21 +62,16 @@ class TestBuildSparseMetaNewReqArg:
         g.build_sparse_meta(so, {"r_new": add}, fakes.FakeInputBatch({"r_new": 0}), {})
         return recorded, nr
 
-    def test_new_req_object_passed(self, gsa_worker, monkeypatch):
-        """钉住当前缺陷行为：_load_kv_dram 收到 NewRequestData 对象本身。"""
-        recorded, nr = self._run(gsa_worker, monkeypatch)
-        assert recorded == [nr]
-        # 对象不是 gsa_stats 的键（键是 "r_new" 字符串）——真实运行即 KeyError
-        assert not isinstance(recorded[0], str)
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason="P0-F2：gsa.py:2384 改为 _load_kv_dram(new_req.req_id) 后移除本标记",
-    )
     def test_fixed_req_id_string_passed(self, gsa_worker, monkeypatch):
-        """期望的修复后行为：_load_kv_dram 收到 req_id 字符串。"""
+        """回归守护（P0-F2 已修复）：_load_kv_dram 必须收到 req_id 字符串。
+
+        修复前 gsa.py:2383-2384 原样把 NewRequestData 对象传给 _load_kv_dram，
+        真实运行时 gsa_stats[对象] 必然 KeyError（PD 分离 + decode 节点 +
+        任意新请求即触发）。
+        """
         recorded, _ = self._run(gsa_worker, monkeypatch)
         assert recorded == ["r_new"]
+        assert all(isinstance(r, str) for r in recorded)
 
 
 # ===========================================================================

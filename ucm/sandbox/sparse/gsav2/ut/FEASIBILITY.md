@@ -188,12 +188,12 @@ gsa.py 在 import 时把常量绑定到自身命名空间，逐用例 patch 即�
 132 行，构造器占 80%。要点：
 - `enable_sparse_sfa_c8` False/True × `get_ascend_device_type()` A5/非 A5（stub 可编程返回）4 组合，覆盖 dtype/k_dim/v_dim 与 packed_head_dim 分支；
 - `GSAPrefetchEngineC` mock 断言入参列表（12 项配置 + 5 项 dims + log 路径）；
-- `update_topk_index` / `del_finish_meta` 的 flag True/False（`prefetch_engine` 的 PTOPK 门控已随开关合并移除）。
+- `del_finish_meta` 的 flag True/False（`update_topk_index` 已随缺陷 A3 整体删除；prefetch_engine 的 PTOPK 门控已随开关合并移除）。
 约 7 用例。
 
 ### 5.5 gsa.py —— ⚠️ 行 100% / 分支 >90% 可达，但有 6 个已知硬点，均有对策
 
-**易覆盖部分（~80% 分支）**：`GSABlockTable/GSASharedCPUPool/GSAReqBlockTable/GSAHashRequest` 等小类、`GSAReqStat` 的全部谓词（step/stage/is_gsa/is_indexer_sparse/is_last_chunk×PD混用与PD分离/is_decode_only/get_seq_len/get_spase_len/init_mask/get_indexer_sparse_len/get_indexer_remain_len/add_req_new×preempt分支/update_req_state）、`GSAMetaData.get_model_input/trans_input_tensor`、`compute_parent_block_hash`、`inject_store_v1_ptr`、`print_log`、scheduler 侧接口（`estimate_num_slots_sparsed`×4 分支、`estimate_free_slots_sparse`×3 分支、`allocate_slots`×3 版本分支×preempt 分支、`begin_sch_flag`、`update_scheduler_free_slot` 双分支）。
+**易覆盖部分（~80% 分支）**：`GSABlockTable/GSASharedCPUPool/GSAReqBlockTable/GSAHashRequest` 等小类、`GSAReqStat` 的全部谓词（step/stage/is_gsa/is_indexer_sparse/is_last_chunk×PD混用与PD分离/is_decode_only/get_seq_len/get_spase_len/init_mask/get_indexer_sparse_len/get_indexer_remain_len/add_req_new×preempt分支/update_req_state）、`GSAMetaData.get_model_input/trans_input_tensor`、`compute_parent_block_hash`、`print_log`、scheduler 侧接口（`estimate_num_slots_sparsed`×4 分支、`estimate_free_slots_sparse`×3 分支、`allocate_slots`×3 版本分支×preempt 分支、`begin_sch_flag`、`update_scheduler_free_slot` 双分支）。
 
 **中高难度部分与对策**（用例设计清单，节选）：
 

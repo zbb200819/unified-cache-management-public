@@ -122,10 +122,6 @@ class GSAPrefetchBase:
         self.k_cache_ptr = [None] * self.layer_num
         self.v_cache_ptr = [None] * self.layer_num
 
-    def update_topk_index(self, layer_id, req_id) -> list:
-        topk_indices = self.prefetch_engine_c.get_topk_indices(layer_id, req_id)
-        return topk_indices
-
     def del_finish_meta(self, del_req, flag: bool = True) -> None:
         if flag:
             self.prefetch_engine_c.del_blocks_map(del_req)

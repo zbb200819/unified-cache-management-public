@@ -159,8 +159,8 @@ class TestConstruction:
         assert g.block_table_sm is not None
         assert g.block_table_sm.is_creator is True
         assert hasattr(g, "gsa_cpu_shared_pool")
-        assert g.indexer_last_query is None  # reset at the end of init
-        assert g.indexer_last_weight is None
+        assert isinstance(g.indexer_last_query, gsa_module.TopkIndices)
+        assert isinstance(g.indexer_last_weight, gsa_module.TopkIndices)
 
 
 # ---------------------------------------------------------------------------
@@ -867,7 +867,7 @@ class TestWarmup:
         g.indexer_cache_preempt_i_ptr = 300
         g.indexer_cache_preempt_i_offset = 30
         gsa_module.GSA._inject_block_hashes(g, 1, [0], [1], inject_indexer=True)
-        assert g.prefetch_engine.prefetch_engine_c.calls_of("set_last_indexer_blocks")
+        assert g.prefetch_engine.prefetch_engine_c.calls_of("set_last_indexer_block")
 
 
 # ---------------------------------------------------------------------------

@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """gsav2 跨语言绑定契约测试（静态，无 NPU / C++ 环境亦可运行）。
 
-背景（见仓库根 GSA_ANALYSIS_REPORT.md 缺陷 A1 / A3）：
-1. gsa.py:1024 调用 set_last_indexer_blocks（复数），而 pybinds.cpp:152 只导出
-   set_last_indexer_block（单数）——IS_INDEXER_OFFLOAD=True 且 prompt>32768 时
-   首个请求即 AttributeError；
-2. prefetch_engine.py:127 调用 get_topk_indices，pybinds.cpp 绑定表中不存在；
-3. ut/fakes.py 的 FakeEngineC 显式实现了 get_topk_indices（非 __getattr__ 兜底），
-   会在单测中掩盖真实绑定的缺失。
+背景（见仓库根 GSA_ANALYSIS_REPORT.md 缺陷 A1 / A3，均已修复）：
+1. [已修复 P0-F1] gsa.py:1024 原调用 set_last_indexer_blocks（复数），而
+   pybinds.cpp:152 只导出 set_last_indexer_block（单数）——gsa.py / gsa_old.py /
+   gsa_for_pd.py 三处调用点与 UT 断言已全部改为单数，账本条目已移除；
+2. [已修复 P0-F3] prefetch_engine.py 原 update_topk_index 调用 get_topk_indices，
+   pybinds.cpp 绑定表中不存在——经全仓核查无任何生产调用方，方法已整体删除；
+3. （背景同 2）ut/fakes.py 曾显式实现 get_topk_indices（非 __getattr__ 兜底），
+   在单测中掩盖真实绑定的缺失——已随 A3 一并删除，本契约测试防止同类问题再现。
 
 本文件做的事：
 - 解析 prefetch/src/pybinds.cpp 的 .def("...") 得到两个类的真实绑定集合；
@@ -40,13 +41,12 @@ PROD_FILES = {
 # 修复对应缺陷后 test_ledger_entries_still_valid 会失败并提示从这里移除条目。
 # ---------------------------------------------------------------------------
 KNOWN_MISMATCHES = {
-    # gsa.py:1024 / gsa_old.py:767 / gsa_for_pd.py:455 → 绑定实名
-    # set_last_indexer_block（单数，pybinds.cpp:152）
-    ("gsa.py", "set_last_indexer_blocks"),
-    ("gsa_old.py", "set_last_indexer_blocks"),
-    ("gsa_for_pd.py", "set_last_indexer_blocks"),
-    # prefetch_engine.py:127 → pybinds.cpp 绑定表中不存在
-    ("prefetch_engine.py", "get_topk_indices"),
+    # A1（set_last_indexer_blocks 复数误调，P0-F1）已修复：gsa.py:1024 /
+    # gsa_old.py:767 / gsa_for_pd.py:455 三处调用点已改为单数。
+    # A3（get_topk_indices 绑定缺失，P0-F3）已修复：update_topk_index 无任何
+    # 生产调用方，方法与 FakeEngineC.get_topk_indices 已整体删除。
+    # 账本当前为空——所有 prefetch_engine_c 调用均有对应 .def 绑定，
+    # 由 test_no_new_unbound_calls 持续看护；新缺失会立即使其失败。
 }
 
 _DEF_RE = re.compile(r'\.def\(\s*"([A-Za-z_][A-Za-z0-9_]*)"')
@@ -164,8 +164,8 @@ class TestEngineBindingContract:
     def test_fake_engine_methods_are_real_bindings(self):
         """FakeEngineC / FakeUCMPrefetch 的绑定风格方法不得超出真实绑定 ∪ 账本。
 
-        防止单测 fake 显式实现一个并不存在的绑定（如 get_topk_indices），
-        在 UT 中掩盖生产代码的 AttributeError。
+        防止单测 fake 显式实现一个并不存在的绑定（历史案例 get_topk_indices，
+        已随 A3 整体删除），在 UT 中掩盖生产代码的 AttributeError。
         """
         import fakes
 

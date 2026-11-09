@@ -217,7 +217,6 @@ class FakeEngineC:
         self.indexer_status = [False]
         self.store_v1_ptr = 0
         self.self_ptr = 0x1234
-        self.topk_indices_result = []
 
     # -- 状态查询（脚本化） --
     @staticmethod
@@ -241,10 +240,6 @@ class FakeEngineC:
     def get_self_ptr(self):
         self.calls.append(("get_self_ptr", (), {}))
         return self.self_ptr
-
-    def get_topk_indices(self, layer_id, req_id):
-        self.calls.append(("get_topk_indices", (layer_id, req_id), {}))
-        return self.topk_indices_result
 
     def called(self, name):
         return [c for c in self.calls if c[0] == name]

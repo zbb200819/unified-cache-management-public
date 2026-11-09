@@ -32,19 +32,6 @@ class TestModuleLevel:
         assert v1 == v2 and isinstance(v1, int)
         assert gsa_mod.compute_parent_block_hash("m", 2, "bf16", 1) != v1
 
-    def test_inject_store_v1_ptr_without_instance(self, monkeypatch):
-        monkeypatch.setattr(gsa_mod, "GSA_INSTANCE", None)
-        gsa_mod.inject_store_v1_ptr(123)
-        assert gsa_mod._pending_store_ptr == 123
-
-    def test_inject_store_v1_ptr_with_instance(self, monkeypatch):
-        calls = []
-        inst = SimpleNamespace(_inject_store_ptr=lambda p: calls.append(p))
-        monkeypatch.setattr(gsa_mod, "GSA_INSTANCE", inst)
-        gsa_mod.inject_store_v1_ptr(456)
-        assert calls == [456]
-        assert gsa_mod._pending_store_ptr == 456
-
     def test_platform_branch_reload(self, monkeypatch):
         """覆盖 L30-43 两侧：True 侧在 import 时已执行，此处覆盖 False 侧并还原"""
         import torch as _torch
@@ -839,12 +826,12 @@ class TestInjectBlockHashes:
         monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
         g = make_gsa()
         self._prepare(g)
-        # 源码 _init_indexer_preempt 写的是 indexer_cache_preempt_ptr，
-        # _inject_block_hashes 读的是 *_i_ptr —— 手动补设以覆盖该路径
+        # _i_ptr/_i_offset 由 init_host_slabs_from_kv → _init_indexer_preempt
+        # 运行期赋值（构造流程不含）；此处手动设值以确定性覆盖该路径
         g.indexer_cache_preempt_i_ptr = 3000
         g.indexer_cache_preempt_i_offset = 30
         g._inject_block_hashes("r1", [0], [1], inject_indexer=True)
-        calls = g.prefetch_engine.prefetch_engine_c.called("set_last_indexer_blocks")
+        calls = g.prefetch_engine.prefetch_engine_c.called("set_last_indexer_block")
         assert len(calls) == 1
         assert calls[0][1][2] == [3000 + 30]
 
@@ -853,7 +840,7 @@ class TestInjectBlockHashes:
         g = make_gsa()
         self._prepare(g)
         g._inject_block_hashes("r1", [0], [1], inject_indexer=False)
-        assert not g.prefetch_engine.prefetch_engine_c.called("set_last_indexer_blocks")
+        assert not g.prefetch_engine.prefetch_engine_c.called("set_last_indexer_block")
 
 
 # ===========================================================================
@@ -1845,9 +1832,8 @@ class TestIndexer:
         g.cal_indexer_topk_blocks()  # bs == 0
 
     def _setup_topk(self, g, stat_kw=None):
-        # 源码疑似问题：_init_worker_indexer_state 中 indexer_last_query 的
-        # None 赋值晚于 init_gsa_metadata 的创建语句，构造完成后恒为 None；
-        # 此处手动重建以覆盖 cal_indexer_topk_blocks 主路径
+        # 已修复（README 问题 #3）：构造期 init_gsa_metadata 保留 TopkIndices；
+        # 此处重建仅为钉住 bs=4 形状，保证断言确定性
         g.indexer_last_query = gsa_mod.TopkIndices(
             (g.layer_num, 4, 32, 128), g.device, g.dtype
         )
@@ -1877,6 +1863,16 @@ class TestIndexer:
         for layer in range(g.layer_num):
             g.indexer_k_repr[layer].normal_()
         return stat
+
+    def test_offload_construction_keeps_topk_indices(self, make_gsa, monkeypatch):
+        """README 问题 #3 回归：offload 构造后 indexer_last_* 必须是 TopkIndices。"""
+        monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
+        g = make_gsa()
+        assert isinstance(g.indexer_last_query, gsa_mod.TopkIndices)
+        assert isinstance(g.indexer_last_weight, gsa_mod.TopkIndices)
+        assert g.indexer_last_query.cpu.shape[0] == g.layer_num
+        assert g.indexer_last_query.cpu.shape[2:] == (32, 128)
+        assert g.indexer_last_weight.cpu.shape[2] == 32
 
     def test_topk_blocks_spec1_full(self, make_gsa, monkeypatch):
         g = self._offload_gsa(make_gsa, monkeypatch)
@@ -2073,7 +2069,7 @@ class TestWarmup:
         stat = self._warmup_setup(g, offload=True)
         # offload + inject_indexer：prompt 200 <= 32768 → False 侧
         g._warmup_dump_blocks()
-        assert not g.prefetch_engine.prefetch_engine_c.called("set_last_indexer_blocks")
+        assert not g.prefetch_engine.prefetch_engine_c.called("set_last_indexer_block")
         # prompt > INDEXER_PREFETCH_TOKENS → inject_indexer True 侧
         stat.num_prompt_tokens = 40000
         stat.block_hashes = [bytes([i]) * 16 for i in range(2)]
@@ -2081,7 +2077,7 @@ class TestWarmup:
         g.indexer_cache_preempt_i_ptr = 3000
         g.indexer_cache_preempt_i_offset = 30
         g._warmup_dump_blocks()
-        assert g.prefetch_engine.prefetch_engine_c.called("set_last_indexer_blocks")
+        assert g.prefetch_engine.prefetch_engine_c.called("set_last_indexer_block")
 
     def test_warmup_dump_sfa_c8(self, make_gsa):
         g = make_gsa(additional_config={"enable_sparse_sfa_c8": True})
@@ -2257,15 +2253,6 @@ def _fake_kv_cache_manager(coordinator=None, block_pool=None):
     )
 
 
-class _SelfRefNewReq:
-    """build_sparse_meta 把 scheduled_new_reqs 的元素（NewRequestData 对象）
-    原样传给 _load_kv_dram，而后者以 req_id 为键查 gsa_stats —— 疑似源码
-    问题（元素与键类型不一致）。用自引用对象使两者兼容以覆盖该路径。"""
-
-    def __init__(self):
-        self.req_id = self
-
-
 class TestSchedulerSide:
     def _build_setup(self, g, monkeypatch, seg=32768, prompt=0):
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", seg)
@@ -2275,9 +2262,9 @@ class TestSchedulerSide:
         stat.num_prompt_tokens = prompt
         md.gsa_stats["r1"] = stat
         g.gsa_stats = md.gsa_stats
-        # 注：build_sparse_meta 会把 scheduled_new_reqs 的元素（NewRequestData
-        # 对象，非 req_id）直接传给 _load_kv_dram —— 疑似源码问题，此处用
-        # cached 路径规避（new-req 路径已在 TestBuildMetaAndExecute 覆盖）
+        # 注：new-req 路径已按 P0-F2 修复为 _load_kv_dram(new_req.req_id)，
+        # 此处仍用 cached 路径构造（new-req 路径在
+        # test_build_sparse_meta_new_reqs_and_has_prefill 覆盖）
         so = fakes.FakeSchedulerOutput(
             num_scheduled_tokens={"r1": 1},
             cached_req_ids=["r1"],
@@ -2325,18 +2312,22 @@ class TestSchedulerSide:
         g = gsa_worker
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 32768)
         g._store_injected = True
-        nr = _SelfRefNewReq()
+        # A2（P0-F2）已修复：scheduled_new_reqs 元素按 new_req.req_id（字符串）
+        # 传 _load_kv_dram —— 还原真实键控，不再使用自引用对象 hack
+        nr = SimpleNamespace(req_id="r_new")
         md = gsa_mod.GSAMetaData(g._vllm_config, 2)
-        md.gsa_stats[nr] = gsa_mod.GSAReqStat(nr, g._vllm_config, 2)
+        md.gsa_stats["r_new"] = gsa_mod.GSAReqStat("r_new", g._vllm_config, 2)
         g.gsa_stats = md.gsa_stats
-        so = fakes.FakeSchedulerOutput(num_scheduled_tokens={nr: 1}, new_reqs=[nr])
+        so = fakes.FakeSchedulerOutput(
+            num_scheduled_tokens={"r_new": 1}, new_reqs=[nr]
+        )
         add = fakes.FakeAddReqState(
             block_ids=[[5]],
             prompt_token_ids=list(range(200)),
             output_token_ids=[],
             num_computed_tokens=0,
         )
-        g.build_sparse_meta(so, {nr: add}, fakes.FakeInputBatch({nr: 0}), {})
+        g.build_sparse_meta(so, {"r_new": add}, fakes.FakeInputBatch({"r_new": 0}), {})
         # prefill 请求（prompt 200 > computed 0）→ has_prefill True
         assert g.has_prefill is True
         assert g.decode_index == []
@@ -2679,7 +2670,7 @@ class TestBuffers:
         g.k_dim = 16
         g.init_host_slabs_from_kv(16)
         assert g.indexer_cache_preempt is not None
-        assert g.indexer_cache_preempt_ptr > 0
+        assert g.indexer_cache_preempt_i_ptr > 0
         assert g.indexer_k_repr.shape == (g.layer_num, 16, 1, 1, 128)
 
     def test_init_kvcache_ptrs_first_and_second(self, gsa_worker):

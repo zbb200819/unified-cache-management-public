@@ -87,12 +87,6 @@ class TestGSAPrefetchBaseAPI:
     def _pe(self):
         return pe_mod.GSAPrefetchBase(fakes.FakeVllmConfig(), 2, False, None, [0, 1])
 
-    def test_update_topk_index(self):
-        pe = self._pe()
-        pe.prefetch_engine_c.topk_indices_result = [1, 2, 3]
-        assert pe.update_topk_index(1, "req-1") == [1, 2, 3]
-        assert pe.prefetch_engine_c.called("get_topk_indices")
-
     def test_del_finish_meta_calls_del_blocks_map(self):
         pe = self._pe()
         pe.del_finish_meta("req-1")

@@ -96,19 +96,8 @@ SEG_PREFILL_THRESHOLD = int(os.environ.get("UCM_GSA_SEG_PREFILL_THRESHOLD", "327
 
 logger = init_logger(__name__)
 
-GSA_INSTANCE = None
-_pending_store_ptr = 0
 UCM_LOOKUP_MAX_RETRY = 10000
 UCM_LOOKUP_TIME_SPACE = 0.001
-
-
-def inject_store_v1_ptr(store_ptr):
-    global _pending_store_ptr
-
-    _pending_store_ptr = int(store_ptr)
-
-    if GSA_INSTANCE is not None:
-        GSA_INSTANCE._inject_store_ptr(_pending_store_ptr)
 
 
 ReqType = Union[str, int]
@@ -661,6 +650,11 @@ class GSA(UcmSparseBase):
         self.indexer_scale_dim = 1
         self.is_prefetch_token = False
         self.prefetch_space_token = PREFETCH_SPACE
+
+        if IS_INDEXER_OFFLOAD:
+            self.indexer_last_query = None
+            self.indexer_last_weight = None
+
         self.init_gsa_metadata(vllm_config)
         self.swap_index = []
         self.prefetch_topk = []
@@ -673,9 +667,6 @@ class GSA(UcmSparseBase):
         self.indexer_k_cache_sparse = [None] * self.layer_num
         if self.rank == 0:
             self.indexer_cpu_shared_pool = GSASharedCPUPool(self.indexer_sparse_num_all)
-        if IS_INDEXER_OFFLOAD:
-            self.indexer_last_query = None
-            self.indexer_last_weight = None
 
     def _init_prefetch_buffers(self, vllm_config: VllmConfig):
         dump_max_num = math.ceil(self.max_num_scheduled_tokens / self.block_size) * 2
@@ -1021,7 +1012,7 @@ class GSA(UcmSparseBase):
                 + self.indexer_cache_preempt_i_offset * s
                 for s in pool_slots
             ]
-            self.prefetch_engine.prefetch_engine_c.set_last_indexer_blocks(
+            self.prefetch_engine.prefetch_engine_c.set_last_indexer_block(
                 req_id, block_idxs, i_refs
             )
 
@@ -2380,8 +2371,8 @@ class GSA(UcmSparseBase):
         self._ensure_store_injected()
         for req_id in scheduler_output.scheduled_cached_reqs.resumed_req_ids:
             self._load_kv_dram(req_id)
-        for req_id in scheduler_output.scheduled_new_reqs:
-            self._load_kv_dram(req_id)
+        for new_req in scheduler_output.scheduled_new_reqs:
+            self._load_kv_dram(new_req.req_id)
 
         prefetch_trigger_output = 1 if self.is_pd_mix else 0
         num_output_one = [
@@ -2662,8 +2653,10 @@ class GSA(UcmSparseBase):
                 device=torch.device("cpu"),
                 pin_memory=True,
             )
-            self.indexer_cache_preempt_ptr = int(self.indexer_cache_preempt.data_ptr())
-            self.indexer_cache_preempt_offset = (
+            self.indexer_cache_preempt_i_ptr = int(
+                self.indexer_cache_preempt.data_ptr()
+            )
+            self.indexer_cache_preempt_i_offset = (
                 self.layer_num
                 * self.block_size
                 * 128
