@@ -407,7 +407,7 @@ inline void* GetOpApiFuncAddr(const char* apiName)
 class Logger;  // forward decl (kvcache_log.h is included by the .cpp)
 int32_t CopyTrans(void** host_ptrs_addr, void** device_ptrs_addr, size_t size_bytes, size_t number,
                   std::string type, void* stream_);
-void ObtainStream(void** outputStream, void** outputContext, int32_t deviceID, int32_t mStreamNum);
+int32_t ObtainStream(void** outputStream, void** outputContext, int32_t deviceID, int32_t mStreamNum);
 int32_t Synchronize(void* context, void* stream, int streamNum, Logger& mLogger);
 bool IsStreamIdle(void* stream);
 void DestroyStream(void* stream, void* context, int32_t deviceID, int32_t mStreamNum);

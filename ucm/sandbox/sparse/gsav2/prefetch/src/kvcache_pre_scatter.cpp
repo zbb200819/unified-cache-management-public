@@ -209,8 +209,11 @@ int GSAPrefetchEngineC::CallPrefetchProcess(const TaskInfo& taskInfo, ThreadInfo
     std::lock_guard<std::mutex> lock(mMutexUseToken);
     auto start = std::chrono::high_resolution_clock::now();
     uint32_t oneRunBsLen = taskInfo.reqIdList.size();
+    int ret = 0;
 
-    PreparePrefetchResults(taskInfo);
+    // 判别式：预取结果准备失败（已打日志、结果清零、版本照常递增）时记录返回码，
+    // 后续层循环仍需完成以维持跨 rank 协议完整（空结果天然走零加载路径）。
+    if (PreparePrefetchResults(taskInfo) != 0) { ret = -1; }
 
     mLogger.log(LogLevel::INFO,
                 "Decode step: %u, |KVCache Prefetch| "
@@ -225,7 +228,10 @@ int GSAPrefetchEngineC::CallPrefetchProcess(const TaskInfo& taskInfo, ThreadInfo
     for (int layerID = 0; layerID < mLayerNum; layerID++) {
         MergeAndCopyPrefetchLayer(taskInfo, threadInfo, layerID, timing);
     }
-    Synchronize(threadInfo.context_, threadInfo.stream_, mStreamNum, mLogger);
+    // 收尾同步失败打日志（Synchronize 内部已记录）并上抛返回码，进程不终止。
+    if (Synchronize(threadInfo.context_, threadInfo.stream_, mStreamNum, mLogger) != 0) {
+        ret = -1;
+    }
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     mLogger.log(LogLevel::INFO,
@@ -235,10 +241,10 @@ int GSAPrefetchEngineC::CallPrefetchProcess(const TaskInfo& taskInfo, ThreadInfo
                 "sync time: %lu, h2d time: %lu, ops time: %lu\n",
                 mDecodeStep, duration.count(), managerDuration.count(), timing.cpuMove,
                 timing.memcpy, timing.sync, timing.h2d, timing.ops);
-    return 0;
+    return ret;
 }
 
-void GSAPrefetchEngineC::PreparePrefetchResults(const TaskInfo& taskInfo)
+int GSAPrefetchEngineC::PreparePrefetchResults(const TaskInfo& taskInfo)
 {
     uint32_t oneRunBsLen = taskInfo.reqIdList.size();
     PrefetchShmLayout layout{};
@@ -249,86 +255,223 @@ void GSAPrefetchEngineC::PreparePrefetchResults(const TaskInfo& taskInfo)
     layout.loadSlotSize = layout.countSize + layout.maxLoadNum * sizeof(int);
     layout.totalSize = layout.missTokenSize + layout.loadSlotSize + mSpaTopkLen * sizeof(int);
     uint32_t* versionPtr = static_cast<uint32_t*>(mPrefetchResultShm);
-
     if (mRank == 0) {
-#pragma omp parallel for num_threads(mThreadNum) proc_bind(master)
-        for (int layerID = 0; layerID < mTopkIndexerNum; layerID++) {
-            for (size_t i = 0; i < oneRunBsLen; i++) {
-                ProcessPrefetchRequest(taskInfo, i, layerID, layout);
-            }
-        }
-        __atomic_store_n(versionPtr, mPrefetchResultVersion.fetch_add(1) + 1, __ATOMIC_RELEASE);
-        mLogger.log(LogLevel::INFO, "Rank %d synced upload version: %u, %u\n", mRank,
-                    mPrefetchResultVersion.load(), __atomic_load_n(versionPtr, __ATOMIC_ACQUIRE));
-    } else {
-        uint32_t expectedVersion = mPrefetchResultVersion.load() + 1;
-        int retryCount = 0;
-        while (__atomic_load_n(versionPtr, __ATOMIC_ACQUIRE) != expectedVersion &&
-               retryCount < 10000) {
-            if (mKVPackControl->fatalError.load(std::memory_order_acquire) != 0) {
-                KVPackAbort(mKVPackControl);
-            }
-            usleep(100);
-            retryCount++;
-        }
-        if (retryCount >= 10000) {
-            mLogger.log(LogLevel::ERROR,
-                        "Rank %d timeout waiting for prefetch result, version: %u, expected: %u\n",
-                        mRank, __atomic_load_n(versionPtr, __ATOMIC_ACQUIRE), expectedVersion);
-            KVPackAbort(mKVPackControl);
-        }
-        ReadPrefetchResults(taskInfo, layout);
-        mPrefetchResultVersion.store(expectedVersion);
-        mLogger.log(LogLevel::INFO, "Rank %d synced prefetch results, version: %u\n", mRank,
-                    __atomic_load_n(versionPtr, __ATOMIC_ACQUIRE));
+        return PublishPrefetchResultsRank0(taskInfo, oneRunBsLen, layout, versionPtr);
     }
+    return SyncPrefetchResultsFromRank0(taskInfo, layout, versionPtr);
 }
 
-void GSAPrefetchEngineC::ProcessPrefetchRequest(const TaskInfo& taskInfo, size_t i, int layerID,
-                                                const PrefetchShmLayout& layout)
+int GSAPrefetchEngineC::PublishPrefetchResultsRank0(const TaskInfo& taskInfo,
+                                                    uint32_t oneRunBsLen,
+                                                    const PrefetchShmLayout& layout,
+                                                    uint32_t* versionPtr)
+{
+    /* 提前识别：进入并行域前完成张量合法性判别并一次性提取只读视图，
+     * OMP 域内不再触碰任何 torch API（消除 data_ptr dtype 抛异常、下标
+     * 越界抛 IndexError 与张量切片堆分配三类异常/终止源）。 */
+    PrefetchTopkView topkView;
+    if (AcquirePrefetchTopkBase(taskInfo, oneRunBsLen, topkView) != 0) {
+        ZeroFillAllPrefetchResults(oneRunBsLen, layout, versionPtr);
+        return -1;
+    }
+    int failedCount = 0;
+#pragma omp parallel for num_threads(mThreadNum) proc_bind(master) reduction(+ : failedCount)
+    for (int layerID = 0; layerID < mTopkIndexerNum; layerID++) {
+        for (size_t i = 0; i < oneRunBsLen; i++) {
+            if (ProcessPrefetchRequest(taskInfo, topkView, i, layerID, layout) != 0) {
+                failedCount += 1;
+            }
+        }
+    }
+    __atomic_store_n(versionPtr, mPrefetchResultVersion.fetch_add(1) + 1, __ATOMIC_RELEASE);
+    mLogger.log(LogLevel::INFO, "Rank %d synced upload version: %u, %u\n", mRank,
+                mPrefetchResultVersion.load(), __atomic_load_n(versionPtr, __ATOMIC_ACQUIRE));
+    if (failedCount > 0) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| %d (req,layer) results skipped "
+                    "this step\n",
+                    mDecodeStep, failedCount);
+        return -1;
+    }
+    return 0;
+}
+
+int GSAPrefetchEngineC::AcquirePrefetchTopkBase(const TaskInfo& taskInfo, uint32_t oneRunBsLen,
+                                                PrefetchTopkView& topkView)
+{
+    const torch::Tensor& topkList = taskInfo.topkList;
+    const bool topkDefined = topkList.defined();
+    const int64_t topkDim = topkDefined ? topkList.dim() : 0;
+    /* mMaxBs 同时界定 shm 结果区容量（mPrefetchResultShmSize），
+     * 越界批次必须在写 shm 前拒绝。 */
+    const bool topkOk =
+        topkDefined && topkDim >= 2 &&
+        static_cast<int64_t>(topkList.size(0)) >= static_cast<int64_t>(mTopkIndexerNum) &&
+        static_cast<int64_t>(topkList.size(1)) >= static_cast<int64_t>(oneRunBsLen) &&
+        taskInfo.topkLenList.size() >= static_cast<size_t>(oneRunBsLen) &&
+        static_cast<uint64_t>(oneRunBsLen) <= static_cast<uint64_t>(mMaxBs) &&
+        topkList.scalar_type() == torch::kInt;
+    if (!topkOk) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| invalid topkList tensor: "
+                    "defined=%d dim=%lld size0=%lld size1=%lld dtype=%d bsLen=%u maxBs=%zu "
+                    "topkIndexerNum=%d\n",
+                    mDecodeStep, topkDefined ? 1 : 0, static_cast<long long>(topkDim),
+                    topkDim >= 1 ? static_cast<long long>(topkList.size(0)) : -1LL,
+                    topkDim >= 2 ? static_cast<long long>(topkList.size(1)) : -1LL,
+                    topkDefined ? static_cast<int>(topkList.scalar_type()) : -1, oneRunBsLen,
+                    mMaxBs, mTopkIndexerNum);
+        return -1;
+    }
+    topkView.base = topkList.data_ptr<int>();
+    topkView.stride0 = topkList.stride(0);
+    topkView.stride1 = topkList.stride(1);
+    topkView.numel = topkList.numel();
+    return 0;
+}
+
+void GSAPrefetchEngineC::ZeroFillAllPrefetchResults(uint32_t oneRunBsLen,
+                                                    const PrefetchShmLayout& layout,
+                                                    uint32_t* versionPtr)
+{
+    std::cerr << "|KVCache Prefetch| [ERROR] PreparePrefetchResults: invalid topkList, "
+                 "results zero-filled for this step\n";
+    if (mPrefetchResultShm == nullptr) {
+        return;
+    }
+    /* 结果区整体清零 = 每请求零 miss，消费侧按空结果降级；
+     * 版本照常递增，保住 rank!=0 的等待协议（否则对端超时 abort）。 */
+    std::memset(static_cast<uint8_t*>(mPrefetchResultShm) + layout.versionSize, 0,
+                static_cast<size_t>(oneRunBsLen) * static_cast<size_t>(mTopkIndexerNum) *
+                    layout.totalSize);
+    __atomic_store_n(versionPtr, mPrefetchResultVersion.fetch_add(1) + 1, __ATOMIC_RELEASE);
+}
+
+int GSAPrefetchEngineC::SyncPrefetchResultsFromRank0(const TaskInfo& taskInfo,
+                                                     const PrefetchShmLayout& layout,
+                                                     uint32_t* versionPtr)
+{
+    uint32_t expectedVersion = mPrefetchResultVersion.load() + 1;
+    int retryCount = 0;
+    while (__atomic_load_n(versionPtr, __ATOMIC_ACQUIRE) != expectedVersion &&
+           retryCount < 10000) {
+        if (mKVPackControl->fatalError.load(std::memory_order_acquire) != 0) {
+            KVPackAbort(mKVPackControl);
+        }
+        usleep(100);
+        retryCount++;
+    }
+    if (retryCount >= 10000) {
+        mLogger.log(LogLevel::ERROR,
+                    "Rank %d timeout waiting for prefetch result, version: %u, expected: %u\n",
+                    mRank, __atomic_load_n(versionPtr, __ATOMIC_ACQUIRE), expectedVersion);
+        KVPackAbort(mKVPackControl);
+    }
+    ReadPrefetchResults(taskInfo, layout);
+    mPrefetchResultVersion.store(expectedVersion);
+    mLogger.log(LogLevel::INFO, "Rank %d synced prefetch results, version: %u\n", mRank,
+                __atomic_load_n(versionPtr, __ATOMIC_ACQUIRE));
+    return 0;
+}
+
+int GSAPrefetchEngineC::ProcessPrefetchRequest(const TaskInfo& taskInfo,
+                                               const PrefetchTopkView& topkView, size_t i,
+                                               int layerID, const PrefetchShmLayout& layout)
 {
     std::string oneReqID = taskInfo.reqIdList[i];
     int oneTopkLen = taskInfo.topkLenList[i];
     if (oneTopkLen <= 0) {
         mLogger.log(LogLevel::ERROR,
                     "Decode step: %u, |KVCache Prefetch| topk len is zero: "
-                    "%d for req_id: %s, rank: %d, taskID: %d, i: %d\n",
+                    "%d for req_id: %s, rank: %d, taskID: %d, i: %zu\n",
                     mDecodeStep, oneTopkLen, oneReqID.c_str(), mRank, taskInfo.taskID, i);
-        return;
+        // 清零槽位避免消费侧读到上一 step 的陈旧结果（零 miss = 该请求本步无加载）。
+        ClearPrefetchResultSlot(i, layerID, layout);
+        return 0;
     }
-    int* topkPtr = taskInfo.topkList[layerID][i].data_ptr<int>();
+    /* 平坦读边界：topkLen 以外的长度越界一律拒绝（防 OOB 读与脏数据扩散）。 */
+    const int64_t topkOffset = static_cast<int64_t>(layerID) * topkView.stride0 +
+                               static_cast<int64_t>(i) * topkView.stride1;
+    if (topkView.base == nullptr ||
+        topkOffset + static_cast<int64_t>(oneTopkLen) > topkView.numel) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| topk view out of range: "
+                    "req_id: %s, layerID: %d, i: %zu, offset: %lld, topkLen: %d, numel: %lld\n",
+                    mDecodeStep, oneReqID.c_str(), layerID, i, static_cast<long long>(topkOffset),
+                    oneTopkLen, static_cast<long long>(topkView.numel));
+        ClearPrefetchResultSlot(i, layerID, layout);
+        return -1;
+    }
+    const int* topkPtr = topkView.base + topkOffset;
     std::vector<int> oneTopkList(topkPtr, topkPtr + oneTopkLen);
-    mMissGlobalToken[oneReqID][layerID].clear();
-    mLoadSlot[oneReqID][layerID].clear();
     std::vector<int> useBlockTable;
-    if (mOpenIndexerOffload && mIsIndexerOffload[i]) {
-        TokenIndexMapInter(oneTopkList, i, layerID, oneTopkLen, oneReqID);
+    if (!RunHbmTopkLookup(oneReqID, oneTopkList, layerID, static_cast<int>(i), oneTopkLen,
+                          useBlockTable)) {
+        ClearPrefetchResultSlot(i, layerID, layout);
+        return -1;
     }
-
-    mHBMMangers[oneReqID][layerID]->processTopkWithDebug(oneTopkList, useBlockTable,
-                                                         mMissGlobalToken[oneReqID][layerID],
-                                                         mLoadSlot[oneReqID][layerID], mLogger);
-    if (mMissGlobalToken[oneReqID][layerID].size() != mLoadSlot[oneReqID][layerID].size() ||
-        mMissGlobalToken[oneReqID][layerID].size() > static_cast<size_t>(mMaxLoadNum)) {
-        KVPackAbort(mKVPackControl);
-    }
-    mAvgHitRate[layerID].emplace_back(mHBMMangers[oneReqID][layerID]->mHitRate);
-    mLogger.log(LogLevel::DEBUG,
-                "Decode step: %u, |KVCache Prefetch| expand topk len: "
-                "%lu and hit rate %f and average hit rate: %f, for layer: %d req_id: %s,  \n",
-                mDecodeStep, oneTopkList.size(), mHBMMangers[oneReqID][layerID]->mHitRate,
-                average(mAvgHitRate[layerID]), layerID, oneReqID.c_str());
     if (mSpaTopkLen != useBlockTable.size()) {
         mLogger.log(LogLevel::ERROR,
                     "[ERROR] mAllTopkIndicesTensor greater than mSpaTopkLen !!! layer_id %d, "
                     "useBlockTable size %d\n",
                     layerID, mSpaTopkLen, useBlockTable.size());
         KVPackAbort(mKVPackControl);
-    } else {
-        std::memcpy(mAllTopkIndicesTensor[oneReqID][layerID].data_ptr(), useBlockTable.data(),
-                    useBlockTable.size() * sizeof(int));
+    }
+    if (CopyUseBlockTableToIndicesTensor(oneReqID, layerID, useBlockTable) != 0) {
+        ClearPrefetchResultSlot(i, layerID, layout);
+        return -1;
     }
     WritePrefetchResult(oneReqID, i, layerID, useBlockTable, layout);
+    return 0;
+}
+
+HBMManager* GSAPrefetchEngineC::FindReqLayerManager(const std::string& reqID, int layerID)
+{
+    /* find 判别：杜绝 map operator[] 在 OMP 失败路径上的并发插入竞态；
+     * managers 与 miss/loadSlot 容器在 SetTokensMap 中同步扩容，命中即全部就绪。 */
+    auto managersIt = mHBMMangers.find(reqID);
+    if (managersIt == mHBMMangers.end() ||
+        static_cast<size_t>(layerID) >= managersIt->second.size() ||
+        !managersIt->second[static_cast<size_t>(layerID)]) {
+        return nullptr;
+    }
+    return managersIt->second[static_cast<size_t>(layerID)].get();
+}
+
+bool GSAPrefetchEngineC::RunHbmTopkLookup(const std::string& oneReqID,
+                                           std::vector<int>& oneTopkList, int layerID,
+                                           int bsIndex, int oneTopkLen,
+                                           std::vector<int>& useBlockTable)
+{
+    HBMManager* manager = FindReqLayerManager(oneReqID, layerID);
+    if (manager == nullptr) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| HBM manager is not initialized: "
+                    "req_id: %s, layerID: %d, rank: %d, bsIndex: %d\n",
+                    mDecodeStep, oneReqID.c_str(), layerID, mRank, bsIndex);
+        return false;
+    }
+    mMissGlobalToken[oneReqID][layerID].clear();
+    mLoadSlot[oneReqID][layerID].clear();
+    if (mOpenIndexerOffload && static_cast<size_t>(bsIndex) < mIsIndexerOffload.size() &&
+        mIsIndexerOffload[static_cast<size_t>(bsIndex)]) {
+        TokenIndexMapInter(oneTopkList, bsIndex, layerID, oneTopkLen, oneReqID);
+    }
+    manager->processTopkWithDebug(oneTopkList, useBlockTable, mMissGlobalToken[oneReqID][layerID],
+                                  mLoadSlot[oneReqID][layerID], mLogger);
+    if (mMissGlobalToken[oneReqID][layerID].size() != mLoadSlot[oneReqID][layerID].size() ||
+        mMissGlobalToken[oneReqID][layerID].size() > static_cast<size_t>(mMaxLoadNum)) {
+        KVPackAbort(mKVPackControl);
+    }
+    mAvgHitRate[layerID].emplace_back(manager->mHitRate);
+    const float avgHitRate =
+        mAvgHitRate[layerID].empty() ? 0.0f : average(mAvgHitRate[layerID]);
+    mLogger.log(LogLevel::DEBUG,
+                "Decode step: %u, |KVCache Prefetch| expand topk len: "
+                "%lu and hit rate %f and average hit rate: %f, for layer: %d req_id: %s,  \n",
+                mDecodeStep, oneTopkList.size(), manager->mHitRate, avgHitRate, layerID,
+                oneReqID.c_str());
+    return true;
 }
 
 void GSAPrefetchEngineC::WritePrefetchResult(const std::string& oneReqID, size_t i, int layerID,
@@ -356,6 +499,17 @@ void GSAPrefetchEngineC::WritePrefetchResult(const std::string& oneReqID, size_t
     }
     std::memcpy(shmBase + layout.missTokenSize + layout.loadSlotSize, useBlockTable.data(),
                 useBlockTable.size() * sizeof(int));
+}
+
+void GSAPrefetchEngineC::ClearPrefetchResultSlot(size_t i, int layerID,
+                                                 const PrefetchShmLayout& layout)
+{
+    if (mPrefetchResultShm == nullptr) { return; }
+    const size_t slotOffset = layout.versionSize +
+                              (i * static_cast<size_t>(mTopkIndexerNum) +
+                               static_cast<size_t>(layerID)) *
+                                  layout.totalSize;
+    std::memset(static_cast<uint8_t*>(mPrefetchResultShm) + slotOffset, 0, layout.totalSize);
 }
 
 void GSAPrefetchEngineC::ReadPrefetchResults(const TaskInfo& taskInfo,
@@ -535,6 +689,7 @@ int GSAPrefetchEngineC::IndexerLoadProcess(const TaskInfo& taskInfo, ThreadInfo&
     std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     auto start = std::chrono::high_resolution_clock::now();
     uint32_t runBsLen = taskInfo.reqIdList.size();
+    int ret = 0;
     allNeedLoadBlock.clear();
     allMissIdxs.clear();
     for (size_t i = 0; i < runBsLen; i++) {
@@ -547,8 +702,12 @@ int GSAPrefetchEngineC::IndexerLoadProcess(const TaskInfo& taskInfo, ThreadInfo&
         }
         allMissIdxs.insert({taskInfo.reqIdList[i], std::vector<std::vector<int>>(mLayerNum)});
         allNeedLoadBlock.insert({taskInfo.reqIdList[i], std::vector<std::vector<int>>(mLayerNum)});
-        RunOneBsPrefetch(taskInfo.reqIdList[i], taskInfo.topkLenList[i], i,
-                         taskInfo.indexerTopkList[i]);
+        // 判别式：单请求 topk 张量非法（已打日志）时记失败返回码并跳过，其余请求继续。
+        if (RunOneBsPrefetch(taskInfo.reqIdList[i], taskInfo.topkLenList[i], i,
+                             taskInfo.indexerTopkList[i]) != 0) {
+            ret = -1;
+            continue;
+        }
     }
     UCMIndexerLoadAsync(threadInfo.context_, threadInfo.stream_);
     auto end = std::chrono::high_resolution_clock::now();
@@ -556,7 +715,7 @@ int GSAPrefetchEngineC::IndexerLoadProcess(const TaskInfo& taskInfo, ThreadInfo&
     mLogger.log(LogLevel::INFO,
                 "Decode step: %u, |KVCache Prefetch| Finish indexer load cost: %lu\n", mDecodeStep,
                 duration.count());
-    return 0;
+    return ret;
 }
 
 void GSAPrefetchEngineC::DealLessPrefetchBlock(std::unordered_set<int>& hitBlocks,
@@ -576,10 +735,17 @@ void GSAPrefetchEngineC::DealLessPrefetchBlock(std::unordered_set<int>& hitBlock
                 hitBlocks.size());
 }
 
-void GSAPrefetchEngineC::RunOneBsPrefetch(std::string reqID, int topkLen, int topkIndex,
-                                          const torch::Tensor& topkList)
+int GSAPrefetchEngineC::RunOneBsPrefetch(std::string reqID, int topkLen, int topkIndex,
+                                         const torch::Tensor& topkList)
 {
-    if (!mOpenIndexerOffload) { return; }
+    if (!mOpenIndexerOffload) { return 0; }
+    /* 提前识别：进入并行域前完成张量判别并一次性提取只读视图（含读取
+     * 范围校验），OMP 域内不再触碰任何 torch API（消除 data_ptr dtype
+     * 抛异常、下标越界抛 IndexError 与张量切片堆分配三类异常/终止源）。 */
+    PrefetchTopkView topkView;
+    if (AcquireIndexerTopkBase(topkList, reqID, topkLen, topkView) != 0) {
+        return -1;
+    }
 #pragma omp parallel for num_threads(4) proc_bind(master)
     for (int i = 0; i < mLayerNum; i++) {
         std::unordered_set<int> hitBlocks;
@@ -589,7 +755,7 @@ void GSAPrefetchEngineC::RunOneBsPrefetch(std::string reqID, int topkLen, int to
         oneBsInfo.topkLen = topkLen;
         oneBsInfo.reqID = reqID;
         oneBsInfo.layerID = i;
-        int* topk_ptr = topkList[i].data_ptr<int>();
+        const int* topk_ptr = topkView.base + static_cast<int64_t>(i) * topkView.stride0;
         std::vector<int> oneTopkList(topk_ptr, topk_ptr + topkLen);
         GetHitAndMissBlock(oneBsInfo, oneTopkList, hitBlocks, hitBlocksIdx, missIdxs);
         if (missIdxs.size() != 0 && hitBlocksIdx.size() < (uint32_t)topkLen) {
@@ -609,6 +775,43 @@ void GSAPrefetchEngineC::RunOneBsPrefetch(std::string reqID, int topkLen, int to
         }
         FinishOneLayerPrefetch(reqID, i, hitBlocksIdx, missIdxs);
     }
+    return 0;
+}
+
+int GSAPrefetchEngineC::AcquireIndexerTopkBase(const torch::Tensor& topkList,
+                                               const std::string& reqID, int topkLen,
+                                               PrefetchTopkView& topkView)
+{
+    const bool topkDefined = topkList.defined();
+    const int64_t topkDim = topkDefined ? topkList.dim() : 0;
+    bool topkOk = topkDefined && topkDim >= 1 &&
+                  static_cast<int64_t>(topkList.size(0)) >= static_cast<int64_t>(mLayerNum) &&
+                  topkList.scalar_type() == torch::kInt;
+    if (topkOk) {
+        /* 平坦读边界：末层末行读取范围不得超过张量元素数（防 OOB 读）。 */
+        const int64_t stride0 = topkList.stride(0);
+        topkOk = topkLen >= 0 && static_cast<int64_t>(mLayerNum) - 1 >= 0 &&
+                 (static_cast<int64_t>(mLayerNum) - 1) * stride0 +
+                         static_cast<int64_t>(topkLen) <=
+                     topkList.numel();
+    }
+    if (!topkOk) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| invalid indexer topkList tensor: "
+                    "reqID=%s defined=%d dim=%lld size0=%lld dtype=%d layerNum=%d topkLen=%d\n",
+                    mDecodeStep, reqID.c_str(), topkDefined ? 1 : 0, static_cast<long long>(topkDim),
+                    topkDim >= 1 ? static_cast<long long>(topkList.size(0)) : -1LL,
+                    topkDefined ? static_cast<int>(topkList.scalar_type()) : -1, mLayerNum,
+                    topkLen);
+        std::cerr << "|KVCache Prefetch| [ERROR] RunOneBsPrefetch: invalid indexer topkList, "
+                     "layer run skipped, reqID="
+                  << reqID << std::endl;
+        return -1;
+    }
+    topkView.base = topkList.data_ptr<int>();
+    topkView.stride0 = topkList.stride(0);
+    topkView.numel = topkList.numel();
+    return 0;
 }
 
 void GSAPrefetchEngineC::FinishOneLayerPrefetch(const std::string& reqID, int layerID,
@@ -767,6 +970,16 @@ bool GSAPrefetchEngineC::ProcessIndexerInitLoadLayer(std::vector<std::vector<int
                                                      const std::string& reqID, int layerID,
                                                      int number)
 {
+    if (static_cast<size_t>(layerID) >= mIndexerPtr.size() ||
+        static_cast<size_t>(layerID) >= blockTable.size() ||
+        static_cast<size_t>(layerID) >= slabIdx.size()) {
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] IndexerInitLoad layerID out of range: reqID=%s layerID=%d "
+                    "indexerPtrSize=%zu blockTableSize=%zu slabIdxSize=%zu\n",
+                    reqID.c_str(), layerID, mIndexerPtr.size(), blockTable.size(),
+                    slabIdx.size());
+        return false;
+    }
     auto* indexerBaseAddr = reinterpret_cast<std::uint8_t*>(mIndexerPtr[layerID]);
     if (indexerBaseAddr == nullptr) {
         mLogger.log(LogLevel::ERROR,
@@ -774,12 +987,41 @@ bool GSAPrefetchEngineC::ProcessIndexerInitLoadLayer(std::vector<std::vector<int
                     layerID);
         return false;
     }
-    const auto& hashVec = mAllBlocksHash.at(reqID);
+    auto hashIt = mAllBlocksHash.find(reqID);
+    if (hashIt == mAllBlocksHash.end()) {
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] IndexerInitLoad reqID not found in mAllBlocksHash: "
+                    "reqID=%s layerID=%d\n",
+                    reqID.c_str(), layerID);
+        return false;
+    }
     UC::Detail::TaskDesc task;
     task.reserve(number);
     task.brief = "UCMIndexerInitLoad";
+    if (!BuildIndexerInitLoadShards(blockTable, slabIdx, reqID, layerID, number, indexerBaseAddr,
+                                    hashIt->second, task)) {
+        return false;
+    }
+    return SubmitIndexerInitLoadTask(task, reqID, layerID);
+}
+
+bool GSAPrefetchEngineC::BuildIndexerInitLoadShards(std::vector<std::vector<int>>& blockTable,
+                                                    std::vector<std::vector<int>>& slabIdx,
+                                                    const std::string& reqID, int layerID,
+                                                    int number, std::uint8_t* indexerBaseAddr,
+                                                    const std::vector<BlockId>& hashVec,
+                                                    UC::Detail::TaskDesc& task)
+{
     size_t shardIndex = static_cast<size_t>(layerID);
     for (int i = 0; i < number; i++) {
+        if (static_cast<size_t>(i) >= blockTable[layerID].size() ||
+            static_cast<size_t>(i) >= slabIdx[layerID].size()) {
+            mLogger.log(LogLevel::ERROR,
+                        "[ERROR] IndexerInitLoad row too short: reqID=%s layerID=%d i=%d "
+                        "blockRow=%zu slabRow=%zu\n",
+                        reqID.c_str(), layerID, i, blockTable[layerID].size(), slabIdx[layerID].size());
+            continue;
+        }
         int deviceBlockId = blockTable[layerID][i];
         int blockIdx = slabIdx[layerID][i];
         if (deviceBlockId < 0 || deviceBlockId >= mDeviceIndexerLen) {
@@ -797,23 +1039,22 @@ bool GSAPrefetchEngineC::ProcessIndexerInitLoadLayer(std::vector<std::vector<int
             }
             continue;
         }
-        if (blockIdx < 0 || static_cast<size_t>(blockIdx) >= hashVec.size()) {
+        if (blockIdx < 0) {
             mLogger.log(LogLevel::ERROR,
                         "[ERROR] IndexerInitLoad blockIdx out of range, "
                         "reqID=%s layerID=%d blockIdx=%d hashNum=%zu\n",
                         reqID.c_str(), layerID, blockIdx, hashVec.size());
             continue;
         }
-        /* One address per store tensor slot: the store's H2D path walks
-         * tensorSizes_ and reads addrs[i] for every slot, so pad the vector
-         * to the full slot count with the indexer address at
+        /* One address per store tensor slot: the store's H2D path reads addrs[i]
+         * for every slot, so pad to the full count with the indexer address at
          * kIndexerTensorIndex (ghost slots stay nullptr). */
         std::vector<void*> tensorAddrs(kStoreTensorCount, nullptr);
         tensorAddrs[kIndexerTensorIndex] = indexerAddr;
-        task.emplace_back(UC::Detail::Shard{hashVec[blockIdx], shardIndex,
+        task.emplace_back(UC::Detail::Shard{hashVec[static_cast<size_t>(blockIdx)], shardIndex,
                                             std::move(tensorAddrs)});
     }
-    return SubmitIndexerInitLoadTask(task, reqID, layerID);
+    return true;
 }
 
 bool GSAPrefetchEngineC::SubmitIndexerInitLoadTask(UC::Detail::TaskDesc& task,
@@ -1204,6 +1445,16 @@ void GSAPrefetchEngineC::SubmitTask(std::vector<int>& topkLensInput, std::vector
                 mDecodeStep, reqIDList.size());
     auto start = std::chrono::high_resolution_clock::now();
     mDecodeStep = stepTime;
+    // 提前识别：set_kv_buffer 未完成（KVPack 控制块为空）时提交任务会在 worker 路径
+    // 空指针崩溃，这里直接打错误日志并跳过本步提交（running 标志保持未置位）。
+    if (mKVPackControl == nullptr) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| set_kv_buffer not done yet, "
+                    "skip prefetch task\n",
+                    mDecodeStep);
+        std::cerr << "|KVCache Prefetch| [ERROR] set_kv_buffer not done, prefetch task skipped\n";
+        return;
+    }
     TaskInfo inputInfo(totalTaskNum, -1, topkLists, topkLensInput, bsIndexInput, reqIDList);
     mIsPrefetchRunning.store(true, std::memory_order_release);
     mIsIndexerOffload = isIndexerOffload;

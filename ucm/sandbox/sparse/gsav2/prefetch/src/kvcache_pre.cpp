@@ -32,7 +32,6 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
-#include <future>
 #include <kvcache_log.h>
 #include <map>
 #include <mutex>
@@ -284,19 +283,28 @@ void MultiBSThreadFun(const TaskInfo& taskInfo, ThreadInfo& threadInfo)
 {
     GSAPrefetchEngineC* engine = static_cast<GSAPrefetchEngineC*>(threadInfo.args_);
     int ret = engine->CallPrefetchProcess(taskInfo, threadInfo);
+    if (ret != 0) {
+        engine->mLogger.log(LogLevel::ERROR,
+                            "|KVCache Prefetch| [ERROR] MultiBSThreadFun task %d failed, ret=%d\n",
+                            taskInfo.taskID, ret);
+    }
     engine->mUpdateReqMutex.lock();
     engine->DelReqIDRun();
     engine->mUpdateReqMutex.unlock();
     engine->mIsPrefetchRunning.store(false, std::memory_order_release);
-    if (ret == 0) { return; }
 }
 
 void MultiBSThreadFunIndexer(const TaskInfo& taskInfo, ThreadInfo& threadInfo)
 {
     GSAPrefetchEngineC* engine = static_cast<GSAPrefetchEngineC*>(threadInfo.args_);
     int ret = engine->IndexerLoadProcess(taskInfo, threadInfo);
+    if (ret != 0) {
+        engine->mLogger.log(LogLevel::ERROR,
+                            "|KVCache Prefetch| [ERROR] MultiBSThreadFunIndexer task %d failed, "
+                            "ret=%d\n",
+                            taskInfo.taskID, ret);
+    }
     engine->mIsIndexerLoadRunning.store(false, std::memory_order_release);
-    if (ret == 0) { return; }
 }
 
 enum class ModelInfoIndex {
@@ -528,20 +536,13 @@ void GSAPrefetchEngineC::InitPrefetchResultShm(std::vector<int>& modelInfo)
     } else {
         AttachPrefetchResultShm();
     }
-    if (mPrefetchResultShm == nullptr) { KVPackAbort(nullptr); }
+    if (mPrefetchResultShm == nullptr) {
+        mLogger.log(LogLevel::ERROR,
+                    "|KVCache Prefetch| prefetch result shm is nullptr, cannot continue\n");
+        KVPackAbort(nullptr);
+    }
     if (mRank == 0) {
         __atomic_store_n(static_cast<uint32_t*>(mPrefetchResultShm), uint32_t(0), __ATOMIC_RELEASE);
-    }
-}
-
-void GSAPrefetchEngineC::CheckInputIndex(uint32_t maxLen, uint32_t index)
-{
-    if (index >= maxLen) {
-        mLogger.log(LogLevel::ERROR,
-                    "Decode step: %u, |KVCache Prefetch| index error! index: %u, maxLen: %u\n",
-                    mDecodeStep, index, maxLen);
-        throw std::out_of_range("KVCache Prefetch: index " + std::to_string(index) +
-                                " out of range [0, " + std::to_string(maxLen) + ")");
     }
 }
 
@@ -709,19 +710,33 @@ void GSAPrefetchEngineC::ProcessTokensMapTopk(int layerID, const std::string& re
                                               torch::Tensor& qTopkTensor, int maxIdx,
                                               size_t sparseSeqLen)
 {
-    const int qTopkNum = static_cast<int>(qTopkTensor.sizes()[0]);
-    const int topkSize = static_cast<int>(qTopkTensor.sizes()[2]);
-    auto& reqManagers = mHBMMangers[reqID];
+    /* 提前识别：循环外完成张量判别并一次性提取只读视图（含读取范围校验）。 */
+    PrefetchTopkView topkView;
+    int qTopkNum = 0;
+    int topkSize = 0;
+    if (AcquireQTopkView(qTopkTensor, reqID, layerID, topkView, qTopkNum, topkSize) != 0) {
+        return;
+    }
+    auto managersIt = mHBMMangers.find(reqID);
+    if (managersIt == mHBMMangers.end() ||
+        static_cast<size_t>(layerID) >= managersIt->second.size()) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| HBM managers not initialized, "
+                    "skip topk map: reqID=%s layerID=%d managerSize=%zu\n",
+                    mDecodeStep, reqID.c_str(), layerID,
+                    managersIt == mHBMMangers.end() ? 0 : managersIt->second.size());
+        return;
+    }
     auto& missGlobalTokens = mMissGlobalToken[reqID][layerID];
     auto& loadSlots = mLoadSlot[reqID][layerID];
-    reqManagers[layerID] = std::make_unique<HBMManager>();
-    auto& manager = *reqManagers[layerID];
+    managersIt->second[static_cast<size_t>(layerID)] = std::make_unique<HBMManager>();
+    auto& manager = *managersIt->second[static_cast<size_t>(layerID)];
     manager.init(maxIdx, sparseSeqLen, mSpaTopkLen, topkSize, mLogger);
     std::vector<int> useBlockTable;
     useBlockTable.reserve(static_cast<size_t>(mSpaTopkLen));
     std::vector<int> oneTopkList(static_cast<size_t>(topkSize));
     for (int i = 0; i < qTopkNum; ++i) {
-        const int* topkPtr = qTopkTensor[i][0].data_ptr<int>();
+        const int* topkPtr = topkView.base + static_cast<int64_t>(i) * topkView.stride0;
         std::memcpy(oneTopkList.data(), topkPtr, static_cast<size_t>(topkSize) * sizeof(int));
         missGlobalTokens.clear();
         loadSlots.clear();
@@ -734,10 +749,84 @@ void GSAPrefetchEngineC::ProcessTokensMapTopk(int layerID, const std::string& re
                     "[ERROR] mAllTopkIndicesTensor greater than mSpaTopkLen !!! "
                     "layer_id %d, mSpaTopkLen: %d, useBlockTable size: %zu\n",
                     layerID, mSpaTopkLen, useBlockTable.size());
-    } else {
-        std::memcpy(mAllTopkIndicesTensor[reqID][layerID].data_ptr(), useBlockTable.data(),
-                    useBlockTable.size() * sizeof(int));
+        return;
     }
+    CopyUseBlockTableToIndicesTensor(reqID, layerID, useBlockTable);
+}
+
+int GSAPrefetchEngineC::AcquireQTopkView(torch::Tensor& qTopkTensor, const std::string& reqID,
+                                         int layerID, PrefetchTopkView& topkView, int& qTopkNum,
+                                         int& topkSize)
+{
+    const bool topkDefined = qTopkTensor.defined();
+    const int64_t topkDim = topkDefined ? qTopkTensor.dim() : 0;
+    if (!topkDefined || topkDim < 3 || qTopkTensor.scalar_type() != torch::kInt ||
+        static_cast<int64_t>(qTopkTensor.size(2)) <= 0) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| invalid qTopkTensor, skip topk map: "
+                    "reqID=%s layerID=%d defined=%d dim=%lld dtype=%d\n",
+                    mDecodeStep, reqID.c_str(), layerID, topkDefined ? 1 : 0,
+                    static_cast<long long>(topkDim),
+                    topkDefined ? static_cast<int>(qTopkTensor.scalar_type()) : -1);
+        return -1;
+    }
+    qTopkNum = static_cast<int>(qTopkTensor.sizes()[0]);
+    topkSize = static_cast<int>(qTopkTensor.sizes()[2]);
+    topkView.base = qTopkTensor.data_ptr<int>();
+    topkView.stride0 = qTopkTensor.stride(0);
+    topkView.numel = qTopkTensor.numel();
+    /* 平坦读边界：末行读取范围不得超过张量元素数（防 OOB 读）。 */
+    const int64_t lastOffset = static_cast<int64_t>(qTopkNum > 0 ? qTopkNum - 1 : 0) *
+                                   topkView.stride0 +
+                               static_cast<int64_t>(topkSize);
+    if (lastOffset > topkView.numel) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| qTopkTensor read out of range, "
+                    "skip topk map: reqID=%s layerID=%d qTopkNum=%d topkSize=%d "
+                    "lastOffset=%lld numel=%lld\n",
+                    mDecodeStep, reqID.c_str(), layerID, qTopkNum, topkSize,
+                    static_cast<long long>(lastOffset),
+                    static_cast<long long>(topkView.numel));
+        return -1;
+    }
+    return 0;
+}
+
+int GSAPrefetchEngineC::CopyUseBlockTableToIndicesTensor(const std::string& reqID, int layerID,
+                                                         const std::vector<int>& useBlockTable)
+{
+    /* find 判别：杜绝 map operator[] 的并发插入；张量校验失败跳过拷贝并报错。 */
+    auto tensorIt = mAllTopkIndicesTensor.find(reqID);
+    if (tensorIt == mAllTopkIndicesTensor.end() || !tensorIt->second.defined() ||
+        tensorIt->second.dim() < 1 ||
+        static_cast<int64_t>(tensorIt->second.size(0)) <= static_cast<int64_t>(layerID)) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| mAllTopkIndicesTensor invalid, "
+                    "skip copy: reqID=%s layerID=%d defined=%d dim=%lld size0=%lld\n",
+                    mDecodeStep, reqID.c_str(), layerID,
+                    tensorIt == mAllTopkIndicesTensor.end() ? 0
+                                                            : (tensorIt->second.defined() ? 1 : 0),
+                    tensorIt != mAllTopkIndicesTensor.end() && tensorIt->second.defined()
+                        ? static_cast<long long>(tensorIt->second.dim())
+                        : -1LL,
+                    tensorIt != mAllTopkIndicesTensor.end() && tensorIt->second.defined() &&
+                            tensorIt->second.dim() >= 1
+                        ? static_cast<long long>(tensorIt->second.size(0))
+                        : -1LL);
+        return -1;
+    }
+    auto dstTensor = tensorIt->second[layerID];
+    if (dstTensor.numel() < static_cast<int64_t>(useBlockTable.size())) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| mAllTopkIndicesTensor too small, "
+                    "skip copy: reqID=%s layerID=%d numel=%lld need=%zu\n",
+                    mDecodeStep, reqID.c_str(), layerID,
+                    static_cast<long long>(dstTensor.numel()), useBlockTable.size());
+        return -1;
+    }
+    std::memcpy(dstTensor.data_ptr(), useBlockTable.data(),
+                useBlockTable.size() * sizeof(int));
+    return 0;
 }
 
 void GSAPrefetchEngineC::SetIndexerMap(std::string reqID, std::vector<int>& blockTableList,
@@ -988,7 +1077,7 @@ void GSAPrefetchEngineC::LastChunkMove(int layerID, const std::string& reqID,
         return;
     }
     if (!LoadLastChunkSources(layerID, reqID, plan)) { return; }
-    Synchronize(mContext, mStream, 1, mLogger);
+    if (Synchronize(mContext, mStream, 1, mLogger) != 0) { return; }
     CopyLastChunkTokens(layerID, reqID, moveMap, sourceBlocks);
     for (size_t i = 0; i < blockCount; ++i) {
         const int hbmSlot = blockTable[i];
@@ -1009,7 +1098,7 @@ void GSAPrefetchEngineC::LastChunkMove(int layerID, const std::string& reqID,
             }
         }
     }
-    Synchronize(mContext, mStream, 1, mLogger);
+    if (Synchronize(mContext, mStream, 1, mLogger) != 0) { return; }
 }
 
 bool GSAPrefetchEngineC::PrepareLastChunkSources(int layerID, const std::string& reqID,
@@ -1043,7 +1132,13 @@ bool GSAPrefetchEngineC::BuildLastChunkSources(int layerID, const std::string& r
                                                std::vector<LastChunkSourceBlock>& sourceBlocks,
                                                UCMTokenLoadPlan& plan)
 {
-    const auto& hashVec = mAllBlocksHash.at(reqID);
+    auto hashItLastChunk = mAllBlocksHash.find(reqID);
+    if (hashItLastChunk == mAllBlocksHash.end()) {
+        mLogger.log(LogLevel::ERROR,
+                    "|LastChunkMove| Cannot find hashVec, reqID=%s\n", reqID.c_str());
+        return false;
+    }
+    const auto& hashVec = hashItLastChunk->second;
     const size_t blockSize = static_cast<size_t>(mBlockSize);
     const size_t kTokenBytes = static_cast<size_t>(mKVSizeBytesToken);
     const size_t vTokenBytes = static_cast<size_t>(mKVSizeBytesTokenRe);
@@ -1583,79 +1678,15 @@ void GSAPrefetchEngineC::UCMTensorMergeBatch(const TaskInfo& taskInfo,
                                              int layerID, int streamIdx,
                                              std::vector<uint64_t>& hbmSlotIndex)
 {
-    /* Per-request state kept alive for the whole batch: contexts hold pointers
-     * into tokenMap. */
-    struct MergeRequest {
-        std::string reqID;
-        std::map<int, std::vector<size_t>> tokenMap;
-        std::vector<UCMMergeBlockContext> contexts;
-        size_t previousLoadNum;
-    };
-
     const bool stagingOk = ValidateMergeStagingWindow(streamIdx);
     UCMTokenLoadPlan plan;
-    std::vector<MergeRequest> requests;
+    std::vector<UCMMergeRequestState> requests;
     size_t runningLoadNum = static_cast<size_t>(mLoadNum[layerID]);
     bool planBuildOk = true;
-
-    /* Phase 1: build the whole-batch plan (one shard per owned UCM block,
-     * concatenated across requests; per-shard dst = the block's landing window
-     * in the shared staging buffer). Ownership stays per-request:
-     * (blockOrdinalInRequest + requestIndex) % mTpSize == mRank. */
-    for (uint32_t requestIndex : requestIndices) {
-        if (requestIndex >= taskInfo.reqIdList.size() ||
-            requestIndex >= taskInfo.topkLenList.size()) {
-            continue;
-        }
-        const std::string& reqID = taskInfo.reqIdList[requestIndex];
-        if (!ValidateUCMMergeRequest(layerID, reqID, runningLoadNum)) { continue; }
-        MergeRequest request;
-        request.reqID = reqID;
-        request.previousLoadNum = runningLoadNum;
-        BuildUCMMergeBlockContexts(layerID, reqID, requestIndex, request.contexts,
-                                   request.tokenMap);
-        if (!BuildUCMMergeLoadPlan(plan, request.contexts, layerID, streamIdx, reqID,
-                                   runningLoadNum)) {
-            /* Plan-build failures are staging-window conditions shared by every
-             * request: keep accumulating so each request still gets its zero
-             * fallback and advances mLoadNum (same as the per-request flow). */
-            mLogger.log(LogLevel::ERROR,
-                        "|UCMTensorMerge| plan build failed, layer=%d reqID=%s\n", layerID,
-                        reqID.c_str());
-            planBuildOk = false;
-            runningLoadNum += mMissGlobalToken[reqID][mTopkLayerMap[layerID]].size();
-            requests.push_back(std::move(request));
-            continue;
-        }
-        runningLoadNum += mMissGlobalToken[reqID][mTopkLayerMap[layerID]].size();
-        requests.push_back(std::move(request));
-    }
-
-    /* Phase 2: submit the batched LoadOnToken (K leg, then V leg) on a worker
-     * thread while the engine thread runs the local non-UCM token copies and
-     * builds hbmSlotIndex. The store splices UCM tokens; the engine copies
-     * non-UCM tokens: the two write disjoint staging windows. */
+    CollectUCMMergeRequests(taskInfo, requestIndices, layerID, streamIdx, plan, requests,
+                            runningLoadNum, planBuildOk);
     const bool planOk = stagingOk && planBuildOk;
-    std::future<bool> loadFuture;
-    bool loadSubmitted = false;
-    if (planOk && (!plan.kTask.empty() || !plan.vTask.empty())) {
-        const std::string& firstReqID = requests.front().reqID;
-        try {
-            loadFuture = std::async(std::launch::async, [this, &plan, layerID, &firstReqID]() {
-                try {
-                    return SubmitUCMTokenLoad(plan, "UCMTensorMerge", layerID, firstReqID);
-                } catch (const std::exception& e) {
-                    mLogger.log(LogLevel::ERROR,
-                                "|UCMTensorMerge| batched load exception: %s\n", e.what());
-                    return false;
-                }
-            });
-            loadSubmitted = true;
-        } catch (const std::exception& e) {
-            mLogger.log(LogLevel::ERROR,
-                        "|UCMTensorMerge| failed to spawn load worker: %s\n", e.what());
-        }
-    }
+    const bool loadOk = SubmitUCMMergeBatchLoad(plan, requests, layerID, planOk);
     std::vector<std::string> localFailed;
     if (planOk) {
         for (auto& request : requests) {
@@ -1672,31 +1703,96 @@ void GSAPrefetchEngineC::UCMTensorMergeBatch(const TaskInfo& taskInfo,
             }
         }
     }
-    bool loadOk = planOk;
-    if (loadSubmitted) { loadOk = loadFuture.get(); }
+    FallbackUCMMergeRequests(requests, layerID, streamIdx, hbmSlotIndex, planOk, loadOk,
+                             localFailed);
+    mLoadNum[layerID] = static_cast<uint32_t>(runningLoadNum);
+}
 
+void GSAPrefetchEngineC::CollectUCMMergeRequests(const TaskInfo& taskInfo,
+                                                 const std::vector<uint32_t>& requestIndices,
+                                                 int layerID, int streamIdx, UCMTokenLoadPlan& plan,
+                                                 std::vector<UCMMergeRequestState>& requests,
+                                                 size_t& runningLoadNum, bool& planBuildOk)
+{
+    /* Phase 1: build the whole-batch plan (one shard per owned UCM block,
+     * concatenated across requests; per-shard dst = the block's landing window
+     * in the shared staging buffer). Ownership stays per-request:
+     * (blockOrdinalInRequest + requestIndex) % mTpSize == mRank. */
+    for (uint32_t requestIndex : requestIndices) {
+        if (requestIndex >= taskInfo.reqIdList.size() ||
+            requestIndex >= taskInfo.topkLenList.size()) {
+            continue;
+        }
+        const std::string& reqID = taskInfo.reqIdList[requestIndex];
+        if (!ValidateUCMMergeRequest(layerID, reqID, runningLoadNum)) { continue; }
+        UCMMergeRequestState request;
+        request.reqID = reqID;
+        request.previousLoadNum = runningLoadNum;
+        BuildUCMMergeBlockContexts(layerID, reqID, requestIndex, request.contexts,
+                                   request.tokenMap);
+        if (!BuildUCMMergeLoadPlan(plan, request.contexts, layerID, streamIdx, reqID,
+                                   runningLoadNum)) {
+            /* Plan-build failures are staging-window conditions shared by every
+             * request: keep accumulating so each request still gets its zero
+             * fallback and advances mLoadNum (same as the per-request flow). */
+            mLogger.log(LogLevel::ERROR,
+                        "|UCMTensorMerge| plan build failed, layer=%d reqID=%s\n", layerID,
+                        reqID.c_str());
+            planBuildOk = false;
+        }
+        runningLoadNum += mMissGlobalToken[reqID][mTopkLayerMap[layerID]].size();
+        requests.push_back(std::move(request));
+    }
+}
+
+bool GSAPrefetchEngineC::SubmitUCMMergeBatchLoad(const UCMTokenLoadPlan& plan,
+                                                 const std::vector<UCMMergeRequestState>& requests,
+                                                 int layerID, bool planOk)
+{
+    /* Phase 2: submit the batched LoadOnToken (K leg, then V leg) directly on
+     * this thread before the local non-UCM token copies (previously an
+     * std::async worker; now a plain judge-and-return-code call so the worker
+     * path carries no exception source, and a spawn failure can no longer
+     * silently skip the zero fallback). The store splices UCM tokens; the
+     * engine copies non-UCM tokens: the two write disjoint staging windows. */
+    if (!planOk || (plan.kTask.empty() && plan.vTask.empty())) {
+        return planOk;
+    }
+    if (requests.empty()) {
+        mLogger.log(LogLevel::ERROR,
+                    "|UCMTensorMerge| no valid requests to load, layer=%d\n", layerID);
+        return false;
+    }
+    const std::string& firstReqID = requests.front().reqID;
+    return SubmitUCMTokenLoad(plan, "UCMTensorMerge", layerID, firstReqID);
+}
+
+void GSAPrefetchEngineC::FallbackUCMMergeRequests(const std::vector<UCMMergeRequestState>& requests,
+                                                  int layerID, int streamIdx,
+                                                  std::vector<uint64_t>& hbmSlotIndex, bool planOk,
+                                                  bool loadOk,
+                                                  const std::vector<std::string>& localFailed)
+{
     /* Phase 3: fallback. Plan failure: local copies never ran, zero-fill all
      * owned tokens. Store failure: local copies already landed, only zero the
      * UCM-owned windows (the store never splices a failed task). In both cases
      * hbmSlotIndex is (re)validated and filled for ALL tokens of every rank. */
-    if (!planOk || !loadOk) {
-        for (auto& request : requests) {
-            if (std::find(localFailed.begin(), localFailed.end(), request.reqID) !=
-                localFailed.end()) {
-                continue;
-            }
-            const size_t zeroTokens =
-                FillFailedUCMMerge(request.contexts, layerID, streamIdx, hbmSlotIndex,
-                                   request.reqID, request.previousLoadNum, /*zeroUcmOnly=*/planOk);
-            mLogger.log(LogLevel::ERROR,
-                        "|KVPack| zero fallback (batched load): rank=%d layer=%d reqID=%s "
-                        "stage=%s zeroOwnedTokens=%zu\n",
-                        mRank, layerID, request.reqID.c_str(), planOk ? "load" : "plan",
-                        zeroTokens);
-        }
+    if (planOk && loadOk) {
+        return;
     }
-
-    mLoadNum[layerID] = static_cast<uint32_t>(runningLoadNum);
+    for (auto& request : requests) {
+        if (std::find(localFailed.begin(), localFailed.end(), request.reqID) !=
+            localFailed.end()) {
+            continue;
+        }
+        const size_t zeroTokens =
+            FillFailedUCMMerge(request.contexts, layerID, streamIdx, hbmSlotIndex,
+                               request.reqID, request.previousLoadNum, /*zeroUcmOnly=*/planOk);
+        mLogger.log(LogLevel::ERROR,
+                    "|KVPack| zero fallback (batched load): rank=%d layer=%d reqID=%s "
+                    "stage=%s zeroOwnedTokens=%zu\n",
+                    mRank, layerID, request.reqID.c_str(), planOk ? "load" : "plan", zeroTokens);
+    }
 }
 
 bool GSAPrefetchEngineC::ValidateUCMMergeRequest(int layerID, const std::string& reqID,

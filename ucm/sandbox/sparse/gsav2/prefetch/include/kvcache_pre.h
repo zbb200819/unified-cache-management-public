@@ -182,8 +182,12 @@ public:
 
     int IndexerLoadProcess(const TaskInfo& taskInfo, ThreadInfo& threadInfo);
 
-    void RunOneBsPrefetch(std::string reqID, int topkLen, int topkIndex,
-                          const torch::Tensor& topkList);
+    int RunOneBsPrefetch(std::string reqID, int topkLen, int topkIndex,
+                         const torch::Tensor& topkList);
+
+    // RunOneBsPrefetch 分解辅助（提前识别/判别在并行域外完成）
+    int AcquireIndexerTopkBase(const torch::Tensor& topkList, const std::string& reqID,
+                               int topkLen, PrefetchTopkView& topkView);
 
     void GetHitAndMissBlock(PrefetchReqInfo oneBsInfo, std::vector<int>& topkList,
                             std::unordered_set<int>& hitBlocks, std::map<int, int>& hitBlocksIdx,
@@ -354,8 +358,6 @@ private:
 #ifdef KV_CACHE_PRE_TEST_PRIVATE_AS_PUBLIC
 public:
 #endif
-    // Abnormality determination
-    void CheckInputIndex(uint32_t maxLen, uint32_t index);
     int InitKVPackControl(int dpRank);
     void CleanupKVPackControl();
     int BeginKVPackSlot(int streamIdx, uint64_t epoch);
@@ -438,13 +440,22 @@ public:
     void BuildUCMMergeBlockContexts(int layerID, const std::string& reqID, uint32_t requestIndex,
                                     std::vector<UCMMergeBlockContext>& blockContexts,
                                     std::map<int, std::vector<size_t>>& blockIdxToTokenIdx);
-    /* Whole-batch merge: all valid requests of one decode step are concatenated
-     * into ONE LoadOnToken task per leg (per layer), submitted on a worker
-     * thread while the engine thread runs the local non-UCM token copies, then
-     * joined. Replaces the per-request submit+wait serialization. */
+
     void UCMTensorMergeBatch(const TaskInfo& taskInfo,
                              const std::vector<uint32_t>& requestIndices, int layerID,
                              int streamIdx, std::vector<uint64_t>& hbmSlotIndex);
+
+    void CollectUCMMergeRequests(const TaskInfo& taskInfo,
+                                 const std::vector<uint32_t>& requestIndices, int layerID,
+                                 int streamIdx, UCMTokenLoadPlan& plan,
+                                 std::vector<UCMMergeRequestState>& requests,
+                                 size_t& runningLoadNum, bool& planBuildOk);
+    bool SubmitUCMMergeBatchLoad(const UCMTokenLoadPlan& plan,
+                                 const std::vector<UCMMergeRequestState>& requests, int layerID,
+                                 bool planOk);
+    void FallbackUCMMergeRequests(const std::vector<UCMMergeRequestState>& requests, int layerID,
+                                  int streamIdx, std::vector<uint64_t>& hbmSlotIndex, bool planOk,
+                                  bool loadOk, const std::vector<std::string>& localFailed);
     bool ValidateMergeStagingWindow(int streamIdx);
     // IndexerInitLoad
     bool ProcessIndexerInitLoadLayer(std::vector<std::vector<int>>& blockTable,
@@ -467,14 +478,31 @@ public:
                              const std::vector<LastChunkSourceBlock>& sourceBlocks);
 
     // CallPrefetchProcess
-    void PreparePrefetchResults(const TaskInfo& taskInfo);
+    int PreparePrefetchResults(const TaskInfo& taskInfo);
 
-    void ProcessPrefetchRequest(const TaskInfo& taskInfo, size_t i, int layerID,
-                                const PrefetchShmLayout& layout);
+    // PreparePrefetchResults 分解辅助（提前识别/判别在并行域外完成）
+    int AcquirePrefetchTopkBase(const TaskInfo& taskInfo, uint32_t oneRunBsLen,
+                                PrefetchTopkView& topkView);
+    void ZeroFillAllPrefetchResults(uint32_t oneRunBsLen, const PrefetchShmLayout& layout,
+                                    uint32_t* versionPtr);
+    int PublishPrefetchResultsRank0(const TaskInfo& taskInfo, uint32_t oneRunBsLen,
+                                    const PrefetchShmLayout& layout, uint32_t* versionPtr);
+    int SyncPrefetchResultsFromRank0(const TaskInfo& taskInfo, const PrefetchShmLayout& layout,
+                                     uint32_t* versionPtr);
+
+    int ProcessPrefetchRequest(const TaskInfo& taskInfo, const PrefetchTopkView& topkView, size_t i,
+                               int layerID, const PrefetchShmLayout& layout);
+
+    // ProcessPrefetchRequest 分解辅助
+    HBMManager* FindReqLayerManager(const std::string& reqID, int layerID);
+    bool RunHbmTopkLookup(const std::string& oneReqID, std::vector<int>& oneTopkList, int layerID,
+                          int bsIndex, int oneTopkLen, std::vector<int>& useBlockTable);
 
     void WritePrefetchResult(const std::string& oneReqID, size_t i, int layerID,
                              const std::vector<int>& useBlockTable,
                              const PrefetchShmLayout& layout);
+
+    void ClearPrefetchResultSlot(size_t i, int layerID, const PrefetchShmLayout& layout);
 
     void ReadPrefetchResults(const TaskInfo& taskInfo, const PrefetchShmLayout& layout);
 
@@ -495,6 +523,14 @@ public:
 
     bool SubmitIndexerInitLoadTask(UC::Detail::TaskDesc& task, const std::string& reqID,
                                    int layerID);
+
+    // ProcessIndexerInitLoadLayer 分解辅助
+    bool BuildIndexerInitLoadShards(std::vector<std::vector<int>>& blockTable,
+                                    std::vector<std::vector<int>>& slabIdx,
+                                    const std::string& reqID, int layerID, int number,
+                                    std::uint8_t* indexerBaseAddr,
+                                    const std::vector<BlockId>& hashVec,
+                                    UC::Detail::TaskDesc& task);
 
     void FinishOneLayerPrefetch(const std::string& reqID, int layerID,
                                 std::map<int, int>& hitBlocksIdx, std::vector<int>& missIdxs);
@@ -533,6 +569,12 @@ public:
 
     void ProcessTokensMapTopk(int layerID, const std::string& reqID, torch::Tensor& qTopkTensor,
                               int maxIdx, size_t sparseSeqLen);
+
+    // ProcessTokensMapTopk 分解辅助
+    int AcquireQTopkView(torch::Tensor& qTopkTensor, const std::string& reqID, int layerID,
+                         PrefetchTopkView& topkView, int& qTopkNum, int& topkSize);
+    int CopyUseBlockTableToIndicesTensor(const std::string& reqID, int layerID,
+                                         const std::vector<int>& useBlockTable);
 
     void ReleasePrefetchStreamResources(int layerID);
 

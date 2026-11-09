@@ -27,6 +27,7 @@
 using ::TaskInfo;
 using ucmprefetch::GSAPrefetchEngineC;
 using ucmprefetch::PrefetchShmLayout;
+using ucmprefetch::PrefetchTopkView;
 using ucmprefetch_test::CleanupShmFor;
 using ucmprefetch_test::MakeModelInfo;
 using ucmprefetch_test::MakeSizeInfo;
@@ -275,7 +276,9 @@ TEST_F(PrefetchH2DTest, ProcessPrefetchRequestProcessesTopkAndWritesShm)
     layout.loadSlotSize = layout.countSize + layout.maxLoadNum * sizeof(int);
     layout.totalSize =
         layout.missTokenSize + layout.loadSlotSize + engine->mSpaTopkLen * sizeof(int);
-    engine->ProcessPrefetchRequest(taskInfo, /*i=*/0, /*layerID=*/0, layout);
+    PrefetchTopkView topkView{topkList.data_ptr<int>(), topkList.stride(0), topkList.stride(1),
+                              topkList.numel()};
+    engine->ProcessPrefetchRequest(taskInfo, topkView, /*i=*/0, /*layerID=*/0, layout);
     // After processing, mMissGlobalToken[reqID][0] is populated.
     // All topk values (0,1) are in DRAM range -> some may be misses (first access).
     EXPECT_GE(engine->mMissGlobalToken[reqID][0].size(), 0u);
@@ -298,7 +301,8 @@ TEST_F(PrefetchH2DTest, ProcessPrefetchRequestSkipsZeroTopkLen)
     layout.loadSlotSize = layout.countSize + layout.maxLoadNum * sizeof(int);
     layout.totalSize =
         layout.missTokenSize + layout.loadSlotSize + engine->mSpaTopkLen * sizeof(int);
-    engine->ProcessPrefetchRequest(taskInfo, /*i=*/0, /*layerID=*/0, layout);
+    PrefetchTopkView topkView{};
+    engine->ProcessPrefetchRequest(taskInfo, topkView, /*i=*/0, /*layerID=*/0, layout);
     // No mutation of mMissGlobalToken (no entry created).
     EXPECT_EQ(engine->mMissGlobalToken.count("req1"), 0u);
 }

@@ -6,8 +6,7 @@
  *
  * Covers TokenIndexMapInter, Add/DeleteIndexerMapForRequest, the UCM-merge
  * helpers (Validate/BuildContexts/BuildPlan/Submit load/Prepare/Memcpy/
- * Copy/BuildTokenCopyTasks), LastChunkMove early-return branches, and
- * CheckInputIndex.
+ * Copy/BuildTokenCopyTasks), and LastChunkMove early-return branches.
  *
  * These paths are pure host logic or only depend on the MockStoreV1, so they
  * run safely without ACL device / TaskManager worker threads.
@@ -99,20 +98,6 @@ protected:
 };
 
 }  // namespace
-
-/* ---------------- CheckInputIndex ---------------- */
-
-TEST_F(PreLogicTest, CheckInputIndexPassesWhenIndexBelowMaxLen)
-{
-    engine = MakeEngine();
-    // index < maxLen -> no abort, returns normally.
-    engine->CheckInputIndex(/*maxLen=*/10, /*index=*/5);
-    SUCCEED();
-}
-
-// NOTE: The index >= maxLen branch calls std::abort() and cannot be tested
-// in-process without killing the test runner; it is documented as a fatal
-// contract violation rather than a recoverable error.
 
 /* ---------------- TokenIndexMapInter ---------------- */
 

@@ -52,25 +52,30 @@ int32_t CopyTrans(void** host_ptrs_addr, void** device_ptrs_addr, size_t size_by
     return 0;
 }
 
-void ObtainStream(void** outputStream, void** outputContext, int32_t deviceID, int32_t mStreamNum)
+int32_t ObtainStream(void** outputStream, void** outputContext, int32_t deviceID, int32_t mStreamNum)
 {
     auto ret = aclrtSetDevice(deviceID);
     if (ret != ACL_SUCCESS) {
-        throw std::runtime_error(std::string("aclrtSetDevice failed: ") + std::to_string(ret));
+        std::cerr << "|KVCache Prefetch| [ERROR] ObtainStream: aclrtSetDevice failed: " << ret
+                  << ", deviceID: " << deviceID << std::endl;
+        return -1;
     }
 
     aclrtContext* context = (aclrtContext*)malloc(sizeof(aclrtContext));
     ret = aclrtCreateContext(context, deviceID);
     if (ret != ACL_SUCCESS) {
-        throw std::runtime_error(std::string("aclrtCreateContext failed: ") + std::to_string(ret));
+        std::cerr << "|KVCache Prefetch| [ERROR] ObtainStream: aclrtCreateContext failed: " << ret
+                  << ", deviceID: " << deviceID << std::endl;
+        return -1;
     }
 
     aclrtStream* stream_ = (aclrtStream*)malloc(sizeof(aclrtStream) * mStreamNum);
     for (int i = 0; i < mStreamNum; i++) {
         ret = aclrtCreateStream(stream_ + i);
         if (ret != ACL_SUCCESS) {
-            throw std::runtime_error(std::string("AscendStreamCreateWithFlags failed: ") +
-                                     std::to_string(ret));
+            std::cerr << "|KVCache Prefetch| [ERROR] ObtainStream: aclrtCreateStream failed: "
+                      << ret << ", index: " << i << "/" << mStreamNum << std::endl;
+            return -1;
         }
     }
 
@@ -80,6 +85,7 @@ void ObtainStream(void** outputStream, void** outputContext, int32_t deviceID, i
     // std::cout << "========================================" << std::endl;
     // std::cout << "create ascend streams done !!!!" << stream_ << std::endl;
     // std::cout << "========================================" << std::endl;
+    return 0;
 }
 
 int32_t Synchronize(void* context, void* stream, int streamNum, Logger& mLogger)

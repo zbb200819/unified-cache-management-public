@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -116,6 +117,22 @@ struct UCMMergeTimeStatus {
     uint64_t loadToHostUs = 0;
     uint64_t preMemcpyUs = 0;
     uint64_t memcpyUs = 0;
+};
+
+struct PrefetchTopkView {
+    const int* base = nullptr;
+    int64_t stride0 = 0;
+    int64_t stride1 = 0;
+    int64_t numel = 0;
+};
+
+/* UCMTensorMergeBatch 的整批请求态：contexts 持有指向 tokenMap 节点的
+ * 指针，须与 tokenMap 同生命周期（std::map 节点地址稳定，move 安全）。 */
+struct UCMMergeRequestState {
+    std::string reqID;
+    std::map<int, std::vector<size_t>> tokenMap;
+    std::vector<UCMMergeBlockContext> contexts;
+    size_t previousLoadNum = 0;
 };
 
 struct LastChunkSourceBlock {

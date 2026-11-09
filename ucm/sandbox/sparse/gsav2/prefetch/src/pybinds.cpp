@@ -37,43 +37,6 @@
 
 namespace ucmprefetch {
 
-std::uintptr_t GetTensorDataPtr(const pybind11::object& tensor, const char* tensorName)
-{
-    if (tensor.is_none()) {
-        throw pybind11::value_error(std::string(tensorName) + " must not be None");
-    }
-
-    if (!pybind11::hasattr(tensor, "data_ptr")) {
-        throw pybind11::type_error(std::string(tensorName) + " must be a torch.Tensor");
-    }
-
-    if (!pybind11::hasattr(tensor, "dim") || !pybind11::hasattr(tensor, "numel") ||
-        !pybind11::hasattr(tensor, "is_contiguous")) {
-        throw pybind11::type_error(std::string(tensorName) +
-                                   " does not provide required Tensor interfaces");
-    }
-
-    const std::int64_t ndim = tensor.attr("dim")().cast<std::int64_t>();
-    if (ndim != 1) {
-        throw pybind11::value_error(std::string(tensorName) + " must be a one-dimensional Tensor");
-    }
-
-    const std::int64_t numel = tensor.attr("numel")().cast<std::int64_t>();
-    if (numel <= 0) { throw pybind11::value_error(std::string(tensorName) + " must not be empty"); }
-
-    const bool is_contiguous = tensor.attr("is_contiguous")().cast<bool>();
-    if (!is_contiguous) {
-        throw pybind11::value_error(std::string(tensorName) + " must be contiguous");
-    }
-
-    const std::uintptr_t address = tensor.attr("data_ptr")().cast<std::uintptr_t>();
-    if (address == 0) {
-        throw pybind11::value_error(std::string(tensorName) + " data_ptr is null");
-    }
-
-    return address;
-}
-
 std::vector<BlockId> BlockIdsFromBuffer(const pybind11::buffer& ids)
 {
     pybind11::buffer_info ids_info = ids.request();
