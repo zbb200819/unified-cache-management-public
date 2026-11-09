@@ -41,7 +41,10 @@ ENABLE_SPARSE = os.getenv("ENABLE_SPARSE", "0").lower() in (
     "on",
 )
 ENABLE_UCM_PATCH = os.environ.get("ENABLE_UCM_PATCH", "").lower() in ("1", "true")
-ENABLE_GSA_PATCH = os.environ.get("ENABLE_GSA_PATCH", "").lower() in ("1", "true")
+# B-5 整改：GSA 补丁全部嵌套在 apply_all_patches 的 UCM 补丁流程内，依赖 UCM
+# 底座；ENABLE_UCM_PATCH=0 时强制不开启 GSA_PATCH（原先该组合静默无补丁无日志）。
+GSA_PATCH_REQUESTED = os.environ.get("ENABLE_GSA_PATCH", "").lower() in ("1", "true")
+ENABLE_GSA_PATCH = ENABLE_UCM_PATCH and GSA_PATCH_REQUESTED
 
 
 def _strip_build(v: Optional[str]) -> Optional[str]:
@@ -151,6 +154,17 @@ def apply_all_patches() -> None:
         from ucm.integration.vllm.patch.logger_patch import patch_logger
 
         if not ENABLE_UCM_PATCH:
+            if GSA_PATCH_REQUESTED:
+                logger.warning(
+                    "ENABLE_UCM_PATCH is not set: no vLLM/vllm-ascend patches "
+                    "will be applied; ENABLE_GSA_PATCH=1 is ignored because "
+                    "GSA patches are nested inside the UCM patch flow."
+                )
+            else:
+                logger.info(
+                    "ENABLE_UCM_PATCH is not set: no vLLM/vllm-ascend patches "
+                    "will be applied."
+                )
             return
 
         version = get_vllm_version()

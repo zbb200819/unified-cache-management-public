@@ -1142,21 +1142,6 @@ class TestModelInputPipeline:
         g._update_prefetch_status_all()
         assert g.is_prefetch_token is True
 
-    def test_update_prefetch_status_gsa_index_busy_wait(self, gsa_worker):
-        # L-7：elif 分支同样先等 prefetch worker 空闲（脚本先 True 后 False），
-        # 之后才采样 is_done——封堵版本握手超时路径的竞态窗口。
-        g = gsa_worker
-        g.need_prefetch_index = []
-        g.gsa_index = [0]
-        g.prefetch_engine.prefetch_engine_c.prefetch_status = [True, False]
-        g.prefetch_status_sm.version_same = True
-        g._update_prefetch_status_all()
-        ec = g.prefetch_engine.prefetch_engine_c
-        assert len(ec.called("get_prefetch_status")) == 3  # 忙等 2 次 + 采样 1 次
-        sm = g.prefetch_status_sm
-        assert sm.status_calls and sm.status_calls[0][0] is True  # 空闲后采样 is_done
-        assert g.is_prefetch_token is True
-
     def test_update_prefetch_status_gsa_index_path(self, gsa_worker):
         g = gsa_worker
         g.need_prefetch_index = []

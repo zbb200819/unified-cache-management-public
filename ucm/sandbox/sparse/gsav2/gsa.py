@@ -572,7 +572,7 @@ class GSA(UcmSparseBase):
         )
 
     def _init_slots_num_manager(self, role: UcmSparseRole):
-        if role == UcmSparseRole.SCHEDULER and IS_OPEN_GSA:
+        if role == UcmSparseRole.SCHEDULER and IS_OPEN_GSA and self.is_decode_node:
             self.slots_num_manager = SharedTensorManager(
                 "gsa_glm52_slots_num_dp" + str(self.dp_rank), False
             )

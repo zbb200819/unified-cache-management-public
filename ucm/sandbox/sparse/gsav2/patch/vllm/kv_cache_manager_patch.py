@@ -115,7 +115,11 @@ def allocate_slots(
             "external computed tokens"
         )
 
-    if num_slots_sparsed != INVALID_SLOT and has_ucm_sparse():
+    if (
+        num_slots_sparsed is not None
+        and num_slots_sparsed != INVALID_SLOT
+        and has_ucm_sparse()
+    ):
         return get_ucm_sparse().allocate_slots(self, request, num_slots_sparsed)
 
     if new_computed_blocks is not None:

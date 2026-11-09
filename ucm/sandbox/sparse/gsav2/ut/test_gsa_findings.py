@@ -6,8 +6,8 @@
   _load_kv_dram（gsa.py:2383-2384）→ PD 分离 + 新请求必现 KeyError。
   修复计划 P0-F2：改为 self._load_kv_dram(new_req.req_id)。
 - S1-2：_init_slots_num_manager 的 SCHEDULER 分支缺少 is_decode_node 守卫
-  （gsa.py:586；PD 分离基线 gsa_for_pd.py:160 有守卫）→ 跨机 PD 分离时
-  P 节点 attach D 节点 shm，120s 超时启动崩溃。修复计划 P0-F4。
+  （gsa.py:586）→ 跨机 PD 分离时
+   P 节点 attach D 节点 shm，120s 超时启动崩溃。修复计划 P0-F4。
 - E.1#2 / E.1#16：shutdown 在 IS_INDEXER_OFFLOAD=False（当前默认）时直接
   早退、零清理；且 ensure_ucm_sparse_shutdown 全库无调用者。修复计划 P1-F1。
 - S2-2：estimate_num_slots_sparsed 默认 num_spec_slots=3（取混合基线），
@@ -75,7 +75,8 @@ class TestBuildSparseMetaNewReqArg:
 
 
 # ===========================================================================
-# S1-2：SCHEDULER 分支缺少 is_decode_node 守卫
+# S1-2 / P0-F4：SCHEDULER 分支缺少 is_decode_node 守卫（2026-11-09 已修复，
+# 原钉缺陷行为的用例已删，翻转原 xfail 用例为正向回归）
 # ===========================================================================
 class TestSchedulerSlotsNumGuard:
     def _make_p_node_scheduler(self, make_gsa, monkeypatch):
@@ -85,21 +86,8 @@ class TestSchedulerSlotsNumGuard:
             role=UcmSparseRole.SCHEDULER, consumer=False, producer=True
         )
 
-    def test_scheduler_on_p_node_attaches_shm(self, make_gsa, monkeypatch):
-        """钉住当前缺陷行为：P 节点（非 decode）scheduler 仍 attach
-        D 节点 worker rank0 创建的 slots_num shm——跨机部署 120s 超时崩溃。"""
-        g = self._make_p_node_scheduler(make_gsa, monkeypatch)
-        assert isinstance(g.slots_num_manager, fakes.FakeSharedTensorManager)
-        assert g.slots_num_manager.is_creator is False  # attach 模式
-        assert g.slots_num_manager.name == "gsa_glm52_slots_num_dp0"
-        assert g.is_decode_node is False
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason="P0-F4：gsa.py:586 SCHEDULER 分支补 and self.is_decode_node 后移除",
-    )
     def test_fixed_scheduler_skips_attach(self, make_gsa, monkeypatch):
-        """期望的修复后行为：非 decode 的 scheduler 不创建/attach slots_num shm。"""
+        """修复后行为：非 decode 的 scheduler 不创建/attach slots_num shm。"""
         g = self._make_p_node_scheduler(make_gsa, monkeypatch)
         assert not hasattr(g, "slots_num_manager")
 
@@ -160,8 +148,8 @@ class TestShutdownCleanup:
 class TestEstimateNumSlotsSparsedDefault:
     def test_pd_separated_default_is_three(self, gsa_worker, monkeypatch):
         """钉住行为漂移：PD 分离（gsa_worker 默认 consumer-only）下默认
-        num_spec_slots=3（gsa.py:2472，取混合基线 gsa_old 的值；分离基线
-        gsa_for_pd.py:1613 为 0）。v0110 补丁单参调用时每请求多估 3 token。
+        num_spec_slots=3（gsa.py:2472，合并时取混合基线值，分离基线为 0）。
+        v0110 补丁单参调用时每请求多估 3 token。
         若裁决改回 0，请同步更新本断言。"""
         monkeypatch.setattr(gsa_mod, "IS_OPEN_GSA", True)
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 64)

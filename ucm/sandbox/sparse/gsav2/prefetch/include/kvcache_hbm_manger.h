@@ -61,15 +61,19 @@ public:
         // 初始化常规 slot 映射
         if (preloadHbm) {
             // local slot [0, mHbmCapacity-1] 映射为 global 组合:
-            //   slot [0, 128]                   -> global [0, 128] 顺序
-            //   slot [129, mHbmCapacity-1]      -> global [mDramTensorCount-1 ...
-            //   mDramTensorCount-mHbmCapacity+129] 倒序
+            //   slot [0, min(256, mDramTensorCount-1)]  -> global [0, ...] 顺序
+            //   slot [min(256, mDramTensorCount), mHbmCapacity-1] -> global [mDramTensorCount-1 ...
+            //   ...] 倒序
+            // 守卫 mGlobalToSlot 下标 < mDramTensorCount、gid >= 0，避免短 prompt
+            // (mDramTensorCount <= 256) 时堆缓冲区溢出。
             int slotIdx = 0;
-            for (; slotIdx <= 256 && slotIdx < mHbmCapacity; ++slotIdx) {
+            for (; slotIdx <= 256 && slotIdx < mHbmCapacity && slotIdx < mDramTensorCount;
+                 ++slotIdx) {
                 mGlobalToSlot[slotIdx] = slotIdx;
                 mSlotToGlobal[slotIdx] = slotIdx;
             }
-            for (int gid = mDramTensorCount - 1; slotIdx < mHbmCapacity; --gid, ++slotIdx) {
+            for (int gid = mDramTensorCount - 1; slotIdx < mHbmCapacity && gid >= 0;
+                 --gid, ++slotIdx) {
                 mGlobalToSlot[gid] = slotIdx;
                 mSlotToGlobal[slotIdx] = gid;
             }

@@ -3,8 +3,8 @@
 
 背景（见仓库根 GSA_ANALYSIS_REPORT.md 缺陷 A1 / A3，均已修复）：
 1. [已修复 P0-F1] gsa.py:1024 原调用 set_last_indexer_blocks（复数），而
-   pybinds.cpp:152 只导出 set_last_indexer_block（单数）——gsa.py / gsa_old.py /
-   gsa_for_pd.py 三处调用点与 UT 断言已全部改为单数，账本条目已移除；
+   pybinds.cpp:152 只导出 set_last_indexer_block（单数）——调用点与 UT 断言
+   已全部改为单数，账本条目已移除；
 2. [已修复 P0-F3] prefetch_engine.py 原 update_topk_index 调用 get_topk_indices，
    pybinds.cpp 绑定表中不存在——经全仓核查无任何生产调用方，方法已整体删除；
 3. （背景同 2）ut/fakes.py 曾显式实现 get_topk_indices（非 __getattr__ 兜底），
@@ -12,8 +12,9 @@
 
 本文件做的事：
 - 解析 prefetch/src/pybinds.cpp 的 .def("...") 得到两个类的真实绑定集合；
-- 扫描 gsa.py / gsa_old.py / gsa_for_pd.py / prefetch_engine.py 中
+- 扫描 gsa.py / prefetch_engine.py 中
   prefetch_engine_c.<name>( 与 ucm_prefetch_engine.<name>( 的调用点；
+  （示例代码文件不纳入扫描。）
 - 维护一份"调用了但未导出"的缺陷账本 KNOWN_MISMATCHES：
   * 账本之外的新缺失 → test_no_new_unbound_calls 立即失败；
   * 账本内缺陷被修复后 → test_ledger_entries_still_valid 失败，提示清理账本；
@@ -27,12 +28,9 @@ HERE = Path(__file__).resolve().parent
 GSAV2 = HERE.parent
 PYBINDS_CPP = GSAV2 / "prefetch" / "src" / "pybinds.cpp"
 
-# 生产代码文件（gsa_old.py / gsa_for_pd.py 是不可 import 的历史快照，
-# 因此用源码文本扫描而不是 import）。
+# 生产代码文件（避免在 UT 进程 import 生产模块，用源码文本扫描）。
 PROD_FILES = {
     "gsa.py": GSAV2 / "gsa.py",
-    "gsa_old.py": GSAV2 / "gsa_old.py",
-    "gsa_for_pd.py": GSAV2 / "gsa_for_pd.py",
     "prefetch_engine.py": GSAV2 / "prefetch" / "prefetch_engine.py",
 }
 
@@ -41,8 +39,8 @@ PROD_FILES = {
 # 修复对应缺陷后 test_ledger_entries_still_valid 会失败并提示从这里移除条目。
 # ---------------------------------------------------------------------------
 KNOWN_MISMATCHES = {
-    # A1（set_last_indexer_blocks 复数误调，P0-F1）已修复：gsa.py:1024 /
-    # gsa_old.py:767 / gsa_for_pd.py:455 三处调用点已改为单数。
+    # A1（set_last_indexer_blocks 复数误调，P0-F1）已修复：gsa.py:1024
+    # 调用点已改为单数（示例文件中的同类调用点亦已同步修正）。
     # A3（get_topk_indices 绑定缺失，P0-F3）已修复：update_topk_index 无任何
     # 生产调用方，方法与 FakeEngineC.get_topk_indices 已整体删除。
     # 账本当前为空——所有 prefetch_engine_c 调用均有对应 .def 绑定，
@@ -193,11 +191,11 @@ class TestEngineBindingContract:
 
 
 class TestMergeBaselineDocs:
-    def test_baseline_pd_default_num_spec_slots(self):
-        """钉住合并基线差异（报告 S2-2）：
-        PD 分离基线 gsa_for_pd.py 默认 num_spec_slots=0，合并版 gsa.py 取了
-        混合基线 gsa_old.py 的默认值 3 —— v0110 补丁单参调用时 PD 分离每请求
-        多估 3 个稀疏 token（调度更保守）。该默认值的变更应有意识地裁决。
+    def test_baseline_num_spec_slots_default(self):
+        """钉住合并基线裁决（报告 S2-2）：gsa.py 的
+        estimate_num_slots_sparsed 默认 num_spec_slots=3（合并时取混合基线值，
+        分离基线为 0）——该默认值的变更应有意识地裁决并同步更新本断言。
+        （示例代码文件已移出本套件断言范围。）
         """
 
         def _default(path):
@@ -209,8 +207,6 @@ class TestMergeBaselineDocs:
             assert m, f"{path.name} 中未找到 estimate_num_slots_sparsed 定义"
             return int(m.group(1))
 
-        assert _default(GSAV2 / "gsa_for_pd.py") == 0
-        assert _default(GSAV2 / "gsa_old.py") == 3
         assert _default(GSAV2 / "gsa.py") == 3
 
 
@@ -231,7 +227,7 @@ if __name__ == "__main__":  # 独立运行：py -3 -X utf8 test_binding_contract
         (f, n) for f, n in scan_ucm_calls() if n not in ucm_bindings
     }
     print(f"[contract] engine bindings: {len(engine_bindings)}")
-    print(f"[contract] engine call sites: {len(discovered)} (files: 4)")
+    print(f"[contract] engine call sites: {len(discovered)} (files: 2)")
     print(f"[contract] 未导出且不在账本: {sorted(missing) or '无'}")
     print(f"[contract] 账本失效条目: {sorted(ledger_stale) or '无'}")
     print(f"[contract] ucm 未导出调用: {sorted(ucm_missing) or '无'}")

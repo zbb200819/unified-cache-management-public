@@ -153,11 +153,24 @@ struct PrefetchShmLayout {
 
 struct PrefetchTiming {
     uint64_t cpuMove = 0;
-    uint64_t memcpy = 0;
-    uint64_t sync = 0;
-    uint64_t h2d = 0;
+    uint64_t loadToHostUs = 0;
+    uint64_t preMemcpyUs = 0;
+    uint64_t memcpyUs = 0;
     uint64_t ops = 0;
 };
+
+/* 非 rank0 等待 rank0 发布 prefetch 结果的超时（L-9）。默认 30s，对齐 KVPack
+ * 控制面等待（kKVPackTimeout，kvcache_pre.cpp）与 Python 侧 is_version_same
+ * 版本握手；环境变量 UCM_PREFETCH_SYNC_TIMEOUT_MS 可覆盖（单位毫秒）。
+ * 原实现为 1s（10000×100us，旧注释误写 "Wait 1ms"），rank0 需串行完成
+ * mTopkIndexerNum×bs 次 LRU 计算时（大 batch/抢占）易误超时 → KVPackAbort
+ * 全进程退出。 */
+constexpr uint64_t kPrefetchSyncDefaultTimeoutMs = 30000;
+
+/* 解析上述超时（微秒）：环境变量缺失/为空/非法（<=0 或解析失败）时回落默认，
+ * 非法值向 stderr 打 WARN。逐次解析不缓存（每步一次，代价可忽略），保证
+ * 测试与运行期改值即时生效。 */
+uint64_t ResolvePrefetchSyncTimeoutUs();
 
 struct TokenCopyTask {
     const std::byte* kSrc;

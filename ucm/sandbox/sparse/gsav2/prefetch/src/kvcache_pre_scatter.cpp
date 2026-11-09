@@ -347,24 +347,47 @@ void GSAPrefetchEngineC::ZeroFillAllPrefetchResults(uint32_t oneRunBsLen,
     __atomic_store_n(versionPtr, mPrefetchResultVersion.fetch_add(1) + 1, __ATOMIC_RELEASE);
 }
 
+uint64_t ResolvePrefetchSyncTimeoutUs()
+{
+    const char* envVal = std::getenv("UCM_PREFETCH_SYNC_TIMEOUT_MS");
+    if (envVal == nullptr || envVal[0] == '\0') {
+        return kPrefetchSyncDefaultTimeoutMs * 1000ULL;
+    }
+    char* parseEnd = nullptr;
+    const long parsedMs = std::strtol(envVal, &parseEnd, 10);
+    if (parseEnd == envVal || parsedMs <= 0) {
+        std::cerr << "|KVCache Prefetch| [WARN] invalid UCM_PREFETCH_SYNC_TIMEOUT_MS='"
+                  << envVal << "', fallback to " << kPrefetchSyncDefaultTimeoutMs << "ms\n";
+        return kPrefetchSyncDefaultTimeoutMs * 1000ULL;
+    }
+    return static_cast<uint64_t>(parsedMs) * 1000ULL;
+}
+
 int GSAPrefetchEngineC::SyncPrefetchResultsFromRank0(const TaskInfo& taskInfo,
                                                      const PrefetchShmLayout& layout,
                                                      uint32_t* versionPtr)
 {
+    /* L-9：超时默认 30s（UCM_PREFETCH_SYNC_TIMEOUT_MS 可覆盖，100us 粒度轮询），
+     * 超时判定同时复核版本号，消除"恰在边界发布成功仍被判超时"的误杀竞态；
+     * fatal 对端提前置错时立即退出，不等超时。 */
+    const uint64_t timeoutUs = ResolvePrefetchSyncTimeoutUs();
     uint32_t expectedVersion = mPrefetchResultVersion.load() + 1;
-    int retryCount = 0;
+    uint64_t waitedUs = 0;
     while (__atomic_load_n(versionPtr, __ATOMIC_ACQUIRE) != expectedVersion &&
-           retryCount < 10000) {
+           waitedUs < timeoutUs) {
         if (mKVPackControl->fatalError.load(std::memory_order_acquire) != 0) {
             KVPackAbort(mKVPackControl);
         }
         usleep(100);
-        retryCount++;
+        waitedUs += 100;
     }
-    if (retryCount >= 10000) {
+    if (waitedUs >= timeoutUs &&
+        __atomic_load_n(versionPtr, __ATOMIC_ACQUIRE) != expectedVersion) {
         mLogger.log(LogLevel::ERROR,
-                    "Rank %d timeout waiting for prefetch result, version: %u, expected: %u\n",
-                    mRank, __atomic_load_n(versionPtr, __ATOMIC_ACQUIRE), expectedVersion);
+                    "Rank %d timeout(%llu ms) waiting for prefetch result, version: %u, "
+                    "expected: %u\n",
+                    mRank, static_cast<unsigned long long>(timeoutUs / 1000),
+                    __atomic_load_n(versionPtr, __ATOMIC_ACQUIRE), expectedVersion);
         KVPackAbort(mKVPackControl);
     }
     ReadPrefetchResults(taskInfo, layout);
