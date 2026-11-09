@@ -11,7 +11,7 @@ the GSA-aware implementation that drives
 
 The remaining GSA SFA patches (``__init__``, ``_build``,
 ``indexer_select_post_process``, ``_execute_sparse_flash_attention_process``)
-live in ``gsa/v0_23_0/vllm_ascend/sfa_v1_patch.py``.
+live in ``ucm/sandbox/sparse/gsav2/patch/vllm_ascend/sfa_v1_patch.py``.
 """
 
 from __future__ import annotations

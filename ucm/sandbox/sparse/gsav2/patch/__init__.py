@@ -7,14 +7,14 @@ so that no explicit ``git apply`` is needed for the Python source.
 
 The C++ additions in ``csrc/torch_binding.cpp`` / ``csrc/torch_binding_meta.cpp``
 (registering the ``gsa_*`` torch ops) cannot be applied at runtime and are kept
-as a build-time patch in
-``ucm/integration/vllm/patch/gsa/v0.23.0/vllm-ascend-csrc-build-1020-c8.patch``;
+as the sibling build-time patch
+``ucm/sandbox/sparse/gsav2/patch/vllm-ascend-csrc-build-1020-c8.patch``;
 it must be ``git apply``-ed before ``pip install -v -e .`` so the ops are
-compiled in. The original full ``.patch`` files also remain in
-``ucm/integration/vllm/patch/gsa/v0.23.0/`` for reference / build-time use.
+compiled in.
 
-This package (``gsa.v0_23_0`` — the ``v0_23_0`` spelling avoids the dots in
-``v0.23.0`` which are not valid in Python module paths) holds the runtime
+This package (``ucm.sandbox.sparse.gsav2.patch``, targeting vLLM /
+vLLM-Ascend 0.23.0 — previously ``ucm.integration.vllm.patch.gsa.v0_23_0``
+merged with the former ``gsa/v0.23.0`` build-patch directory) holds the runtime
 Python monkey-patches, toggled by ``ENABLE_GSA_PATCH=1`` (in addition to
 ``ENABLE_UCM_PATCH=1``, via ``apply_patch.apply_all_patches``) and no-ops at
 runtime unless GSA is actually initialized (``has_ucm_sparse()`` /

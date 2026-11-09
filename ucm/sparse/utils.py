@@ -41,9 +41,10 @@ NUM_GSA_BLOCKS = 1
 # by their own kv_transfer_config and do not consume this switch.
 IS_OPEN_GSA = _env_bool("UCM_SPARSE_GSA_ENABLE", True)
 # Topk-prefetch switch consumed by the legacy ucm.sparse.gsa chain only.
-# NOTE: gsav2 and the gsa/v0_23_0 vLLM integration patches no longer read
-# this switch -- it was merged into IS_OPEN_GSA (env UCM_SPARSE_GSA_ENABLE)
-# so GSA init and runtime gating share a single variable.
+# NOTE: gsav2 and its vLLM integration patches
+# (ucm.sandbox.sparse.gsav2.patch) no longer read this switch -- it was
+# merged into IS_OPEN_GSA (env UCM_SPARSE_GSA_ENABLE) so GSA init and
+# runtime gating share a single variable.
 PTOPK_PREFETCH_ENABLE = _env_bool("UCM_GSA_PTOPK_PREFETCH_ENABLE", True)
 
 ######  GSA v2 threshold for offload
