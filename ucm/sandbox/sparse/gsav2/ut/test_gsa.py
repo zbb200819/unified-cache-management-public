@@ -4,7 +4,7 @@
 覆盖策略：
 - C++ 扩展（GSAPrefetchEngineC / UCMKVPrefetch / torch.ops._C_ascend）使用
   conftest 注入的 mock；
-- 模块常量（IS_INDEXER_OFFLOAD / PTOPK_PREFETCH_ENABLE / IS_PERFORMANCE_LOG /
+- 模块常量（IS_INDEXER_OFFLOAD / IS_OPEN_GSA / IS_PERFORMANCE_LOG /
   SEG_PREFILL_THRESHOLD 等）通过 monkeypatch 构造分支矩阵；
 - 平台分支（L30-43）由 import 时的 True 侧 + reload 用例的 False 侧共同覆盖。
 """
@@ -461,7 +461,7 @@ class TestGSAConstruction:
         assert not hasattr(g, "select_gsa_prefetch_topk")  # 无 speculative
 
     def test_worker_init_ptopk_disabled(self, make_gsa, monkeypatch):
-        monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
+        monkeypatch.setattr(gsa_mod, "IS_OPEN_GSA", False)
         g = make_gsa()
         assert not hasattr(g, "prefetch_engine")
         assert not hasattr(g, "log")
@@ -557,7 +557,7 @@ class TestGSAConstruction:
 
     def test_init_gsa_metadata_early_return(self, gsa_worker, monkeypatch):
         # 构造路径下该分支不可达（外层已过滤），直接调用覆盖早退
-        monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
+        monkeypatch.setattr(gsa_mod, "IS_OPEN_GSA", False)
         gsa_worker.init_gsa_metadata(fakes.FakeVllmConfig())
 
 
@@ -861,7 +861,7 @@ class TestInjectBlockHashes:
 # ===========================================================================
 class TestAttentionHooks:
     def test_begin_ptopk_disabled(self, gsa_worker, monkeypatch):
-        monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
+        monkeypatch.setattr(gsa_mod, "IS_OPEN_GSA", False)
         out = gsa_worker.attention_begin("q", "k", "v", "model.layers.1.x", None)
         assert out == ("q", "k", "v", None)
 
@@ -1583,7 +1583,7 @@ class TestBuildMetaAndExecute:
         assert not hasattr(g, "slots_num_manager")  # rank≠0 不更新
 
     def test_execute_begin_early_return_ptopk_off(self, gsa_worker, monkeypatch):
-        monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
+        monkeypatch.setattr(gsa_mod, "IS_OPEN_GSA", False)
         gsa_worker.execute_begin(fakes.FakeSchedulerOutput(), {})  # 早退
 
     def test_execute_begin_early_return_not_decode(self, make_gsa):
@@ -2033,7 +2033,7 @@ class TestWarmup:
         g = gsa_worker
         g.warmup_topk = []
         g.warmup()  # warmup_topk 空 → 早退
-        monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
+        monkeypatch.setattr(gsa_mod, "IS_OPEN_GSA", False)
         g.warmup()  # 开关关闭 → 早退
 
     def test_warmup_full(self, gsa_worker, monkeypatch):
@@ -2127,7 +2127,7 @@ class TestWarmup:
 # ===========================================================================
 class TestExecuteFinished:
     def test_early_return_ptopk_off(self, gsa_worker, monkeypatch):
-        monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
+        monkeypatch.setattr(gsa_mod, "IS_OPEN_GSA", False)
         gsa_worker.execute_finished()
 
     def test_early_return_not_decode(self, make_gsa):
@@ -2293,7 +2293,7 @@ class TestSchedulerSide:
         return so, requests, input_batch
 
     def test_build_sparse_meta_early_return(self, gsa_worker, monkeypatch):
-        monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
+        monkeypatch.setattr(gsa_mod, "IS_OPEN_GSA", False)
         gsa_worker.build_sparse_meta(fakes.FakeSchedulerOutput(), {}, None, {})
 
     def test_build_sparse_meta_full(self, gsa_worker, monkeypatch):
@@ -2367,11 +2367,11 @@ class TestSchedulerSide:
         g.request_finished_in_scheduler("r1")
         assert "r1" not in g.preempt_req_output_tokens
         g.request_finished_in_scheduler("missing")  # 不存在 → pass
-        monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
+        monkeypatch.setattr(gsa_mod, "IS_OPEN_GSA", False)
         g.request_finished_in_scheduler("r1")  # 开关关闭 → 早退
 
     def test_request_finished_in_worker_early_return(self, make_gsa, monkeypatch):
-        monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
+        monkeypatch.setattr(gsa_mod, "IS_OPEN_GSA", False)
         gsa_worker = make_gsa()
         gsa_worker.request_finished_in_worker("r1")
         make_gsa(consumer=False).request_finished_in_worker("r1")
@@ -2484,7 +2484,7 @@ class TestSchedulerSide:
         assert g.estimate_free_slots_sparse(req, 90, 0) is True
 
     def test_estimate_num_slots_invalid_paths(self, gsa_worker, monkeypatch):
-        monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
+        monkeypatch.setattr(gsa_mod, "IS_OPEN_GSA", False)
         req = fakes.FakeRequest(num_output_tokens=5, prompt_token_ids=list(range(100)))
         assert gsa_worker.estimate_num_slots_sparsed(req) == gsa_mod.INVALID_SLOT
 
@@ -2530,7 +2530,7 @@ class TestSchedulerSide:
         assert g.estimate_num_slots_sparsed(req) == gsa_mod.INVALID_SLOT
 
     def test_allocate_slots_early_return(self, gsa_worker, monkeypatch):
-        monkeypatch.setattr(gsa_mod, "PTOPK_PREFETCH_ENABLE", False)
+        monkeypatch.setattr(gsa_mod, "IS_OPEN_GSA", False)
         assert (
             gsa_worker.allocate_slots(_fake_kv_cache_manager(), fakes.FakeRequest(), 10)
             is None

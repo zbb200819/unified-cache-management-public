@@ -155,7 +155,14 @@ def install_stubs():
     # ---------------- ucm.integration.vllm.ucm_connector ----------------
     _mod("ucm.integration")
     _mod("ucm.integration.vllm")
-    _mod("ucm.integration.vllm.ucm_connector", RequestHasher=_RequestHasher)
+    # build_kv_hash_meta 对齐 public 真实签名（ucm_connector.py:104：
+    # build_kv_hash_meta(vllm_config, rank_id) -> str）；gsa.py:46/225 依赖它，
+    # 缺失会使整个 UT 套件在收集期 ImportError。
+    _mod(
+        "ucm.integration.vllm.ucm_connector",
+        RequestHasher=_RequestHasher,
+        build_kv_hash_meta=lambda vllm_config, rank=0: "ut-hash-meta",
+    )
     # ucm/__init__.py 会执行 from ucm.integration.vllm.patch.logger_patch import
     # patch_logger —— 预置 stub 避免触发真实 patch 链（依赖真实 vllm）
     _mod("ucm.integration.vllm.patch")
@@ -168,11 +175,21 @@ def install_stubs():
         UCMKVPrefetch=fakes.FakeUCMPrefetch,
     )
 
-    # ---------------- torch.ops._C_gsa（ACL 自定义 op）----------------
+    # ---------------- torch.ops._C_gsa（本地 ops/ 扩展的 ACL op）----------------
     # 无条件覆盖：UT 不依赖真实 ACL op（NPU 环境同理，保证跨环境确定性）
     import torch
 
     torch.ops._C_gsa = SimpleNamespace(
+        gsa_gather_copy=lambda *a, **k: None,
+        gsa_scatter_copy=lambda *a, **k: None,
+    )
+
+    # ---------------- torch.ops._C_ascend（vllm-ascend csrc patch 注册的 op）----
+    # 生产代码 gsa.py（L1044/1051/1068/1075/1673/1680/1688/1697）与
+    # test_gsa.py 的 _record_ops 都引用 torch.ops._C_ascend.*；该命名空间由
+    # vllm-ascend-csrc-build-1020-c8.patch 编译注册，UT 环境必须 stub
+    # （README/FEASIBILITY 亦声明 conftest 覆盖 _C_ascend）。
+    torch.ops._C_ascend = SimpleNamespace(
         gsa_gather_copy=lambda *a, **k: None,
         gsa_scatter_copy=lambda *a, **k: None,
     )

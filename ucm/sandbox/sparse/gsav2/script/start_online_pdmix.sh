@@ -49,7 +49,7 @@ vllm serve /home/l00844759/models/GLM-5.2-w4a8c8/ \
     --max-num-seqs 16 \
     --max-num-batched-tokens 4096 \
     --trust-remote-code \
-    --gpu-memory-utilization 0.8 \
+    --gpu-memory-utilization 0.9 \
     --quantization ascend \
     --enable-chunked-prefill \
     --enable-prefix-caching \

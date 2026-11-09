@@ -94,7 +94,7 @@ ut/                      # 位于 ucm/sandbox/sparse/gsav2/ 下（无 __init__.p
    避免跨用例段污染。
 3. **平台分支**（gsa.py L30-43）：conftest 保证 import 走 True 侧（fake `torch.npu`），
    reload 用例覆盖 False 侧。
-4. **模块常量**（`IS_INDEXER_OFFLOAD`/`PTOPK_PREFETCH_ENABLE`/
+4. **模块常量**（`IS_INDEXER_OFFLOAD`/`IS_OPEN_GSA`/
    `IS_PERFORMANCE_LOG`/`SEG_PREFILL_THRESHOLD`/`VLLM_ASCEND_VERSION`/
    `UCM_LOOKUP_MAX_RETRY` 等）逐用例 monkeypatch 构造分支矩阵。
 5. **微型配置**：FakeVllmConfig（layer=2、max_model_len=2048、max_bs=4、

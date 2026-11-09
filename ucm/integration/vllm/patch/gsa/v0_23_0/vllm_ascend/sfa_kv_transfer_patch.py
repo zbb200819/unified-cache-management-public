@@ -339,7 +339,6 @@ def forward(
     if (
         (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
         and has_ucm_sparse()
-        and PTOPK_PREFETCH_ENABLE
         and self.layer_id < self.layer_num
     ):
         if self.enable_sparse_sfa_c8:
@@ -381,7 +380,6 @@ def forward(
         if (
             (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
             and has_ucm_sparse()
-            and PTOPK_PREFETCH_ENABLE
             and self.layer_id < self.layer_num
         ):
             torch_npu.npu_scatter_nd_update_(
@@ -425,7 +423,6 @@ def forward(
                             or not self.vllm_config.kv_transfer_config.is_kv_producer
                         )
                         and has_ucm_sparse()
-                        and PTOPK_PREFETCH_ENABLE
                         and self.layer_id < self.layer_num
                     ):
                         torch_npu.npu_scatter_nd_update_(
@@ -479,7 +476,6 @@ def forward(
     if (
         (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
         and has_ucm_sparse()
-        and PTOPK_PREFETCH_ENABLE
         and self.layer_id < self.layer_num
     ):
         if has_prefill:
@@ -603,7 +599,6 @@ def forward(
     if (
         (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
         and has_ucm_sparse()
-        and PTOPK_PREFETCH_ENABLE
         and self.layer_id < self.layer_num
     ):
         k_cache = kv_cache[0]

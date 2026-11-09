@@ -102,9 +102,3 @@ class TestGSAPrefetchBaseAPI:
         pe = self._pe()
         pe.del_finish_meta("req-1", flag=False)
         assert not pe.prefetch_engine_c.called("del_blocks_map")
-
-    def test_del_finish_meta_ptopk_disabled_skips(self, monkeypatch):
-        monkeypatch.setattr(pe_mod, "PTOPK_PREFETCH_ENABLE", False)
-        pe = self._pe()
-        pe.del_finish_meta("req-1")  # flag 默认 True，但开关关闭
-        assert not pe.prefetch_engine_c.called("del_blocks_map")

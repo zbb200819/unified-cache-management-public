@@ -24,7 +24,6 @@ def indexer_select_post_process(
     use_torch_npu_lightning_indexer: bool,
 ) -> torch.Tensor:
     from ucm.sparse.state import has_ucm_sparse
-    from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE
 
     # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
     # So two branches are maintained temporarily.
@@ -35,7 +34,6 @@ def indexer_select_post_process(
 
     if (
         has_ucm_sparse()
-        and PTOPK_PREFETCH_ENABLE
         and sfa_impl.layer_id < sfa_impl.layer_num
         and (
             sfa_impl.is_pdmix
@@ -211,14 +209,12 @@ def indexer_select_post_process_a5(
     use_torch_npu_lightning_indexer: bool,
 ) -> torch.Tensor:
     from ucm.sparse.state import has_ucm_sparse
-    from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE
 
     packed_kv_cache = getattr(sfa_impl, "enable_sparse_sfa_c8", False)
     indexer_cache_idx = 1 if packed_kv_cache else 2
     indexer_scale_cache_idx = 2 if packed_kv_cache else 3
     if (
         has_ucm_sparse()
-        and PTOPK_PREFETCH_ENABLE
         and sfa_impl.layer_id < sfa_impl.layer_num
         and (
             sfa_impl.is_pdmix

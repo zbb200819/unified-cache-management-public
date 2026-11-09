@@ -445,7 +445,6 @@ def _prepare_inputs(
     """
     from ucm.sparse.base import INVALID_SLOT
     from ucm.sparse.state import has_ucm_sparse
-    from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE
 
     total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
     assert total_num_scheduled_tokens > 0
@@ -871,7 +870,7 @@ def _prepare_inputs(
             + self.query_pos.gpu[:total_num_scheduled_tokens]
         )
 
-    if has_ucm_sparse() and PTOPK_PREFETCH_ENABLE:
+    if has_ucm_sparse():
         self.sparse_positions[:total_num_scheduled_tokens].copy_(
             torch.from_numpy(sparsed_positions[:total_num_scheduled_tokens]),
             non_blocking=True,
@@ -1791,7 +1790,7 @@ def _build_attention_metadata(
     :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
     """
     from ucm.sparse.state import has_ucm_sparse
-    from ucm.sparse.utils import IS_INDEXER_OFFLOAD, PTOPK_PREFETCH_ENABLE
+    from ucm.sparse.utils import IS_INDEXER_OFFLOAD
 
     # Attention metadata is not needed for attention free models
     if len(self.kv_cache_config.kv_cache_groups) == 0:
@@ -2000,7 +1999,6 @@ def _build_attention_metadata(
                 hasattr(self.vllm_config.model_config, "hf_text_config")
                 and hasattr(self.vllm_config.model_config.hf_text_config, "index_topk")
                 and has_ucm_sparse()
-                and PTOPK_PREFETCH_ENABLE
                 and (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
             ):
                 attn_metadata_i.gsa_slot_len = common_attn_metadata.num_input_tokens
@@ -2036,7 +2034,6 @@ def _build_attention_metadata(
             hasattr(self.vllm_config.model_config, "hf_text_config")
             and hasattr(self.vllm_config.model_config.hf_text_config, "index_topk")
             and has_ucm_sparse()
-            and PTOPK_PREFETCH_ENABLE
             and (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
         ):
             attn_metadata_i.num_padding_reqs = common_attn_metadata.num_input_tokens

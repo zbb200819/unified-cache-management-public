@@ -71,6 +71,7 @@ from ucm.sparse.utils import (
     INDEXER_SPARSE_RATE,
     INIT_LOCAL_WINDOWS,
     IS_INDEXER_OFFLOAD,
+    IS_OPEN_GSA,
     IS_PERFORMANCE_LOG,
     IS_SHARED_MEMCPY,
     KVCACHE_BUFFER_SIZE,
@@ -79,7 +80,6 @@ from ucm.sparse.utils import (
     MAX_SLOTS_BLOCK_NUM,
     PREFETCH_SPACE,
     PREFETCH_THREAD_NUM,
-    PTOPK_PREFETCH_ENABLE,
     SPA_TOKENS_LEN,
     STREAM_NUM,
     VLLM_ASCEND_VERSION,
@@ -494,7 +494,7 @@ class GSA(UcmSparseBase):
         self._init_slots_num_manager(role)
         if (
             role == UcmSparseRole.WORKER
-            and PTOPK_PREFETCH_ENABLE
+            and IS_OPEN_GSA
             and self.is_decode_node
         ):
             self._init_worker_shared_tables()
@@ -583,7 +583,7 @@ class GSA(UcmSparseBase):
         )
 
     def _init_slots_num_manager(self, role: UcmSparseRole):
-        if role == UcmSparseRole.SCHEDULER and PTOPK_PREFETCH_ENABLE:
+        if role == UcmSparseRole.SCHEDULER and IS_OPEN_GSA:
             self.slots_num_manager = SharedTensorManager(
                 "gsa_glm52_slots_num_dp" + str(self.dp_rank), False
             )
@@ -751,7 +751,7 @@ class GSA(UcmSparseBase):
             ).contiguous()
 
     def init_gsa_metadata(self, vllm_config):
-        if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
+        if not IS_OPEN_GSA or not self.is_decode_node:
             return
         self.cudagraph_capture_sizes = (
             vllm_config.compilation_config.cudagraph_capture_sizes
@@ -1099,7 +1099,7 @@ class GSA(UcmSparseBase):
         has_indexer: Optional[bool] = True,
         use_li_c8: Optional[bool] = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
+        if not IS_OPEN_GSA or not self.is_decode_node:
             return query, key, value, output
         if IS_PERFORMANCE_LOG:
             start = time.perf_counter()
@@ -1657,7 +1657,7 @@ class GSA(UcmSparseBase):
         has_indexer: Optional[bool] = True,
         use_li_c8: Optional[bool] = False,
     ) -> None:
-        if not PTOPK_PREFETCH_ENABLE or not self.is_pd_mix:
+        if not IS_OPEN_GSA or not self.is_pd_mix:
             return
         if IS_PERFORMANCE_LOG:
             start = time.perf_counter()
@@ -1760,7 +1760,7 @@ class GSA(UcmSparseBase):
     # @time_us
     def execute_begin(self, scheduler_output: SchedulerOutput, attn_metadata):
         """每步推理前的 GSA 预取准备：注入 store、处理请求、同步块表、构造输入"""
-        if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
+        if not IS_OPEN_GSA or not self.is_decode_node:
             return
         if IS_PERFORMANCE_LOG:
             start_total = time.perf_counter()
@@ -2218,7 +2218,7 @@ class GSA(UcmSparseBase):
                     )
 
     def warmup(self):
-        if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
+        if not IS_OPEN_GSA or not self.is_decode_node:
             return
         if len(self.warmup_topk) == 0:
             return
@@ -2246,7 +2246,7 @@ class GSA(UcmSparseBase):
     # @time_us
     def execute_finished(self, rec_result=None):
         """rec_result 代表当前每个 req 接受了多少个 token"""
-        if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
+        if not IS_OPEN_GSA or not self.is_decode_node:
             return
         if IS_PERFORMANCE_LOG:
             time_prepare = 0
@@ -2360,7 +2360,7 @@ class GSA(UcmSparseBase):
     def build_sparse_meta(
         self, scheduler_output: SchedulerOutput, requests, input_batch, attn_metadata
     ) -> None:
-        if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
+        if not IS_OPEN_GSA or not self.is_decode_node:
             return
         self.gsa_metadata = self.build_gsa_metadata(
             scheduler_output, requests, input_batch
@@ -2404,14 +2404,14 @@ class GSA(UcmSparseBase):
         pass
 
     def request_finished_in_scheduler(self, request_id: ReqType):
-        if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
+        if not IS_OPEN_GSA or not self.is_decode_node:
             return
         if request_id in self.preempt_req_output_tokens:
             del self.preempt_req_output_tokens[request_id]
         pass
 
     def request_finished_in_worker(self, request_id: ReqType):
-        if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
+        if not IS_OPEN_GSA or not self.is_decode_node:
             return
         while self.prefetch_engine.prefetch_engine_c.get_prefetch_status():
             time.sleep(0.001)
@@ -2470,7 +2470,7 @@ class GSA(UcmSparseBase):
         return gsa_preempted_flag
 
     def estimate_num_slots_sparsed(self, request: Request, num_spec_slots=3) -> int:
-        if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
+        if not IS_OPEN_GSA or not self.is_decode_node:
             return INVALID_SLOT
         if request.status == RequestStatus.PREEMPTED:
             self.preempt_req_output_tokens[request.request_id] = (
@@ -2492,7 +2492,7 @@ class GSA(UcmSparseBase):
         return num_tokens_sparsed
 
     def allocate_slots(self, kv_cache_manager, request, num_slots_sparsed):
-        if not PTOPK_PREFETCH_ENABLE or not self.is_decode_node:
+        if not IS_OPEN_GSA or not self.is_decode_node:
             return None
         coordinator = kv_cache_manager.coordinator
         block_pool = kv_cache_manager.block_pool
@@ -2558,7 +2558,7 @@ class GSA(UcmSparseBase):
     def _load_kv_dram(self, req_id):
         # PD 分离模式下，decode 节点在请求到达时按 rank 分片做 UCM lookup，
         # 命中部分提交 DRAM 加载任务；PD 混合模式无需此路径。
-        if not PTOPK_PREFETCH_ENABLE or self.is_pd_mix:
+        if not IS_OPEN_GSA or self.is_pd_mix:
             return
         if not self.is_decode_node:
             return

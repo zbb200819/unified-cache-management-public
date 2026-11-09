@@ -15,7 +15,7 @@ def __init__(
     vllm_config: VllmConfig,
     device: torch.device,
 ):
-    from ucm.sparse.utils import IS_INDEXER_OFFLOAD, IS_OPEN_GSA, PTOPK_PREFETCH_ENABLE
+    from ucm.sparse.utils import IS_INDEXER_OFFLOAD, IS_OPEN_GSA
 
     self.vllm_config = vllm_config
     self.model_config = vllm_config.model_config
@@ -349,7 +349,7 @@ def __init__(
     self.num_accepted_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
 
     ######[GSA] add attention metadata info
-    if PTOPK_PREFETCH_ENABLE and IS_OPEN_GSA:
+    if IS_OPEN_GSA:
         self.dsa_block_table = None
         self.dsa_seq_len = None
         self.dsa_slot_mapping = None

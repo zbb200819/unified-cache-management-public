@@ -99,7 +99,7 @@ class TestConstruction:
         assert isinstance(g.log, gsa_module.GSALogger)
 
     def test_worker_ptopk_disabled_minimal(self, make_worker, set_gsa_const):
-        set_gsa_const(PTOPK_PREFETCH_ENABLE=False)
+        set_gsa_const(IS_OPEN_GSA=False)
         g, _ = make_worker()
         assert not hasattr(g, "prefetch_engine")
         assert not hasattr(g, "indexer_block_table_sm")
@@ -216,7 +216,7 @@ class TestExecuteBegin:
         return g, stat, sched, attn_meta
 
     def test_early_return_ptopk_off(self, make_worker, set_gsa_const):
-        set_gsa_const(PTOPK_PREFETCH_ENABLE=False)
+        set_gsa_const(IS_OPEN_GSA=False)
         g, _ = make_worker()
         gsa_module.GSA.execute_begin(g, fakes.FakeSchedulerOutput(), {})
         assert g.prefetch_engine.step_time == 0
@@ -604,7 +604,7 @@ class TestInitIndexerOffloadAll:
 
 class TestAttentionBegin:
     def test_early_return_ptopk_off(self, make_worker, set_gsa_const):
-        set_gsa_const(PTOPK_PREFETCH_ENABLE=False)
+        set_gsa_const(IS_OPEN_GSA=False)
         g, _ = make_worker()
         q = torch.zeros(1)
         assert gsa_module.GSA.attention_begin(
@@ -765,10 +765,10 @@ class TestAttentionFinished:
 
 class TestWarmup:
     def test_early_returns(self, make_worker, set_gsa_const):
-        set_gsa_const(PTOPK_PREFETCH_ENABLE=False)
+        set_gsa_const(IS_OPEN_GSA=False)
         g, _ = make_worker()
         gsa_module.GSA.warmup(g)
-        set_gsa_const(PTOPK_PREFETCH_ENABLE=True)
+        set_gsa_const(IS_OPEN_GSA=True)
         g2, _ = make_worker()
         g2.warmup_topk = []
         gsa_module.GSA.warmup(g2)
@@ -877,7 +877,7 @@ class TestWarmup:
 
 class TestExecuteFinished:
     def test_early_return_ptopk_off(self, make_worker, set_gsa_const):
-        set_gsa_const(PTOPK_PREFETCH_ENABLE=False)
+        set_gsa_const(IS_OPEN_GSA=False)
         g, _ = make_worker()
         gsa_module.GSA.execute_finished(g)
 
@@ -1005,7 +1005,7 @@ class TestRequestLifecycle:
 
 class TestBuildSparseMeta:
     def test_early_return(self, make_worker, set_gsa_const):
-        set_gsa_const(PTOPK_PREFETCH_ENABLE=False)
+        set_gsa_const(IS_OPEN_GSA=False)
         g, _ = make_worker()
         gsa_module.GSA.build_sparse_meta(g, fakes.FakeSchedulerOutput(), {}, None, None)
 
