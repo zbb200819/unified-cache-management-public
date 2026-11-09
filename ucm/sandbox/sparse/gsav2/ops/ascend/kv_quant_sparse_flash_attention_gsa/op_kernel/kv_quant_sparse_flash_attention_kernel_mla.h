@@ -45,7 +45,7 @@ struct TempLoopInfo {
     int32_t nextTokensPerBatch = 0;
     uint32_t tndCoreStartKVSplitPos;
     uint32_t gS1Idx = 0U;
-    // splitKV(P0): 当前任务在全局(b,s1)序列中的线性编号，用于FD workspace寻址
+    // 当前任务在全局 (b,s1) 序列中的线性编号，用于 FD workspace 寻址
     uint32_t taskIdx = 0U;
     bool tndIsS2SplitCore;
     bool curActSeqLenIsZero = false;
@@ -61,8 +61,8 @@ public:
     using Q_ROPE_T = Q_T;
     using K_ROPE_T = typename QSFAT::kRopeType;
     using UPDATE_T = T;             // vec2Res累积保持fp32
-    using MM1_OUT_T = T;            // mm1Res(S)保持fp32(D-fp16精度回退)
-    using MM2_OUT_T = T;            // mm2Res(O)保持fp32(D-fp16精度回退)
+    using MM1_OUT_T = T;            // mm1Res(S) 保持 fp32
+    using MM2_OUT_T = T;            // mm2Res(O) 保持 fp32
 
     __aicore__ inline KvQuantSparseFlashAttentionMla(){};
     __aicore__ inline void Init(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *value,
@@ -84,16 +84,17 @@ private:
     static constexpr QSFA_LAYOUT LAYOUT_T = QSFAT::layout;
     static constexpr QSFA_LAYOUT KV_LAYOUT_T = QSFAT::kvLayout;
 
-    // GSA-P4: preLoadNum 2→3，加深 3 级 Preload 流水，掩盖 MTE3 stall 波动
+    // 3 级 Preload 流水，掩盖 MTE3 stall 波动
     static constexpr uint32_t PRELOAD_NUM = 3;
     static constexpr uint32_t N_BUFFER_M_BASIC_SIZE = 256;
     static constexpr uint32_t QSFA_PRELOAD_TASK_CACHE_SIZE = 3;
+    // combine 阶段任务描述符数组上线（单核 owner 任务数 <= ceil(x/aicNum) + 1）
+    static constexpr uint32_t QSFA_SPLITKV_TASK_MAX = 16U;
 
     static constexpr uint32_t SYNC_V0_C1_FLAG = 6;
     static constexpr uint32_t SYNC_C1_V1_FLAG = 7;
     static constexpr uint32_t SYNC_V1_C2_FLAG = 8;
     static constexpr uint32_t SYNC_C2_V2_FLAG = 9;
-    static constexpr uint32_t SYNC_C2_V1_FLAG = 4;
     static constexpr uint32_t SYNC_V1_NUPDATE_C2_FLAG = 5;
 
     static constexpr uint64_t SYNC_MM2RES_BUF1_FLAG = 10;
@@ -134,11 +135,6 @@ private:
     ConstInfo constInfo{};
     TempLoopInfo tempLoopInfo{};
 
-    // splitKV(P0): 本核combine阶段需要归约的任务列表(本核持有part 0的任务)
-    static constexpr uint32_t QSFA_SPLITKV_TASK_MAX = 16U;
-    SplitKVTaskInfo splitKVTasks[QSFA_SPLITKV_TASK_MAX]{};
-    uint32_t splitKVTaskCount = 0U;
-
     QSFAMatmulService<QSFAT> matmulService;
     QSFAVectorService<QSFAT> vectorService;
 
@@ -157,7 +153,7 @@ private:
 
     GlobalTensor<int32_t> actualSeqLengthsQGm;
     GlobalTensor<int32_t> actualSeqLengthsKVGm;
-    // GSA-P1: per-batch sparse lengths
+    // per-batch 真实 topk 长度
     GlobalTensor<int32_t> actualSparseLengthsGm;
     bool hasActualSparseLengths = false;
 
@@ -168,7 +164,6 @@ private:
     GlobalTensor<K_ROPE_T> kvMergeGm_;
     GlobalTensor<int32_t> kvValidSizeGm_;
 
-    GlobalTensor<int32_t> mm2ResInt32Gm;
     GlobalTensor<T> vec2ResGm;
 
     GlobalTensor<T> accumOutGm;
@@ -183,7 +178,7 @@ private:
                                             __gm__ uint8_t *actualSparseLengths);
     __aicore__ inline void InitOutputSingleCore();
     // ================================Process functions================================
-    __aicore__ inline void ProcessBalance();
+    __aicore__ inline void ProcessBalance(SplitKVTaskInfo *splitKVTasks, uint32_t &splitKVTaskCount);
     __aicore__ inline void PreloadPipeline(uint32_t loop, uint64_t s2Start, uint64_t s2LoopIdx,
                                            RunInfo extraInfo[QSFA_PRELOAD_TASK_CACHE_SIZE]);
     // ================================Offset Calc=====================================
@@ -195,7 +190,7 @@ private:
     __aicore__ inline void CalcMSizeInfo(RunInfo &info);
     __aicore__ inline void CalcFirstTensorOffsets(RunInfo &info, uint64_t qsfaActualSeqQPrefixSum,
                                                   uint64_t actualSeqKVPrefixSum);
-    // splitKV(C): sub全局编号 = taskIdx<tailStart ? taskIdx : tailStart+(taskIdx-tailStart)*P+part
+    // sub 全局编号 = taskIdx<tailStart ? taskIdx : tailStart+(taskIdx-tailStart)*P+part
     __aicore__ inline uint64_t SubIndexOf(uint32_t taskIdx, uint32_t partIdx) const;
     __aicore__ inline void GetAxisStartIdx(uint32_t bN2EndPrev, uint32_t gS1EndPrev, uint32_t s2EndPrev);
     __aicore__ inline uint64_t GetBalanceActualSeqLengths(GlobalTensor<int32_t> &actualSeqLengths, uint32_t bIdx);
@@ -216,7 +211,7 @@ template <typename QSFAT> __aicore__ inline void KvQuantSparseFlashAttentionMla<
 {
     usedCoreNum = tilingData->singleCoreParams.usedCoreNum;
     constInfo.splitKVNum = tilingData->splitKVParams.s2;
-    // C-splitKV: 尾波切分参数(host估计,真实taskNum在InitCalcParamsEach枚举后回填)
+    // 尾波切分参数(host 估计，真实 taskNum 在 InitCalcParamsEach 枚举后回填)
     constInfo.splitTailTaskNum = tilingData->splitKVParams.tailTaskNum;
     constInfo.splitS2LoopsEst = tilingData->splitKVParams.s2LoopsEst;
     constInfo.mmResUbSize = tilingData->singleCoreTensorSize.mmResUbSize;
@@ -237,14 +232,9 @@ template <typename QSFAT> __aicore__ inline void KvQuantSparseFlashAttentionMla<
     constInfo.headDimRope = headDimRope;
     constInfo.sparseBlockSize = tilingData->baseParams.sparseBlockSize;
     constInfo.sparseBlockCount = tilingData->baseParams.sparseBlockCount;
-    // GSA-P1: 有效 sparse count（host侧扫描，0表示未知退化为sparseBlockCount）
-    constInfo.effectiveSparseCount = tilingData->baseParams.effectiveSparseCount;
-    if (constInfo.effectiveSparseCount == 0) {
-        constInfo.effectiveSparseCount = constInfo.sparseBlockCount;
-    }
-    // GSA-P1: 是否返回 per-batch sparse lengths
+    // 是否传入 per-batch 真实 topk 长度
     hasActualSparseLengths = (tilingData->baseParams.hasActualSparseLengths != 0);
-    // GSA-v2: 是否返回 softmax 统计结果
+    // 是否返回 softmax 统计结果
     constInfo.returnSoftmaxLse = tilingData->baseParams.returnSoftmaxLse;
     constInfo.sparseMode = tilingData->baseParams.sparseMode;
     constInfo.quantScaleRepoMode = QUANT_SCALE_REPO_MODE::COMBINE;
@@ -258,7 +248,6 @@ template <typename QSFAT> __aicore__ inline void KvQuantSparseFlashAttentionMla<
     constInfo.syncC1V1 = SYNC_C1_V1_FLAG;
     constInfo.syncV1C2 = SYNC_V1_C2_FLAG;
     constInfo.syncC2V2 = SYNC_C2_V2_FLAG;
-    // constInfo.syncC2V1 = SYNC_C2_V1_FLAG;
     constInfo.syncV1NupdateC2 = SYNC_V1_NUPDATE_C2_FLAG;
 }
 
@@ -285,7 +274,7 @@ KvQuantSparseFlashAttentionMla<QSFAT>::InitActualSeqLen(__gm__ uint8_t *actualSe
     if (constInfo.actualLenDimsKV != 0) {
         actualSeqLengthsKVGm.SetGlobalBuffer((__gm__ int32_t *)actualSeqLengths, constInfo.actualLenDimsKV);
     }
-    // GSA-P1: per-batch sparse lengths
+    // per-batch 真实 topk 长度
     if (hasActualSparseLengths && actualSparseLengths != nullptr) {
         actualSparseLengthsGm.SetGlobalBuffer((__gm__ int32_t *)actualSparseLengths, constInfo.batchSize);
     }
@@ -348,10 +337,9 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::GetSparseActualSeq
         threshold = static_cast<int64_t>(tempLoopInfo.nextTokensPerBatch) + s1Idx + 1;
     }
     if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
-        // GSA-P1: 使用 effectiveSparseCount（host侧扫描的有效topk数）替代 sparseBlockCount
+        // 用 per-batch 真实 topk 长度替代 sparseBlockCount， 跳过 -1 padding 迭代
         // 这是 5120-padding-1 场景性能从 429us 回到 ~95us 的关键改动
-        // 
-        uint32_t effCount = constInfo.effectiveSparseCount;
+        uint32_t effCount = constInfo.sparseBlockCount;
         if (hasActualSparseLengths) {
             int32_t perBatch = actualSparseLengthsGm.GetValue(bIdx);
             if (perBatch > 0 && static_cast<uint32_t>(perBatch) < effCount) {
@@ -542,11 +530,10 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uint8_
         (__gm__ MM2_OUT_T *)(workspace + qsfaOffset +
                              aiCoreIdx * dbWorkspaceRatio * constInfo.bmm2ResUbSize * sizeof(MM2_OUT_T)));
     qsfaOffset += GetBlockNum() * dbWorkspaceRatio * constInfo.bmm2ResUbSize * sizeof(MM2_OUT_T);
-    mm2ResInt32Gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(mm2ResGm.GetPhyAddr(0)));
 
     vec2ResGm.SetGlobalBuffer((__gm__ T *)(workspace + qsfaOffset +
                               aiCoreIdx * dbWorkspaceRatio * constInfo.bmm2ResUbSize * sizeof(T)));
-    // vec2Res跨chunk累积恒为fp32,workspace推进量按sizeof(T)计
+    // vec2Res 跨 chunk 累积恒为 fp32,workspace 推进量按 sizeof(T) 计
     qsfaOffset += GetBlockNum() * dbWorkspaceRatio * constInfo.bmm2ResUbSize * sizeof(T);
 
     if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
@@ -557,12 +544,12 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uint8_
 
         kvValidSizeGm_.SetGlobalBuffer(
             (__gm__ int32_t *)(workspace + qsfaOffset + (aiCoreIdx * 2) * 128 * 4 * sizeof(int32_t)));
-        // P0-splitKV修复: kvValidSize区域后必须推进qsfaOffset，否则FD区域会与其重叠
+        // kvValidSize 区域后必须推进 qsfaOffset，否则 FD 区域会与其重叠
         qsfaOffset += GetBlockNum() * 2 * 128 * 4 * sizeof(int32_t);
     }
 
-    // P0-splitKV: FLASH_DECODE模板参数改为运行时tiling字段控制(splitKVParams.s2>1)，
-    // 避免新增tilingKey实例；FD workspace紧随kvValidSize之后
+    // split KV 由运行时 tiling 字段控制(splitKVParams.s2>1)，避免新增 tilingKey 实例；
+    // FD workspace 紧随 kvValidSize 之后
     if (constInfo.splitKVNum > 1U) {
         accumOutGm.SetGlobalBuffer((__gm__ float *)(workspace + qsfaOffset));
         qsfaOffset = qsfaOffset + tilingData->splitKVParams.accumOutSize * sizeof(float);
@@ -574,7 +561,6 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uint8_
 
     if ASCEND_IS_AIV {
         vectorService.InitParams(constInfo, tilingData);
-        vectorService.InitMm2ResInt32GmGlobalTensor(mm2ResInt32Gm);
         if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
             vectorService.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, kRopeGm, keyGm, blockTableGm);
         }
@@ -613,7 +599,7 @@ template <typename QSFAT> __aicore__ inline void KvQuantSparseFlashAttentionMla<
         totalBaseNum += actBatchS1 * actBatchS2 ;
     }
     uint32_t avgBaseNum = 1;
-    // C-splitKV: 以全局sub序列做「工作量加权」核间均分。
+    // 以全局 sub 序列做「工作量加权」核间均分。
     // sub编号：taskIdx<tailStart ? taskIdx : tailStart+(taskIdx-tailStart)*P+part
     // 权重：full任务=L(估计s2迭代数)，切分part=ceil(L/P)。
     // WCP(加权等分点连续区间)分配：sub归属核 = (prefix-1)*coreNum/totalW
@@ -795,7 +781,7 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::CalcParams(uint32_
     info.gS1Idx = tempLoopInfo.gS1Idx;
     info.s2Idx = s2LoopIdx;
     info.curSInnerLoopTimes = tempLoopInfo.s2LoopTimes;
-    // C-splitKV: FD workspace寻址用的全局sub编号(=SubOf(taskIdx, partIdx))
+    // FD workspace 寻址用的全局 sub 编号(=SubOf(taskIdx, partIdx))
     info.splitSubIdx = (uint32_t)SubIndexOf(tempLoopInfo.taskIdx, tempLoopInfo.tndCoreStartKVSplitPos);
 
     info.isBmm2Output = false;
@@ -941,12 +927,15 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::ComputeMm2(const R
         CrossCoreWaitFlag(constInfo.syncV1C2);
         matmulService.ComputeMm2(info, mSplitInfo);
         CrossCoreSetFlag<ConstInfo::QSFA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC2V2);
-        // CrossCoreSetFlag<ConstInfo::QSFA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC2V1);
     }
 }
 
 template <typename QSFAT> __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::Process()
-{
+{  
+    // 任务描述符放在Process()栈帧而非类成员-类成员数组会显著改变
+    // 编译器对本类热路径的代码生成（实测真实topk性能回退月25%）
+    SplitKVTaskInfo splitKVTasks[QSFA_SPLITKV_TASK_MAX];
+    uint32_t splitKVTaskCount = 0U;
     if (aiCoreIdx < usedCoreNum) {
         if ASCEND_IS_AIC {
             matmulService.AllocEventID();
@@ -954,7 +943,7 @@ template <typename QSFAT> __aicore__ inline void KvQuantSparseFlashAttentionMla<
             vectorService.AllocEventID();
             vectorService.InitSoftmaxDefaultBuffer();
         }
-        ProcessBalance();
+        ProcessBalance(splitKVTasks, splitKVTaskCount);
 
         if ASCEND_IS_AIC {
             matmulService.FreeEventID();
@@ -962,7 +951,7 @@ template <typename QSFAT> __aicore__ inline void KvQuantSparseFlashAttentionMla<
             vectorService.FreeEventID();
         }
     }
-    // P0-splitKV: combine阶段。SyncAll是AIV-only硬件栅栏(自带PIPE_ALL drain，
+    // combine 阶段。SyncAll 是 AIV-only 硬件栅栏(自带PIPE_ALL drain，
     // 障栅消息走MTE3队列，保证各核FD partial写入GM后栅栏才放行)，
     // 必须放在 usedCoreNum 判定之外——所有AIV block(含空转核)都要到达，否则死锁。
     // AIC不参与combine(FD partial全部由AIV写出)。
@@ -982,16 +971,16 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::GetBN2Idx(uint32_t
     n2Idx = bN2Idx % kvHeadNum;
 }
 
-template <typename QSFAT> __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::ProcessBalance()
+template <typename QSFAT> __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::ProcessBalance(
+    SplitKVTaskInfo *splitKVTasks, uint32_t &splitKVTaskCount)
 {
     RunInfo extraInfo[QSFA_PRELOAD_TASK_CACHE_SIZE];
     uint32_t gloop = 0;
     int gS1LoopEnd;
-    // C-splitKV: 尾波任务切P份，其余任务整块执行；per-task partNum见下
+    // 尾波任务切 P 份，其余任务整块执行；per-task partNum 见下
     uint32_t partNumGlobal = (constInfo.splitKVNum > 1U) ? constInfo.splitKVNum : 1U;
     uint32_t taskGlobalIdx = constInfo.splitTaskStart;
     if ASCEND_IS_AIC {
-        // CrossCoreSetFlag<ConstInfo::QSFA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC2V1);
         if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
             CrossCoreSetFlag<ConstInfo::QSFA_SYNC_MODE2, PIPE_MTE2>(3);
             CrossCoreSetFlag<ConstInfo::QSFA_SYNC_MODE2, PIPE_MTE2>(3);
@@ -1020,12 +1009,12 @@ template <typename QSFAT> __aicore__ inline void KvQuantSparseFlashAttentionMla<
             }
             int s2SplitNum =
                 (tempLoopInfo.curActualSeqLen + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize; // S2切分份数
-            // C-splitKV: per-task partNum——尾波任务(>=splitTailStart)切P份，其余任务整块
+            // per-task partNum——尾波任务(>=splitTailStart)切P份，其余任务整块
             uint32_t taskPartNum = 1U;
             if (partNumGlobal > 1U) {
                 taskPartNum = (taskGlobalIdx >= constInfo.splitTailStart) ? partNumGlobal : 1U;
             }
-            // C-splitKV: 计算本任务分给本核的part区间 [partLo, partHi)
+            // 计算本任务分给本核的part区间 [partLo, partHi)
             // (由本核sub区间[splitSubStart,splitSubEnd)与该任务的sub编号区间求交集)
             uint32_t partLo = 0;
             uint32_t partHi = 1;
@@ -1036,8 +1025,8 @@ template <typename QSFAT> __aicore__ inline void KvQuantSparseFlashAttentionMla<
                 partLo = (lo > 0) ? (uint32_t)lo : 0U;
                 partHi = (hi < 0) ? 0U : ((hi < (int64_t)taskPartNum) ? (uint32_t)hi : taskPartNum);
             }
-            // C-splitKV: 持有part 0的核负责该尾波任务的combine，记录任务信息(仅AIV)
-            // (full任务part 0覆盖全区间直写attenOut，无需combine，不记录)
+            // 持有part 0 的核负责该尾波任务的 combine，记录任务信息(仅 AIV)
+            // (full 任务 part 0 覆盖全区间直写 attenOut，无需 combine，不记录)
             if ASCEND_IS_AIV {
                 if ((taskPartNum > 1U) && (partLo == 0) && (s2SplitNum > 0) &&
                     (splitKVTaskCount < QSFA_SPLITKV_TASK_MAX)) {

@@ -240,7 +240,7 @@ int GSAPrefetchEngineC::CallPrefetchProcess(const TaskInfo& taskInfo, ThreadInfo
                 "cpu merge time: %lu, memcpy time: %lu, "
                 "sync time: %lu, h2d time: %lu, ops time: %lu\n",
                 mDecodeStep, duration.count(), managerDuration.count(), timing.cpuMove,
-                timing.memcpy, timing.sync, timing.h2d, timing.ops);
+                timing.memcpyUs, timing.sync, timing.h2d, timing.ops);
     return ret;
 }
 
@@ -603,7 +603,7 @@ void GSAPrefetchEngineC::MergeAndCopyPrefetchLayer(const TaskInfo& taskInfo, Thr
     CopyPrefetchToH2DBuffers(streamIdx, layerID);
     ValidateAndPublishHbmSlotIndex(streamIdx, layerID, hbmSlotIndex);
     auto memcpyEnd = std::chrono::high_resolution_clock::now();
-    timing.memcpy +=
+    timing.memcpyUs +=
         std::chrono::duration_cast<std::chrono::microseconds>(memcpyEnd - cpuEnd).count();
     if (Synchronize(threadInfo.context_, static_cast<aclrtStream*>(threadInfo.stream_) + streamIdx,
                     1, mLogger) != 0) {

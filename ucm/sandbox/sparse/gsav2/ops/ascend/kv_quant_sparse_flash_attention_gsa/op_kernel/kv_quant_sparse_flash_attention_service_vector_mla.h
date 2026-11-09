@@ -33,9 +33,8 @@ public:
     using K_ROPE_T = typename QSFAT::kRopeType;
     using OUT_T = typename QSFAT::outputType;
     using UPDATE_T = T;             // vec2Res累积fp32
-    using MM1_OUT_T = float;        // mm1Res(S)保持fp32(D-fp16精度回退)
-    using MM2_OUT_T = float;        // mm2Res(O)保持fp32(D-fp16精度回退)
-    bool NO_AMLA = true;
+    using MM1_OUT_T = float;        // mm1Res(S) 保持 fp32
+    using MM2_OUT_T = float;        // mm2Res(O) 保持 fp32
 
     __aicore__ inline QSFAVectorService(){};
     __aicore__ inline void ProcessVec1L(const RunInfo &info);
@@ -43,7 +42,6 @@ public:
     __aicore__ inline void InitBuffers(TPipe *pipe);
     __aicore__ inline void InitParams(const struct ConstInfo &constInfo,
                                       const KvQuantSparseFlashAttentionTilingDataMla *__restrict tilingData);
-    __aicore__ inline void InitMm2ResInt32GmGlobalTensor(GlobalTensor<int32_t> mm2ResInt32Gm);
     __aicore__ inline void InitVec0GlobalTensor(const GlobalTensor<int32_t> &kvValidSizeGm,
                                                 const GlobalTensor<K_ROPE_T> &kvMergeGm,
                                                 const GlobalTensor<K_ROPE_T> &keyRopeGm,
@@ -108,7 +106,7 @@ public:
     __aicore__ inline void Bmm2FDDataCopyOut(const RunInfo &info, LocalTensor<T> &bmm2ResUb, uint32_t wsMStart,
                                              uint32_t dealRowCount, uint32_t columnCount,
                                              uint32_t actualColumnCount);
-    // P0-splitKV: combine阶段——对本核持有part 0的任务做跨核online-softmax归约并写出最终输出
+    // combine 阶段——对本核持有 part 0 的任务做跨核 online-softmax 归约并写出最终输出
     __aicore__ inline void ProcessSplitKVCombine(const SplitKVTaskInfo *tasks, uint32_t taskCount);
     __aicore__ inline void GetConfusionTransposeTiling(int64_t numR, int64_t numC, const uint32_t stackBufferSize,
                                                        const uint32_t typeSize, ConfusionTransposeTiling &tiling);
@@ -150,7 +148,6 @@ private:
     uint32_t pingpongFlag = 0U;
     ConstInfo constInfo = {};
 
-    GlobalTensor<int32_t> mm2ResInt32Gm;
     GlobalTensor<MM1_OUT_T> mm1ResGm;
     GlobalTensor<K_ROPE_T> vec1ResGm;
     GlobalTensor<T> lseSumFdGm;
@@ -236,13 +233,6 @@ QSFAVectorService<QSFAT>::InitParams(const struct ConstInfo &constInfo,
 }
 
 template <typename QSFAT>
-__aicore__ inline void
-QSFAVectorService<QSFAT>::InitMm2ResInt32GmGlobalTensor(GlobalTensor<int32_t> mm2ResInt32Gm)
-{
-    this->mm2ResInt32Gm = mm2ResInt32Gm;
-}
-
-template <typename QSFAT>
 __aicore__ inline void QSFAVectorService<QSFAT>::InitVec0GlobalTensor(
     const GlobalTensor<int32_t> &kvValidSizeGm, const GlobalTensor<K_ROPE_T> &kvMergeGm,
     const GlobalTensor<K_ROPE_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm, const GlobalTensor<int32_t> &blkTableGm)
@@ -316,7 +306,7 @@ __aicore__ inline void QSFAVectorService<QSFAT>::ComputeLogSumExpAndCopyToGm(con
     }
     uint64_t qsfaBaseOffset = mSplitInfo.nBufferStartM / 2;
     size_t qsfaSize = mSplitInfo.vecDealM * FP32_BLOCK_ELEMENT_NUM;
-    // C-splitKV: lse槽位 = (sub*gSize + 行号)*8 (sub=该(task,part)的全局编号)
+    // lse 槽位 = (sub*gSize + 行号)*8 (sub = 该 (task,part) 的全局编号)
     // 与combine阶段(Bmm2FDDataCopyOut/ProcessSplitKVCombine)的布局约定一致
     uint64_t qsfaSlot = (uint64_t)info.splitSubIdx * constInfo.kvHeadNum * constInfo.mBaseSize +
                         mSplitInfo.nBufferStartM + mSplitInfo.vecStartM;
@@ -727,9 +717,7 @@ __aicore__ inline void QSFAVectorService<QSFAT>::CopyOutMrgeResult(int64_t mte2S
         Brcb(antiQuantScale, tmpAntiQuantScale, dealRow, {1, 4});
     }
     PipeBarrier<PIPE_V>();
-    // GSA-P2: 反量化直通路径 —— 省掉 FP16→FP32→Mul(FP32)→BF16 的 FP32 中转
-    // 改为: scale FP32→K_ROPE_T, 然后 INT8→FP16 Cast 后直接在 K_ROPE_T 域做 Mul
-    // 收益: 减少 2 次 Cast + 2 次 PipeBarrier per dealLoop iteration，V0 阶段压缩 ~30-40%
+    // 反量化： int8 → fp 16 Cast 后直接在 K_ROPE_T 域乘 scale，省去 FP32 中转
     uint32_t dealLoop = CeilDiv(dealRow, LIMIT_DEAL_ROW);
     uint32_t dealRowFp32 = LIMIT_DEAL_ROW;
     uint32_t element = LIMIT_DEAL_ROW * constInfo.headDim;
@@ -917,7 +905,7 @@ __aicore__ inline void QSFAVectorService<QSFAT>::ProcessVec1L(const RunInfo &inf
         ProcessVec1SingleBuf(info, mSplitInfo);
         CrossCoreSetFlag<ConstInfo::QSFA_SYNC_MODE2, PIPE_MTE3>(constInfo.syncV1C2);
         // move lse for flash decode
-        // P0-splitKV: FLASH_DECODE模板参数改为运行时tiling字段判断
+        // splitKV 由运行时 tiling 字段判断
         if (info.s2Idx == info.curSInnerLoopTimes - 1) {
             if (info.tndIsS2SplitCore) {
                 if (constInfo.splitKVNum > 1U) {
@@ -980,9 +968,8 @@ __aicore__ inline void QSFAVectorService<QSFAT>::DealBmm2ResBaseBlock(const RunI
     SetFlag<AscendC::HardEvent::V_MTE2>(SYNC_INPUT_BUF1_FLAG + pingpongFlag);
 
     // 除第一个循环外，均需要更新中间计算结果
-    // P0-splitKV修复: 判断条件从 s2Idx>0 改为 !isFirstSInnerLoop——
-    // split场景下part>0的首个迭代(s2Idx>0但isFirstSInnerLoop=true)必须重新起算，
-    // 否则会读到上一个part的累积结果并乘以exp(默认max-当前max)=0，破坏part 0的结果
+    // 必须用 !isFirstSInnerLoop 而非 s2Idx>0 判断：split 场景下 part > 0 的首个迭代
+    // (s2Idx>0 但 isFirstSInnerLoop=true )必须重新起算，否则会读到上一个part的累积结果
     if (!info.isFirstSInnerLoop) {
         event_t eventIdMte2WaitMte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
         SetFlag<HardEvent::MTE3_MTE2>(eventIdMte2WaitMte3);
@@ -1005,8 +992,8 @@ __aicore__ inline void QSFAVectorService<QSFAT>::DealBmm2ResBaseBlock(const RunI
     }
     // 最后一次输出计算结果，否则将中间结果暂存至workspace
     if (info.s2Idx + 1 == info.curSInnerLoopTimes) {
-        // P0-splitKV修复: split核(写FD partial)不做归一化——partial保持未归一，
-        // 由combine阶段按 max/maxG 权重归约后再除以加权和；只有直写attenOut的路径才RowDivs
+        // split 核(写 FD partial)不做归一化——partial 保持未归一，
+        // 由 combine 阶段按 max/maxG 权重归约后再除以加权和；只有直写 attenOut 的路径才 RowDivs
         if (!info.tndIsS2SplitCore) {
             LocalTensor<T> softmaxSumBrcb =  tmpBuff2.Get<T>();
             Brcb(softmaxSumBrcb, softmaxSumUb[(info.loop % constInfo.preLoadNum) * SOFTMAX_TMP_BUFFER_OFFSET + baseOffset],
@@ -1107,12 +1094,12 @@ QSFAVectorService<QSFAT>::Bmm2FDDataCopyOut(const RunInfo &info, LocalTensor<T> 
     DataCopy(tmp, bmm2ResUb, columnCount * dealRowCount);
     SetFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
     WaitFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
-    // C-splitKV: accumOut槽位 = (sub*gSize + 行号)*512，与combine阶段布局约定一致
+    // accumOut 槽位 = (sub*gSize + 行号)*512，与 combine 阶段布局约定一致
     uint64_t offset = (uint64_t)info.splitSubIdx * constInfo.kvHeadNum * constInfo.mBaseSize *
                       constInfo.headDim +                              // sub编号offset
                       wsMStart * actualColumnCount;                    // m轴offset
     GlobalTensor<T> dst = accumOutGm[offset];
-    // P0-splitKV修复: 原dead代码条件写反——有效迭代(!=0)写真实partial数据，无效迭代才写0
+    // 有效迭代(!=0)写真实 partial 数据，无效迭代才写0
     if (info.actualSingleProcessSInnerSize != 0) {
         DataCopyExtParams dataCopyParams;
         dataCopyParams.blockCount = dealRowCount;
@@ -1166,7 +1153,7 @@ __aicore__ inline void
 QSFAVectorService<QSFAT>::Bmm2ResCopyOut(const RunInfo &info, LocalTensor<T> &bmm2ResUb, uint32_t wsMStart,
                                          uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount)
 {
-    // P0-splitKV: 运行时判断splitKV；split核写FD workspace等待combine，非split核直写attenOut
+    // 运行时判断 splitKV；split 改写 FD workspace 等待 combine，非 split 核直写 attenOut
     if ((constInfo.splitKVNum > 1U) && info.tndIsS2SplitCore) {
         Bmm2FDDataCopyOut(info, bmm2ResUb, wsMStart, dealRowCount, columnCount, actualColumnCount);
     } else {
@@ -1214,7 +1201,7 @@ __aicore__ inline void QSFAVectorService<QSFAT>::ProcessSplitKVCombine(const Spl
 
     for (uint32_t t = 0; t < taskCount; t++) {
         const uint32_t loopTimes = tasks[t].s2Loops;
-        const uint32_t partNum = tasks[t].partNum;   // C-splitKV: per-task P(仅尾波任务>1)
+        const uint32_t partNum = tasks[t].partNum;   // per-task P (仅尾波任务 >1)
         uint32_t partIter = (loopTimes + partNum - 1) / partNum;      // 每part的s2迭代数
         uint32_t validParts = (loopTimes + partIter - 1) / partIter;  // 非空part数
         if (validParts <= 1) {
@@ -1300,7 +1287,7 @@ __aicore__ inline void QSFAVectorService<QSFAT>::ProcessSplitKVCombine(const Spl
                     Cast(castUb, accUb, AscendC::RoundMode::CAST_ROUND, dealRow * headDimV);
                 }
                 SetFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
-                WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
+                WaitFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
                 DataCopyExtParams copyParams;
                 copyParams.blockCount = dealRow;
                 copyParams.blockLen = headDimV * sizeof(OUT_T);

@@ -32,7 +32,7 @@ using namespace ge;
 using namespace AscendC;
 namespace optiling {
 
-constexpr uint32_t PRE_LOAD_NUM = 3; // GSA-P4: 2→3 加深流水
+constexpr uint32_t PRE_LOAD_NUM = 3; // 3 级 Preload 流水，掩盖 MTE3 stall
 constexpr uint32_t BLOCK_TABLE_ELEM_BYTE = 4;
 constexpr int32_t SPARSE_MODE_BAND = 4;
 
@@ -306,9 +306,7 @@ void QSFAMlaTiling::CheckUbSpace()
 
 void QSFAMlaTiling::CalcInnerSize(uint32_t qsfaS2Size)
 {
-    sInnerSize_ = 512; // 512:s2默认切分大小
-    // P0-splitKV: 删除原先依赖splitKVFlag_缩减sInnerSize_的dead code——
-    // splitKVFlag_现已可能为true，若保留会改变s2BaseSize进而破坏非FD主路径
+    sInnerSize_ = 512; // 512:s2默认切分大小（splitKV 通过跨核切分实现， 不改变 s2BaseSize）
 
     sInnerLoopTimes_ = (qsfaS2Size + sInnerSize_ - 1) / sInnerSize_;
     sInnerSizeTail_ = qsfaS2Size - (sInnerLoopTimes_ - 1) * sInnerSize_;
@@ -323,7 +321,7 @@ void QSFAMlaTiling::CalcInnerSize(uint32_t qsfaS2Size)
 void QSFAMlaTiling::SplitBalanced()
 {
     CalcInnerSize(qsfaInfo_->s2Size);
-    DecideSplitKV(); // P0-splitKV: CalcInnerSize之后执行(sInnerSize_已确定为512)
+    DecideSplitKV(); // 必须在 CalcInnerSize 之后执行(sInnerSize_ 已确定为 512)
     InnerSplitParams qsfaInnerSplitParams;
     qsfaInnerSplitParams.s1GBaseSize = qsfaInfo_->gSize;
     tilingData_.innerSplitParams.set_mBaseSize(qsfaInnerSplitParams.s1GBaseSize);
@@ -335,8 +333,8 @@ void QSFAMlaTiling::SplitBalanced()
 }
 
 /*
- * P0/C-splitKV: 决定是否启用S2跨核切分(flash-decoding式)及切分策略。
- * C阶段升级为「尾波自适应切分 + 工作量加权分核」：
+ * 决定是否启用 S2 跨核切分(flash-decoding式)及切分策略：
+ * 「尾波自适应切分 + 工作量加权分核」：
  *   任务=(b,s1)，子任务(sub)=(task,part)。仅尾波x个任务切P份，其余任务整块执行；
  *   核间按迭代工作量(而非子任务数)加权均分，消除波尾碎片。
  *   sub全局编号：前taskNum-x个任务各占1个sub(编号=taskIdx)，其后每个切分任务占P个
@@ -350,9 +348,7 @@ void QSFAMlaTiling::SplitBalanced()
  *   3. 有效s2迭代数>=4(太少无切分价值)
  *   4. 建模收益>=25%且P>=2
  *   5. subTotal<=4*aicNum(FD workspace与kernel owner任务数组上界)
- * 环境变量(基准测试/验证用)：
- *   QSFA_DISABLE_SPLITKV=1        强制关闭；QSFA_FORCE_SPLITKV=P 强制全任务切P(受同一安全上限)
- *   QSFA_ENABLE_SPLITKV=1         允许自动切分(生产默认关闭：真实topk下均匀makespan模型误判,实测性能下降)
+ * 
  */
 void QSFAMlaTiling::DecideSplitKV()
 {
@@ -376,14 +372,9 @@ void QSFAMlaTiling::DecideSplitKV()
     if (taskNum == 0 || sInnerSize_ == 0 || aicNum_ == 0) {
         return;
     }
-    // 有效s2长度：sparse block总量，不超过seq长度与有效topk数
+    // 有效s2长度：sparse block总量，不超过seq长度
     uint64_t effS2 = static_cast<uint64_t>(qsfaInfo_->sparseBlockCount) *
                      static_cast<uint64_t>(qsfaInfo_->sparseBlockSize);
-    if (qsfaInfo_->effectiveSparseCount > 0) {
-        uint64_t effS2ByCount = static_cast<uint64_t>(qsfaInfo_->effectiveSparseCount) *
-                                static_cast<uint64_t>(qsfaInfo_->sparseBlockSize);
-        effS2 = std::min(effS2, effS2ByCount);
-    }
     effS2 = std::min(effS2, static_cast<uint64_t>(qsfaInfo_->s2Size));
     const uint32_t s2Loops = static_cast<uint32_t>((effS2 + sInnerSize_ - 1) / sInnerSize_);
     constexpr uint32_t MIN_S2_LOOPS_FOR_SPLIT = 4;  // 4:最少迭代数
@@ -394,43 +385,10 @@ void QSFAMlaTiling::DecideSplitKV()
     }
     const uint64_t baseMakespan = ((taskNum + aicNum_ - 1) / aicNum_) * s2Loops;
     const uint64_t subBudget = SUB_TOTAL_BUDGET * aicNum_;
-    // 环境变量开关，供on-device基准测试做splitKV开/关A/B对比及combine路径验证。
-    //   QSFA_DISABLE_SPLITKV=1           强制关闭(走原非split路径)
-    //   QSFA_FORCE_SPLITKV=P (2~上限)    强制全任务切P(兼容P0均匀切分行为,仍受安全上限约束)
-    //   QSFA_ENABLE_SPLITKV=1            允许自动切分(生产默认关闭)
-    const char *disableEnv = std::getenv("QSFA_DISABLE_SPLITKV");
-    if (disableEnv != nullptr && disableEnv[0] == '1' && disableEnv[1] == '\0') {
-        return;
-    }
-    const char *forceEnv = std::getenv("QSFA_FORCE_SPLITKV");
-    if (forceEnv != nullptr) {
-        long forcedP = std::strtol(forceEnv, nullptr, 10);
-        if (forcedP >= 2) {
-            uint64_t subTotal = taskNum * static_cast<uint64_t>(forcedP);
-            if (subTotal <= subBudget) {
-                kvSplitPart_ = static_cast<uint32_t>(forcedP);
-                splitKVFlag_ = true;
-                kvSplitTailTaskNum_ = static_cast<uint32_t>(taskNum); // 全任务切分
-                kvSplitS2LoopsEst_ = s2Loops;
-                kvSplitTaskNumEst_ = taskNum;
-                OP_LOGI(qsfaInfo_->opName,
-                        "QSFA splitKV forced: P=%u, taskNum=%llu, s2Loops=%u.", kvSplitPart_,
-                        static_cast<unsigned long long>(taskNum), s2Loops);
-            }
-        }
-        return;
-    }
-    // 生产默认关闭自动切分：makespan模型假设各任务s2迭代数均匀(host仅有全局上界估计，
-    // TND下无法读取每任务真实topk长度)，真实topk分布差异大时模型误判启用，实测性能下降约20%。
-    // 待真实负载验证模型修正后再行开启；基准/验证请用 QSFA_ENABLE_SPLITKV=1 或 QSFA_FORCE_SPLITKV=P。
-    const char *enableEnv = std::getenv("QSFA_ENABLE_SPLITKV");
-    if (enableEnv == nullptr || enableEnv[0] != '1' || enableEnv[1] != '\0') {
-        return;
-    }
     // makespan模拟：WCP(加权等分点连续区间切分)——sub按全局顺序流式分配，
     // 归属核 = (prefix-1)*nCore/totalW，核负载=区间权重和。与kernel侧InitCalcParamsEach严格一致。
     // 数学结论(供后续维护)：full任务整块不可拆，大bs(64/112/128)在subTotal<=4*aicNum约束下
-    // 最优组合恰等于base makespan，尾波切分无真实收益(不启用是正确行为，勿试图"修复")。
+    // 最优组合恰等于 base makespan，尾波切分无真实收益(不启用是正确行为)。
     auto simulateMakespan = [this, taskNum, s2Loops](uint32_t x, uint32_t p) -> uint64_t {
         const uint64_t partW = (s2Loops + p - 1) / p;
         const uint64_t totalW = (taskNum - x) * s2Loops + x * partW * p;
@@ -511,11 +469,6 @@ void QSFAMlaTiling::DecideSplitKV()
             static_cast<unsigned long long>(baseMakespan), static_cast<unsigned long long>(bestMakespan));
 }
 
-void QSFAMlaTiling::Split()
-{
-    SplitBalanced();
-}
-
 void QSFAMlaTiling::FillTilingBaseParamsMla()
 {
     tilingData_.baseParams.set_batchSize(qsfaInfo_->bSize);
@@ -534,17 +487,16 @@ void QSFAMlaTiling::FillTilingBaseParamsMla()
     tilingData_.baseParams.set_dSizeVInput(qsfaInfo_->dSizeVInput);
     tilingData_.baseParams.set_isActualLenDimsNull(qsfaInfo_->actualQSeqLenFlag ? 0U : 1U);
     tilingData_.baseParams.set_isActualLenDimsKVNull(qsfaInfo_->actualSeqLenFlag ? 0U : 1U);
-    // GSA-P1: 设置有效 sparse count（0 表示未知，kernel 退化为 sparseBlockCount*sparseBlockSize）
-    tilingData_.baseParams.set_effectiveSparseCount(qsfaInfo_->effectiveSparseCount);
+    //  是否传入 per-batch 真实 topk 长度（padding场景由 kernel 按该长度计算有效 KV）
     tilingData_.baseParams.set_hasActualSparseLengths(qsfaInfo_->hasActualSparseLengths ? 1U : 0U);
-    // GSA-v2: 是否返回 softmax 统计结果
+    // 是否返回 softmax 统计结果
     tilingData_.baseParams.set_returnSoftmaxLse(qsfaInfo_->returnSoftmaxLse ? 1U : 0U);
 }
 
 // for flash decode
 void QSFAMlaTiling::FillTilingSplitKVMla()
 {
-    // C-splitKV: FD workspace元素数按sub全局编号紧凑布局计算——
+    // FD workspace 元素数按 sub 全局编号紧凑布局计算——
     // sub编号：前(taskNum-x)个任务各占1个sub(=taskIdx)，其后每任务占P个(=splitTailStart+
     // (taskIdx-splitTailStart)*P+part)。accumOut槽位=(sub*gSize+行)*headDim，
     // lse槽位=(sub*gSize+行)*8(sum与max各占一半region，kernel按logSumExpSize/2定位max区)
@@ -625,9 +577,9 @@ void QSFAMlaTiling::GetWorkspaceSize()
                 * TRIPLE_BUFFER_NUM * (aicNum >> 1));
         }
     } else {
-        uint32_t mmResElemSize = 4;         // 4:fp32(D-fp16精度回退)
+        uint32_t mmResElemSize = 4;         // 4:fp32
         uint32_t vec1ResElemSize = 2;       // 2:fp16/bf16
-        uint32_t bmm2ResElemSize = 4;       // 4:fp32(D-fp16精度回退)
+        uint32_t bmm2ResElemSize = 4;       // 4:fp32
         uint32_t qPreProcResElemSize = 0;   // 普通场景不涉及Q预处理
         uint32_t softmaxSumElemSize = 4;   // 4:int32
         float kvDtypeRatio = 1.0;
@@ -672,7 +624,7 @@ ge::graphStatus QSFAMlaTiling::DoOpTiling(QSFATilingInfo *qsfaInfo)
         return ge::GRAPH_FAILED;
     }
     InitParams();
-    Split();
+    SplitBalanced();
     FillTiling();
     CalcBlockDim();
     GetWorkspaceSize();
@@ -2191,12 +2143,9 @@ void QSFAInfoParser::FillTilingInfoAttrsAndLayouts(QSFATilingInfo &qsfaInfo)
     qsfaInfo.outLayout = outLayout_;
     qsfaInfo.dSizeVInput = dSizeKV_;
 
-    // GSA-P1: 扫描 sparse_indices 统计有效(非-1)的 topk 数量
-    // host 侧一次性扫描，避免 kernel 侧 V_TEMPLATE 路径盲目按 sparseBlockCount 计算有效长度
-    qsfaInfo.effectiveSparseCount = ScanEffectiveSparseCount();
-    // GSA-P1: 若用户传入 per-batch 真是 topk 长度， kernel 直接按该长度计算 （padding 场景提速）
+    // 若用户传入 per-batch 真实 topk 长度， kernel 直接按该长度计算 （padding 场景提速）
     qsfaInfo.hasActualSparseLengths = (opParamInfo_.actualSparseLengths.tensor != nullptr);
-    // GSA-v2: return_softmax_lse 属性
+    // return_softmax_lse 属性
     qsfaInfo.returnSoftmaxLse = ParseReturnSoftmaxLse();
 }
 
@@ -2239,18 +2188,7 @@ IMPL_OP_OPTILING(KvQuantSparseFlashAttentionGsa)
 
 // ==================== GSA 优化实现 ====================
 
-// GSA-P1: 扫描 sparse_indices 统计有效(非-1)的 topk 数量
-// 在 host tiling 阶段，如果 sparse_indices tensor 数据可访问（编译期已知或运行时tiling），
-// 则遍历所有 batch/head 行，取各行有效长度的最小值作为 effectiveSparseCount。
-// 这使得 V_TEMPLATE 路径不再盲目用 sparseBlockCount（含 padding-1）计算 KV 有效长度，
-// 而是用实际有效 topk 数，从而避免 padding 项引入的无用迭代。
-// 返回 0 表示无法获取数据（动态shape无device数据），kernel 侧退化为 sparseBlockCount 行为。
-uint32_t QSFAInfoParser::ScanEffectiveSparseCount()
-{
-    return 0U;
-}
-
-// GSA-v2: 解析 return_softmax_lse 属性
+// 解析 return_softmax_lse 属性
 bool QSFAInfoParser::ParseReturnSoftmaxLse()
 {
     auto attrs = context_->GetAttrs();

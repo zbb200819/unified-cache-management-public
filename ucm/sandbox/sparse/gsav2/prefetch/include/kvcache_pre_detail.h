@@ -156,6 +156,8 @@ struct PrefetchTiming {
     uint64_t loadToHostUs = 0;
     uint64_t preMemcpyUs = 0;
     uint64_t memcpyUs = 0;
+    uint64_t sync = 0;
+    uint64_t h2d = 0;
     uint64_t ops = 0;
 };
 
