@@ -2055,6 +2055,11 @@ def _build_attention_metadata(
             attn_metadata_i.gsa_swap_index = self.gsa_swap_index.npu[
                 : common_attn_metadata.num_input_tokens
             ]
+            # actual_sparse_lengths: per-token 真实 topk 长度，传给
+            # npu_kv_quant_sparse_flash_attention_gsa；长度对齐 num_input_tokens。
+            attn_metadata_i.actual_sparse_lengths = self.actual_sparse_lengths.npu[
+                : common_attn_metadata.num_input_tokens
+            ]
             attn_metadata_i.gsa_warmup_index = self.gsa_warmup_index.npu
             attn_metadata_i.gsa_prefetch_topk = self.gsa_prefetch_topk.npu[
                 :, : common_attn_metadata.num_input_tokens

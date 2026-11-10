@@ -177,18 +177,30 @@ def install_stubs():
 
     # ---------------- torch.ops._C_gsa（本地 ops/ 扩展的 ACL op）----------------
     # 无条件覆盖：UT 不依赖真实 ACL op（NPU 环境同理，保证跨环境确定性）
+    # 生产代码 gsa.py / sfa_kv_transfer_patch.py / sfa_v1_patch.py 中
+    # gsa_gather_copy/gsa_scatter_copy/indexer_gather_qw/gsa_topk_expand_tmp
+    # 均通过 torch.ops._C_gsa.* 调用（由 ops/torch_binding.cpp 注册）；
+    # test_gsa.py 的 _record_ops 亦 patch 此命名空间。
     import torch
 
     torch.ops._C_gsa = SimpleNamespace(
         gsa_gather_copy=lambda *a, **k: None,
         gsa_scatter_copy=lambda *a, **k: None,
+        indexer_gather_qw=lambda *a, **k: None,
+        gsa_topk_expand_tmp=lambda *a, **k: a[3] if len(a) > 3 else None,
+        # execute_kv_quant_sparse_flash_attention patch 返回 (attn_out, smax, ssum)
+        npu_kv_quant_sparse_flash_attention_gsa=lambda *a, **k: (
+            a[0] if a else None,
+            torch.empty(0),
+            torch.empty(0),
+        ),
     )
 
     # ---------------- torch.ops._C_ascend（vllm-ascend csrc patch 注册的 op）----
-    # 生产代码 gsa.py（L1044/1051/1068/1075/1673/1680/1688/1697）与
-    # test_gsa.py 的 _record_ops 都引用 torch.ops._C_ascend.*；该命名空间由
-    # vllm-ascend-csrc-build-1020-c8.patch 编译注册，UT 环境必须 stub
-    # （README/FEASIBILITY 亦声明 conftest 覆盖 _C_ascend）。
+    # 生产代码 patch 文件中 store_kv_block/store_kv_block_metadata/
+    # npu_lightning_indexer*/npu_sparse_flash_attention 仍引用 torch.ops._C_ascend.*
+    # （_C_gsa 未注册这些算子）；该命名空间由 vllm-ascend-csrc-build-1020-c8.patch
+    # 编译注册，UT 环境必须 stub（README/FEASIBILITY 亦声明 conftest 覆盖 _C_ascend）。
     torch.ops._C_ascend = SimpleNamespace(
         gsa_gather_copy=lambda *a, **k: None,
         gsa_scatter_copy=lambda *a, **k: None,

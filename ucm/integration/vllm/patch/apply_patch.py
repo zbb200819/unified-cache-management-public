@@ -47,6 +47,36 @@ GSA_PATCH_REQUESTED = os.environ.get("ENABLE_GSA_PATCH", "").lower() in ("1", "t
 ENABLE_GSA_PATCH = ENABLE_UCM_PATCH and GSA_PATCH_REQUESTED
 
 
+def _ensure_gsa_ops_loaded() -> None:
+    """加载 gsa_ops C++ 扩展，注册 torch.ops._C_gsa 命名空间。
+
+    GSA 运行时算子（gsa_gather_copy / gsa_scatter_copy / indexer_gather_qw /
+    gsa_topk_expand_tmp / npu_kv_quant_sparse_flash_attention_gsa）由
+    ``ucm/sandbox/sparse/gsav2/ops/torch_binding.cpp`` 通过
+    ``TORCH_LIBRARY_EXPAND(CONCAT(_C, _gsa), ops)`` 注册到 ``torch.ops._C_gsa``。
+    该注册由 ``import gsa_ops`` 触发的 ``PyInit_gsa_ops`` 静态初始化器完成
+    （见 torch_binding.cpp:241 ``REGISTER_EXTENSION(gsa_ops)``）。
+
+    与旧方案（build-time patch 编译进 vllm-ascend csrc、随 vllm-ascend 启动
+    自动注册到 ``torch.ops._C_ascend``）不同，新方案是独立 wheel，必须在
+    GSA patch 应用前显式 import。此处仅当 ENABLE_GSA_PATCH 时调用，避免无
+    NPU/C++ 扩展的环境（UT、CPU CI）因 import 失败而阻塞。
+    """
+    if not ENABLE_GSA_PATCH:
+        return
+    try:
+        import gsa_ops  # noqa: F401  触发 torch.ops._C_gsa 注册
+        logger.info("gsa_ops C++ extension loaded; torch.ops._C_gsa registered")
+    except ImportError as e:
+        logger.warning(
+            "ENABLE_GSA_PATCH=1 but gsa_ops C++ extension not installed; "
+            "torch.ops._C_gsa.* ops will be unavailable. "
+            "Build & install via `pip install -v -e ucm/sandbox/sparse/gsav2/ops`. "
+            "Detail: %s",
+            e,
+        )
+
+
 def _strip_build(v: Optional[str]) -> Optional[str]:
     """Strip only build/local metadata (the +xxx suffix), e.g. 0.26.0+empty -> 0.26.0."""
     if not v:
@@ -228,6 +258,11 @@ def apply_all_patches() -> None:
                 import ucm.integration.vllm.patch.v0191.vllm.pc_patch
             case "0.23.0":
                 if ENABLE_GSA_PATCH:
+                    # 先加载 gsa_ops C++ 扩展，注册 torch.ops._C_gsa 命名空间，
+                    # 供后续 GSA patch（gsa_gather_copy / gsa_scatter_copy /
+                    # indexer_gather_qw / gsa_topk_expand_tmp /
+                    # npu_kv_quant_sparse_flash_attention_gsa）调用。
+                    _ensure_gsa_ops_loaded()
                     logger.info("UCM patching vllm 0.23.0 for GSA sparse attention...")
 
                     import ucm.sandbox.sparse.gsav2.patch.vllm.block_table_patch
@@ -330,10 +365,10 @@ def apply_all_patches() -> None:
                     )
                     # GSA runtime monkey-patches (Python portions of
                     # vllm-ascend-adapt-1020-c8.patch). The C++ ops registered
-                    # in csrc/torch_binding*.cpp still require the build-time
-                    # patch vllm-ascend-csrc-build-1020-c8.patch to be applied
-                    # before `pip install -v -e .` so the gsa_* ops are
-                    # compiled in.
+                    # in csrc/torch_binding*.cpp are now built as the standalone
+                    # gsa_ops wheel (ucm/sandbox/sparse/gsav2/ops) and loaded
+                    # by _ensure_gsa_ops_loaded() above into torch.ops._C_gsa;
+                    # no build-time patch is required anymore.
                     import ucm.sandbox.sparse.gsav2.patch.vllm_ascend.block_table_patch
                     import ucm.sandbox.sparse.gsav2.patch.vllm_ascend.device_op_patch
                     import ucm.sandbox.sparse.gsav2.patch.vllm_ascend.model_runner_v1_patch

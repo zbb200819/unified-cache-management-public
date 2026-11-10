@@ -544,7 +544,7 @@ def forward(
                 )
         else:
             if attn_metadata.gsa_warmup_len > 0 and self.has_indexer:
-                torch.ops._C_ascend.gsa_gather_copy(
+                torch.ops._C_gsa.gsa_gather_copy(
                     attn_metadata.gsa_warmup_topk[self.cur_topk_index][
                         : attn_metadata.gsa_warmup_len
                     ].view(-1, DEFAULT_TOPK_LEN),
@@ -554,7 +554,7 @@ def forward(
                     .expand((-1, DEFAULT_TOPK_LEN)),
                 )
             if attn_metadata.gsa_prefetch_len != 0 and self.has_indexer:
-                torch.ops._C_ascend.gsa_gather_copy(
+                torch.ops._C_gsa.gsa_gather_copy(
                     attn_metadata.gsa_prefetch_topk[self.cur_topk_index][
                         : attn_metadata.gsa_prefetch_len
                     ].view(-1, DEFAULT_TOPK_LEN),
@@ -563,7 +563,7 @@ def forward(
                     .view(-1, 1)
                     .expand((-1, DEFAULT_TOPK_LEN)),
                 )
-            topk_indices_out = torch.ops._C_ascend.gsa_topk_expand_tmp(
+            topk_indices_out = torch.ops._C_gsa.gsa_topk_expand_tmp(
                 topk_indices.view(-1, DEFAULT_TOPK_LEN),
                 attn_metadata.gsa_swap_topk[self.cur_topk_index][
                     : attn_metadata.gsa_swap_len

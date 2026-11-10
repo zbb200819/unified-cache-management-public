@@ -84,6 +84,7 @@ from ucm.sparse.utils import (
     STREAM_NUM,
     VLLM_ASCEND_VERSION,
     WARMUP_TOPK_LEN,
+    DEFAULT_TOPK_LEN,
     DSAInputStruct,
     TopkIndices,
     bind_thread_memory_policy,
@@ -554,6 +555,7 @@ class GSA(UcmSparseBase):
         self.indexer_sparse_num_all = MAX_INDEXER_BLOCK_NUM
         self.has_prefill = False
         self.num_padding_reqs = 0
+        self.num_actual_tokens = 0
         self.alloc_block_sch = 0
         self._store_injected = False
         self._store_inject_retries = 0
@@ -774,6 +776,19 @@ class GSA(UcmSparseBase):
 
         self.gsa_swap_index = DSAInputStruct(
             (max_graph_bs + 2), self.device, torch.int64
+        )
+
+        # actual_sparse_lengths: per-token 真实 topk 长度，传给
+        # torch.ops._C_gsa.npu_kv_quant_sparse_flash_attention_gsa 的 actual_sparse_lengths 入参。
+        # kernel 用它跳过 topk_indices 尾部 -1 padding 的迭代（5120-padding-1 场景性能关键，
+        # 见 op_kernel/kv_quant_sparse_flash_attention_kernel_mla.h:343-348）。
+        # 长度对齐 gsa_swap_index（max_graph_bs + 2，取 num_input_tokens 切片使用）：
+        #   - swap req 的 token 位置: SPA_TOKENS_LEN（gsa_topk_expand_tmp 已把 2048 pad 到 5120）
+        #   - 非 swap req 的 token 位置: DEFAULT_TOPK_LEN（原始 topk 长度）
+        #   - padding req 区域（full_decode_only 图模式）: 0（kernel 跳过该 batch）
+        # dtype int32 对齐 kernel 侧 actualSparseLengthsGm.GetValue (int32_t)。
+        self.actual_sparse_lengths = DSAInputStruct(
+            (max_graph_bs + 2), self.device, torch.int32
         )
 
         self.gsa_swap_topk = TopkIndices(  # 78 * bs * 4096 * 4
@@ -1032,14 +1047,14 @@ class GSA(UcmSparseBase):
         hit_num = self.indexer_pc_hit_num[index_in_batch]
         block_view = self.block_size * vllm_indexer_cache.shape[-1]
         gathered = indexer_tmp[:hit_num].view(-1, block_view)
-        torch.ops._C_ascend.gsa_gather_copy(
+        torch.ops._C_gsa.gsa_gather_copy(
             gathered,
             vllm_indexer_cache.view(-1, block_view),
             self.indexer_pc_hit_index.npu[0][index_in_batch][:hit_num]
             .view(-1, 1)
             .expand((hit_num, block_view)),
         )
-        torch.ops._C_ascend.gsa_scatter_copy(
+        torch.ops._C_gsa.gsa_scatter_copy(
             indexer_cache.view(-1, block_view),
             gathered,
             self.indexer_pc_hit_index.npu[1][index_in_batch][:hit_num]
@@ -1056,14 +1071,14 @@ class GSA(UcmSparseBase):
         """c8 场景：将命中块的 scale gather/scatter 到 indexer 缓存"""
         hit_num = self.indexer_pc_hit_num[index_in_batch]
         gathered = self.indexer_pc_dump_scale_tmp[:hit_num].view(-1, self.block_size)
-        torch.ops._C_ascend.gsa_gather_copy(
+        torch.ops._C_gsa.gsa_gather_copy(
             gathered,
             vllm_indexer_scale.view(-1, self.block_size),
             self.indexer_pc_hit_index.npu[0][index_in_batch][:hit_num]
             .view(-1, 1)
             .expand((hit_num, self.block_size)),
         )
-        torch.ops._C_ascend.gsa_scatter_copy(
+        torch.ops._C_gsa.gsa_scatter_copy(
             indexer_scale.view(-1, self.block_size),
             gathered,
             self.indexer_pc_hit_index.npu[1][index_in_batch][:hit_num]
@@ -1371,6 +1386,10 @@ class GSA(UcmSparseBase):
         self.select_block_index.np[:] = 0
         self.gsa_swap_index.np[:] = 0
         self.gsa_prefetch_index.np[:] = 0
+        # actual_sparse_lengths 默认填充 DEFAULT_TOPK_LEN：非 swap req 的 token 走原始
+        # topk 长度（2048）。swap req 的 token 位置在 _copy_gsa_buffers_to_npu 中被
+        # 覆写为 SPA_TOKENS_LEN；padding 区域覆写为 0。
+        self.actual_sparse_lengths.np[:] = DEFAULT_TOPK_LEN
 
     def _init_indexer_offload_all(self):
         if not IS_INDEXER_OFFLOAD:
@@ -1561,6 +1580,29 @@ class GSA(UcmSparseBase):
         self.gsa_swap_index.copy_to_npu(-1)
         self.gsa_prefetch_index.copy_to_npu(self.num_padding_reqs)
         self.gsa_warmup_index.copy_to_npu(len(warmup_index))
+        # actual_sparse_lengths: per-token 真实 topk 长度，传给
+        # torch.ops._C_gsa.npu_kv_quant_sparse_flash_attention_gsa 的 actual_sparse_lengths
+        # 入参。kernel 用它跳过 topk_indices 尾部 -1 padding 的迭代
+        # (op_kernel/kv_quant_sparse_flash_attention_kernel_mla.h:343-348)。
+        #   - swap req 的 token 位置（gsa_swap_index[:gsa_swap_len]）: SPA_TOKENS_LEN
+        #     （gsa_topk_expand_tmp 已把 topk 从 DEFAULT_TOPK_LEN pad 到 SPA_TOKENS_LEN）
+        #   - 非 swap 的真实 req token 位置 [0:num_actual_tokens): DEFAULT_TOPK_LEN
+        #     （_reset_gsa_buffers_all 已预填，此处不动）
+        #   - padding token 位置 [num_actual_tokens:num_padding_reqs): 0
+        #     （full_decode_only 图模式 pad 到 capture size 的空位，无真实 topk，
+        #      kernel 见 0 即 effCount=0 跳过该 batch，避免遍历 -1 padding 空转）
+        # 注意 gsa_swap_index 的 padding 区域填的是 num_padding_reqs 常数值（用于
+        # gather 跳转索引），actual_sparse_lengths 的 padding 区域填 0（长度值），
+        # 二者语义不同。
+        if len(self.swap_index) != 0:
+            self.actual_sparse_lengths.np[
+                self.gsa_swap_index.np[: len(self.swap_index)]
+            ] = SPA_TOKENS_LEN
+        # padding 区域覆写为 0（覆盖 _reset 预填的 DEFAULT_TOPK_LEN）
+        self.actual_sparse_lengths.np[
+            self.num_actual_tokens : self.num_padding_reqs
+        ] = 0
+        self.actual_sparse_lengths.copy_to_npu(self.num_padding_reqs)
         indexer_len = 0
         if IS_INDEXER_OFFLOAD:
             flattened = [
@@ -1589,6 +1631,13 @@ class GSA(UcmSparseBase):
             if IS_INDEXER_OFFLOAD:
                 attn.indexer_last_query_len = indexer_len
             attn.select_block_index = self.select_block_index.npu[:req_cnt]
+            # actual_sparse_lengths: per-token 真实 topk 长度，传给
+            # npu_kv_quant_sparse_flash_attention_gsa；长度对齐 num_input_tokens
+            # （含图模式 padding），真实 token 区域为 SPA_TOKENS_LEN/DEFAULT_TOPK_LEN，
+            # padding 区域为 0。
+            attn.actual_sparse_lengths = self.actual_sparse_lengths.npu[
+                : self.num_padding_reqs
+            ]
         self.log.info(
             f"[GSA] gsa_prefetch_len {gsa_prefetch_len} gsa_swap_len {gsa_swap_len}"
             f"gsa_warmup_len {gsa_warmup_len} attn.gsa_slot_len {gsa_slot_len}"
@@ -1661,14 +1710,14 @@ class GSA(UcmSparseBase):
             indexer_tmp = self.indexer_pc_dump_tmp_c8
         else:
             indexer_tmp = self.indexer_pc_dump_tmp
-        torch.ops._C_ascend.gsa_gather_copy(
+        torch.ops._C_gsa.gsa_gather_copy(
             indexer_tmp[: self.indexer_pc_dump_num].view(-1, self.block_size * 128),
             self.indexer_k_cache_sparse[layer_id].view(-1, self.block_size * 128),
             self.indexer_pc_dump_index.npu[1][: self.indexer_pc_dump_num]
             .view(-1, 1)
             .expand((self.indexer_pc_dump_num, self.block_size * 128)),
         )
-        torch.ops._C_ascend.gsa_scatter_copy(
+        torch.ops._C_gsa.gsa_scatter_copy(
             self.kv_caches[layer_id][2].view(-1, self.block_size * 128),
             indexer_tmp[: self.indexer_pc_dump_num].view(-1, self.block_size * 128),
             self.indexer_pc_dump_index.npu[0][: self.indexer_pc_dump_num]
@@ -1676,7 +1725,7 @@ class GSA(UcmSparseBase):
             .expand((self.indexer_pc_dump_num, self.block_size * 128)),
         )
         if use_li_c8:
-            torch.ops._C_ascend.gsa_gather_copy(
+            torch.ops._C_gsa.gsa_gather_copy(
                 self.indexer_pc_dump_scale_tmp[: self.indexer_pc_dump_num].view(
                     -1, self.block_size
                 ),
@@ -1685,7 +1734,7 @@ class GSA(UcmSparseBase):
                 .view(-1, 1)
                 .expand((self.indexer_pc_dump_num, self.block_size)),
             )
-            torch.ops._C_ascend.gsa_scatter_copy(
+            torch.ops._C_gsa.gsa_scatter_copy(
                 self.kv_caches[layer_id][3].view(-1, self.block_size),
                 self.indexer_pc_dump_scale_tmp[: self.indexer_pc_dump_num].view(
                     -1, self.block_size
@@ -1782,6 +1831,11 @@ class GSA(UcmSparseBase):
         self.gsa_stats = self.gsa_metadata.gsa_stats
         attn = next(iter(attn_metadata.values()))
         self.num_padding_reqs = attn.num_input_tokens
+        # num_actual_tokens: 真实调度 token 数（不含图模式 padding）。
+        # actual_sparse_lengths 的 [num_actual_tokens:num_input_tokens] 区域是 padding
+        # token（full_decode_only 图模式下 pad 到 capture size 的空位），需填 0 让 kernel
+        # 跳过；[0:num_actual_tokens] 是真实 token，按 swap/非 swap 填长度。
+        self.num_actual_tokens = getattr(attn, "num_actual_tokens", attn.num_input_tokens)
         gsa_slot_len = self.get_dsa_input()
         self.get_model_input_all(attn_metadata, gsa_slot_len)
         if IS_PERFORMANCE_LOG:
@@ -1888,6 +1942,7 @@ class GSA(UcmSparseBase):
         model_runner.gsa_swap_index = self.gsa_swap_index
         model_runner.gsa_prefetch_index = self.gsa_prefetch_index
         model_runner.gsa_warmup_index = self.gsa_warmup_index
+        model_runner.actual_sparse_lengths = self.actual_sparse_lengths
 
         model_runner.dsa_slot_mapping = self.dsa_slot_mapping
         model_runner.dsa_block_table = self.dsa_block_table

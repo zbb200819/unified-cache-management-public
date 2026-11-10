@@ -360,6 +360,7 @@ def __init__(
         self.gsa_swap_topk = None
         self.gsa_warmup_index = None
         self.gsa_warmup_topk = None
+        self.actual_sparse_lengths = None
         self.gsa_prefill_query = None
         self.gsa_topk_win_tmp = None
 

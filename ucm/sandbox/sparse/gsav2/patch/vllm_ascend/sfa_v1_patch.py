@@ -512,7 +512,7 @@ def indexer_select_post_process(
     ):
         actual_seq_lengths_key = attn_metadata.dsa_seq_len
         if IS_INDEXER_OFFLOAD and self.has_indexer:
-            torch.ops._C_ascend.indexer_gather_qw(
+            torch.ops._C_gsa.indexer_gather_qw(
                 q_li.view(-1, self.n_head * self.head_dim),
                 weights.view(-1, self.n_head),
                 attn_metadata.indexer_last_query[self.layer_id][
