@@ -72,8 +72,17 @@ public:
                 mGlobalToSlot[slotIdx] = slotIdx;
                 mSlotToGlobal[slotIdx] = slotIdx;
             }
-            for (int gid = mDramTensorCount - 1; slotIdx < mHbmCapacity && gid >= 0;
-                 --gid, ++slotIdx) {
+            /* B-3 整改：loop1 已恒等映射 gid [0, identityCount)。loop2 倒序回填
+             * 剩余 slot 时必须止步于该区间——原条件 gid >= 0 在 mHbmCapacity >
+             * mDramTensorCount（短 prompt 常见）时会把已映射的高位 gid 再映射
+             * 一遍：恒等 slot 沦为幽灵（mSlotToGlobal[k]=k 但 mGlobalToSlot[k]
+             * 指向逆序重映射的高位 slot），validateMapping 必败、LRU 驱逐误杀
+             * 正身映射（多余 DRAM 重载）、buildTopkOutput 冷填不排除幽灵导致
+             * 同一 global 双槽 gather（softmax 权重双计）。被排除的剩余 slot
+             * 保持 -1（空位，冷填按需启用）。 */
+            const int identityCount = slotIdx;
+            for (int gid = mDramTensorCount - 1;
+                 slotIdx < mHbmCapacity && gid >= identityCount; --gid, ++slotIdx) {
                 mGlobalToSlot[gid] = slotIdx;
                 mSlotToGlobal[slotIdx] = gid;
             }

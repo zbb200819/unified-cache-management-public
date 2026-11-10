@@ -433,14 +433,28 @@ int GSAPrefetchEngineC::ProcessPrefetchRequest(const TaskInfo& taskInfo,
         ClearPrefetchResultSlot(i, layerID, layout);
         return -1;
     }
-    if (mSpaTopkLen != useBlockTable.size()) {
+    /* B-4 整改：与 init 路径（ProcessTokensMapTopk 尾部同判）一致——useBlockTable
+     * 尺寸与 mSpaTopkLen 不一致属可恢复场景（短/年轻请求 sparse 窗口不足、LRU 冷
+     * slot 补齐失败），清槽跳过、消费侧按零 miss 降级；不再 KVPackAbort 误杀全
+     * 进程。调用方 PublishPrefetchResultsRank0 按 failedCount 汇总记账、版本照常
+     * 递增，rank 间等待协议完整。 */
+    if (static_cast<int>(useBlockTable.size()) != mSpaTopkLen) {
         mLogger.log(LogLevel::ERROR,
-                    "[ERROR] mAllTopkIndicesTensor greater than mSpaTopkLen !!! layer_id %d, "
-                    "useBlockTable size %d\n",
-                    layerID, mSpaTopkLen, useBlockTable.size());
-        KVPackAbort(mKVPackControl);
+                    "Decode step: %u, |KVCache Prefetch| useBlockTable size mismatch, skip: "
+                    "req_id: %s, layerID: %d, mSpaTopkLen: %d, useBlockTableSize: %zu\n",
+                    mDecodeStep, oneReqID.c_str(), layerID, mSpaTopkLen, useBlockTable.size());
+        ClearPrefetchResultSlot(i, layerID, layout);
+        return -1;
     }
-    if (CopyUseBlockTableToIndicesTensor(oneReqID, layerID, useBlockTable) != 0) {
+    /* A-5 整改：mAllTopkIndicesTensor 读侧与写侧（SetTopkIndices，Python 线程）
+     * 统一 mUpdateReqMutex 协议；本调用点位于 OMP 并行域，锁缩到仅包住
+     * find+memcpy 的最小临界区。 */
+    int copyRet = 0;
+    {
+        std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+        copyRet = CopyUseBlockTableToIndicesTensor(oneReqID, layerID, useBlockTable);
+    }
+    if (copyRet != 0) {
         ClearPrefetchResultSlot(i, layerID, layout);
         return -1;
     }
@@ -566,8 +580,21 @@ void GSAPrefetchEngineC::ReadPrefetchResults(const TaskInfo& taskInfo,
             std::vector<int> useBlockTable(mSpaTopkLen);
             memcpy(useBlockTable.data(), shmBase + layout.missTokenSize + layout.loadSlotSize,
                    mSpaTopkLen * sizeof(int));
-            std::memcpy(mAllTopkIndicesTensor[oneReqID][layerID].data_ptr(), useBlockTable.data(),
-                        useBlockTable.size() * sizeof(int));
+            /* A-5/A-4 整改：读侧统一 mUpdateReqMutex 协议（写侧 SetTopkIndices、
+             * erase 侧 DelReqIDRun 均持该锁），并复用 CopyUseBlockTableToIndicesTensor
+             * 的 find+四重判别替代 operator[]——未注册 key 的默认插入既是无锁时代的
+             * 结构级写 UB，也是注册不变式被破坏时 torch select 抛 c10::Error 的
+             * 确定抛点（对照 init 路径守卫，消除防御不对称）。判别失败清空本
+             * (req,layer) 的 miss/slot，消费侧按零加载降级。 */
+            int copyRet = 0;
+            {
+                std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+                copyRet = CopyUseBlockTableToIndicesTensor(oneReqID, layerID, useBlockTable);
+            }
+            if (copyRet != 0) {
+                mMissGlobalToken[oneReqID][layerID].clear();
+                mLoadSlot[oneReqID][layerID].clear();
+            }
         }
     }
 }
@@ -955,6 +982,12 @@ void GSAPrefetchEngineC::IndexerInitLoad(std::vector<std::vector<int>>& blockTab
                                          std::vector<std::vector<int>>& slabIdx, std::string reqID)
 {
     if (!mOpenIndexerOffload) { return; }
+    /* A-6 整改：本函数子树读 mAllBlocksHash（find 于 IndexerInitLoad /
+     * ProcessIndexerInitLoadLayer）与 mLastKVBlockAddress（LoadNonUcmIndexerBlock 一带，
+     * 引用跨函数全程持有），调用点（execute_finished 在 _submit_prefetch_task 之后）
+     * 与 prefetch worker 清理段 erase（DelReqIDRun，持 mUpdateReqMutex）并发，读者
+     * 补锁对称。一次性 init 路径，非解码热路径。 */
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
 
     mLogger.log(LogLevel::INFO, "Decode step: %u, |KVCache Prefetch| Start IndexerInitLoad\n",
                 mDecodeStep);
@@ -1481,17 +1514,24 @@ void GSAPrefetchEngineC::SubmitTask(std::vector<int>& topkLensInput, std::vector
     TaskInfo inputInfo(totalTaskNum, -1, topkLists, topkLensInput, bsIndexInput, reqIDList);
     mIsPrefetchRunning.store(true, std::memory_order_release);
     mIsIndexerOffload = isIndexerOffload;
-    for (uint32_t i = 0; i < reqIDList.size(); i++) {
-        if (mOpenIndexerOffload && mIsIndexerOffload[i]) {
-            mRealTimeIdx[reqIDList[i]].clear();
-            mRealTimeIdx[reqIDList[i]] = mUseBlockTableIdx[reqIDList[i]];
-            mSeqLen[reqIDList[i]] = seqLens[i];
-            mLogger.log(LogLevel::DEBUG,
-                        "Decode step: %u, "
-                        "|KVCache Prefetch| SubmitTask mRealTimeIdx: %u, mUseBlockTableIdx: %u for "
-                        "req_id: %s\n",
-                        mDecodeStep, mRealTimeIdx[reqIDList[i]][0].size(),
-                        mUseBlockTableIdx[reqIDList[i]][0].size(), reqIDList[i].c_str());
+    /* A-6 整改：提交期对 mRealTimeIdx/mUseBlockTableIdx/mSeqLen 的读写与 prefetch
+     * worker 清理段 erase（DelReqIDRun，持 mUpdateReqMutex）及 SubmitTaskIndexer
+     * 的 mUseBlockTableIdx 拷贝并发（gsa_index 路径 Python 采样状态后不等待 worker
+     * 空闲即提交），对称补锁；锁内仅容器操作，无设备调用。 */
+    {
+        std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+        for (uint32_t i = 0; i < reqIDList.size(); i++) {
+            if (mOpenIndexerOffload && mIsIndexerOffload[i]) {
+                mRealTimeIdx[reqIDList[i]].clear();
+                mRealTimeIdx[reqIDList[i]] = mUseBlockTableIdx[reqIDList[i]];
+                mSeqLen[reqIDList[i]] = seqLens[i];
+                mLogger.log(LogLevel::DEBUG,
+                            "Decode step: %u, "
+                            "|KVCache Prefetch| SubmitTask mRealTimeIdx: %u, mUseBlockTableIdx: %u "
+                            "for req_id: %s\n",
+                            mDecodeStep, mRealTimeIdx[reqIDList[i]][0].size(),
+                            mUseBlockTableIdx[reqIDList[i]][0].size(), reqIDList[i].c_str());
+            }
         }
     }
     mTaskManger->SubmitTask(inputInfo, MultiBSThreadFun);
@@ -1547,6 +1587,12 @@ void GSAPrefetchEngineC::SetTopkIndices(std::string reqID, torch::Tensor& topInd
     mLogger.log(LogLevel::DEBUG,
                 "Decode step: %u, |KVCache Prefetch| Start SetTopkIndices reqID: %s\n", mDecodeStep,
                 reqID.c_str());
+    /* A-5 整改：mAllTopkIndicesTensor 全部读写统一 mUpdateReqMutex 协议（读者：
+     * worker 树 ReadPrefetchResults / CopyUseBlockTableToIndicesTensor；erase 侧：
+     * DelReqIDRun）。Python 侧在等待 worker 空闲之前调用本接口（execute_begin
+     * 前置段 _process_scheduled_req），新 req 首个 decode step 的 map 插入/重平衡
+     * 必然与 worker 并发遍历交叠，不能靠 Python 序列化避免，锁不可省。 */
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     mAllTopkIndicesTensor[reqID] = topIndices;
     mLogger.log(LogLevel::DEBUG,
                 "Decode step: %u, |KVCache Prefetch| End SetTopkIndices reqID: %s\n", mDecodeStep,

@@ -2079,7 +2079,12 @@ class GSA(UcmSparseBase):
 
         if self.num_spec_tokens != 1 and rec_result is not None:
             last_q_index_fb = list(accumulate(self.indexer_last_q_index_fb))
-            result = [rec_result[i] for i in self.need_indexer_sparse_bs]
+            # B-1 整改：被拒请求的 rec_result 哨兵为 -1（model_runner_v1_patch 的
+            # where(valid_counts>0, valid_counts-1, -1)），直接参与列索引得到
+            # last_q_index_fb[i] - 1 的负下标（落到上一请求或回绕到末列），
+            # torch 索引静默取错 query 向量；钳到 0 = 该请求首个候选位置，
+            # 优雅降级。
+            result = [max(rec_result[i], 0) for i in self.need_indexer_sparse_bs]
             index_list = []
             result_num = len(result)
             for i in range(result_num):
@@ -2369,19 +2374,23 @@ class GSA(UcmSparseBase):
             index_in_batch = req_meta.index_in_batch
             req_meta.prefetch_topk_step = self.prefetch_engine.step_time
             if self.num_spec_tokens != 1 and rec_result is not None:
+                # B-1 整改：rec_result 哨兵 -1 表示该 req 本步无任何有效采样
+                # token。req_seq_len 公式 (- num_spec_tokens + rec + 1) 对 -1
+                # 恰好退化为"本步提交 0 token"，语义正确，必须保留原值不可钳制；
+                # 但两处张量列索引必须钳到 0，否则负列下标被 torch 静默回绕
+                # （index==0 取全 batch 末列、其余取上一请求末列），静默取错
+                # topk。
+                rec = rec_result[index_in_batch]
                 req_seq_len[index] = (
                     req_meta.get_seq_len()
                     - self.num_spec_tokens
-                    + rec_result[index_in_batch]
+                    + rec
                     + 1
                 )
-                index_list.append(
-                    index * self.num_spec_tokens + rec_result[index_in_batch]
-                )
+                topk_col = index * self.num_spec_tokens + max(rec, 0)
+                index_list.append(topk_col)
                 self.select_gsa_prefetch_topk[:, index].copy_(
-                    self.gsa_prefetch_topk.cpu[
-                        :, index * self.num_spec_tokens + rec_result[index_in_batch]
-                    ]
+                    self.gsa_prefetch_topk.cpu[:, topk_col]
                 )
             else:
                 req_seq_len[index] = req_meta.get_seq_len()

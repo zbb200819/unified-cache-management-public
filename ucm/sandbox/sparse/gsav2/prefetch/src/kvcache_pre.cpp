@@ -719,6 +719,13 @@ void GSAPrefetchEngineC::ResetReqTokenState(const std::string& reqID,
 {
     /* layer0 每步重建 per-request 容器（原 SetTokensMap 内联块提取），
      * managers/miss/loadSlot 三表同步扩容是下游下标访问的相关性前提。 */
+    /* A-6 整改：本函数写 mHBMMangers/mAllReqIdSlots/mReqUseBlockTable/mSparseSeqLen/
+     * mPromptLen/mMissGlobalToken/mLoadSlot 七张 per-request map（operator[] 含
+     * 插入/重平衡），与 prefetch worker 清理段 erase（DelReqIDRun，持
+     * mUpdateReqMutex）及 indexer worker 写侧并发。调用方 SetTokensMap 已持
+     * mMutexUseToken，锁序 mMutexUseToken → mUpdateReqMutex（全引擎唯一嵌套方向，
+     * 无反向路径）。 */
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     auto it = mHBMMangers.find(reqID);
     if (it != mHBMMangers.end()) {
         it->second.clear();
@@ -739,6 +746,13 @@ void GSAPrefetchEngineC::ResetReqTokenState(const std::string& reqID,
 void GSAPrefetchEngineC::RunLastChunkMoveGuarded(int layerID, const std::string& reqID,
                                                  int curTopkIndex)
 {
+    /* A-6 整改：LastChunkMove 子树无锁读 mAllBlocksHash/mReqUseBlockTable/
+     * mLastKVBlockAddress（find 于 LastChunkMove/BuildLastChunkSources，引用跨函数
+     * 全程持有），与 prefetch worker 清理段 erase（持 mUpdateReqMutex）并发；引用
+     * 无法在锁外安全使用（拷出会引入逐层分配），全程持锁——临界区含 H2D 拷贝与
+     * 同步，每层一次，代价记录在案。调用方 SetTokensMap 已持 mMutexUseToken，
+     * 锁序 mMutexUseToken → mUpdateReqMutex。 */
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     /* L-6 整改：判别式替代无条件 `*mHBMMangers[reqID][curTopkIndex]` 解引用。
      * ProcessTokensMapTopk 的任何早退（张量判别失败）都会使 manager 停留为
      * null；reqID 条目被 DelReqIDRun 抹除后的陈旧调用会走 operator[] 插空
@@ -764,6 +778,12 @@ void GSAPrefetchEngineC::ProcessTokensMapTopk(int layerID, const std::string& re
                                               size_t sparseSeqLen)
 {
     /* 提前识别：循环外完成张量判别并一次性提取只读视图（含读取范围校验）。 */
+    /* A-6 整改：函数体写 mHBMMangers/mMissGlobalToken/mLoadSlot 并经
+     * CopyUseBlockTableToIndicesTensor 读 mAllTopkIndicesTensor（其自身不加锁，
+     * 由调用方持锁，见其头注释），与 worker 清理段 erase（持 mUpdateReqMutex）
+     * 及 SetTopkIndices 写侧并发，统一锁协议。调用方 SetTokensMap 已持
+     * mMutexUseToken，锁序 mMutexUseToken → mUpdateReqMutex。 */
+    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
     PrefetchTopkView topkView;
     int qTopkNum = 0;
     int topkSize = 0;
@@ -848,7 +868,10 @@ int GSAPrefetchEngineC::AcquireQTopkView(torch::Tensor& qTopkTensor, const std::
 int GSAPrefetchEngineC::CopyUseBlockTableToIndicesTensor(const std::string& reqID, int layerID,
                                                          const std::vector<int>& useBlockTable)
 {
-    /* find 判别：杜绝 map operator[] 的并发插入；张量校验失败跳过拷贝并报错。 */
+    /* find 判别：杜绝 map operator[] 的并发插入；张量校验失败跳过拷贝并报错。
+     * A-5 锁协议：本函数自身不加锁，调用方必须已持 mUpdateReqMutex——
+     * ProcessTokensMapTopk（函数级）与 ProcessPrefetchRequest / ReadPrefetchResults
+     * （OMP/热路径上的最小临界区），写侧对端为 SetTopkIndices（函数级持锁）。 */
     auto tensorIt = mAllTopkIndicesTensor.find(reqID);
     if (tensorIt == mAllTopkIndicesTensor.end() || !tensorIt->second.defined() ||
         tensorIt->second.dim() < 1 ||
