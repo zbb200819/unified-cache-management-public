@@ -288,9 +288,11 @@ void MultiBSThreadFun(const TaskInfo& taskInfo, ThreadInfo& threadInfo)
                             "|KVCache Prefetch| [ERROR] MultiBSThreadFun task %d failed, ret=%d\n",
                             taskInfo.taskID, ret);
     }
-    engine->mUpdateReqMutex.lock();
-    engine->DelReqIDRun();
-    engine->mUpdateReqMutex.unlock();
+    {
+        UReqLockGuard lock(engine->mUpdateReqMutex,
+                           engine->UReqLockStatsAt(UReqLockSite::WorkerCleanup));
+        engine->DelReqIDRun();
+    }
     engine->mIsPrefetchRunning.store(false, std::memory_order_release);
 }
 
@@ -335,10 +337,58 @@ GSAPrefetchEngineC::GSAPrefetchEngineC(std::vector<int>& modelInfo, std::vector<
                                        std::string logFileName)
     : mLogger(logFileName, LogLevel::INFO, isLog)
 {
+    /* UReqLock 埋点 dump 门控：UCM_PREFETCH_LOCK_PROFILE 未设/0=关；
+     * 1=每 100 步 dump；N(>1)=每 N 步 dump。计数本身常开（见
+     * kvcache_pre_detail.h UReqLockStats），此处仅解析 dump 开关与间隔。 */
+    const char* lockProfileVal = std::getenv("UCM_PREFETCH_LOCK_PROFILE");
+    if (lockProfileVal != nullptr && lockProfileVal[0] != '\0' && lockProfileVal[0] != '0') {
+        mUReqLockProfileEnabled = true;
+        char* parseEnd = nullptr;
+        const long parsedSteps = std::strtol(lockProfileVal, &parseEnd, 10);
+        if (parseEnd != lockProfileVal && parsedSteps > 1) {
+            mUReqLockDumpIntervalSteps = static_cast<uint64_t>(parsedSteps);
+        }
+    }
     InitModelInfo(modelInfo, isLog, cpuToBind, topkLayerMap, rank, threadNum);
     InitBufferInfo(sizeinfo);
     InitAclRuntime();
     InitPrefetchResultShm(modelInfo);
+}
+
+void GSAPrefetchEngineC::DumpUReqLockStats()
+{
+    /* 埋点 dump：exchange 清零取"距上次 dump"的区间值。wait 落点指示
+     * "哪里在等"，hold 排名指示"谁在挡"——是 Tier 1 优化
+     * （IndexerLoadProcess 整程锁收窄 / LastChunkMove 分相 / OMP 预取化）
+     * 的裁决依据。名称表顺序必须与 UReqLockSite 枚举一一对应。 */
+    static const char* kUReqLockSiteNames[static_cast<size_t>(UReqLockSite::Count)] = {
+        "WorkerCleanup",     "DelBlocksMap",        "SetBlocksMap",     "SetLastIndexerBlock",
+        "SetIndexerMap",     "UpdateIndexerMap",    "SubmitTaskIndexer", "SetTopkIndices",
+        "ResetReqTokenState", "ProcessTokensMapTopk", "RunLastChunkMoveGuarded",
+        "IndexerInitLoad",   "SubmitTask",          "IndexerLoadProcess", "ProcessPrefetchRequest",
+        "ReadPrefetchResults",
+    };
+    static_assert(sizeof(kUReqLockSiteNames) / sizeof(kUReqLockSiteNames[0]) ==
+                      static_cast<size_t>(UReqLockSite::Count),
+                  "UReqLock site name table out of sync with UReqLockSite enum");
+    mLogger.log(LogLevel::INFO,
+                "Decode step: %u, |KVCache Prefetch| UReqLock profile (rank %d, since last "
+                "dump): site, acq, contended(>1us), waitUs, holdUs\n",
+                mDecodeStep, mRank);
+    for (size_t s = 0; s < static_cast<size_t>(UReqLockSite::Count); ++s) {
+        const uint64_t acq = mUReqLockStats[s].acquisitions.exchange(0, std::memory_order_relaxed);
+        const uint64_t contended =
+            mUReqLockStats[s].contended.exchange(0, std::memory_order_relaxed);
+        const uint64_t waitNs = mUReqLockStats[s].waitNs.exchange(0, std::memory_order_relaxed);
+        const uint64_t holdNs = mUReqLockStats[s].holdNs.exchange(0, std::memory_order_relaxed);
+        if (acq == 0) { continue; }
+        mLogger.log(LogLevel::INFO,
+                     "  %-24s acq=%-10llu contended=%-8llu waitUs=%-12llu holdUs=%-12llu\n",
+                     kUReqLockSiteNames[s], static_cast<unsigned long long>(acq),
+                     static_cast<unsigned long long>(contended),
+                     static_cast<unsigned long long>(waitNs / 1000),
+                     static_cast<unsigned long long>(holdNs / 1000));
+    }
 }
 
 void GSAPrefetchEngineC::InitModelInfo(std::vector<int>& modelInfo, bool isLog,
@@ -624,7 +674,7 @@ void GSAPrefetchEngineC::SetBlocksMap(const std::string& reqID,
     /* L-7 整改（最小改动·性能优先）：admission 与 indexer worker（IndexerLoadProcess
      * 全程持 mUpdateReqMutex find 本函数写入的两张 map）对称加锁，杜绝 std::map
      * 新 key 插入 vs 并发 find 的结构级 UB。每请求一次，非解码热路径。 */
-    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+    UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::SetBlocksMap));
     mAllBlocksHash[reqID] = blocksHash;
     mPromptLen[reqID] = maxIdx;
     auto& blockMap = mLastKVBlockAddress[reqID];
@@ -647,7 +697,7 @@ void GSAPrefetchEngineC::SetLastIndexerBlock(const std::string& reqID,
     }
     /* L-7 整改（最小改动）：与 SetBlocksMap 同理，写侧补 mUpdateReqMutex 对称
      * （读侧 indexer worker 已持同锁）。 */
-    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+    UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::SetLastIndexerBlock));
     auto reqIt = mLastKVBlockAddress.find(reqID);
     if (reqIt == mLastKVBlockAddress.end()) {
         mLogger.log(LogLevel::ERROR, "[ERROR] SetLastIndexerBlock no block info, reqID=%s\n",
@@ -725,7 +775,7 @@ void GSAPrefetchEngineC::ResetReqTokenState(const std::string& reqID,
      * mUpdateReqMutex）及 indexer worker 写侧并发。调用方 SetTokensMap 已持
      * mMutexUseToken，锁序 mMutexUseToken → mUpdateReqMutex（全引擎唯一嵌套方向，
      * 无反向路径）。 */
-    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+    UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::ResetReqTokenState));
     auto it = mHBMMangers.find(reqID);
     if (it != mHBMMangers.end()) {
         it->second.clear();
@@ -752,7 +802,7 @@ void GSAPrefetchEngineC::RunLastChunkMoveGuarded(int layerID, const std::string&
      * 无法在锁外安全使用（拷出会引入逐层分配），全程持锁——临界区含 H2D 拷贝与
      * 同步，每层一次，代价记录在案。调用方 SetTokensMap 已持 mMutexUseToken，
      * 锁序 mMutexUseToken → mUpdateReqMutex。 */
-    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+    UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::RunLastChunkMoveGuarded));
     /* L-6 整改：判别式替代无条件 `*mHBMMangers[reqID][curTopkIndex]` 解引用。
      * ProcessTokensMapTopk 的任何早退（张量判别失败）都会使 manager 停留为
      * null；reqID 条目被 DelReqIDRun 抹除后的陈旧调用会走 operator[] 插空
@@ -783,7 +833,7 @@ void GSAPrefetchEngineC::ProcessTokensMapTopk(int layerID, const std::string& re
      * 由调用方持锁，见其头注释），与 worker 清理段 erase（持 mUpdateReqMutex）
      * 及 SetTopkIndices 写侧并发，统一锁协议。调用方 SetTokensMap 已持
      * mMutexUseToken，锁序 mMutexUseToken → mUpdateReqMutex。 */
-    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+    UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::ProcessTokensMapTopk));
     PrefetchTopkView topkView;
     int qTopkNum = 0;
     int topkSize = 0;
@@ -911,7 +961,7 @@ void GSAPrefetchEngineC::SetIndexerMap(std::string reqID, std::vector<int>& bloc
                                        std::vector<int>& blockSlot, torch::Tensor& dsaSBT)
 {
     if (!mOpenIndexerOffload) { return; }
-    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+    UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::SetIndexerMap));
     mLogger.log(LogLevel::INFO,
                 "Decode step: %u, |KVCache Prefetch|"
                 " Start SetIndexerMap\n",
@@ -996,7 +1046,7 @@ void GSAPrefetchEngineC::UpdateIndexerMap(std::string reqID, int idx)
      * 守卫三连：offload 开关、请求已初始化（find 判别，杜绝 operator[]
      * 插入空条目后 [layerID] 越界 UB）、层数就绪。 */
     if (!mOpenIndexerOffload || mLayerNum <= 0) { return; }
-    std::lock_guard<std::mutex> lock(mUpdateReqMutex);
+    UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::UpdateIndexerMap));
     auto it = mUseBlockTableIdx.find(reqID);
     if (it == mUseBlockTableIdx.end() || it->second.size() < static_cast<size_t>(mLayerNum)) {
         mLogger.log(LogLevel::ERROR,

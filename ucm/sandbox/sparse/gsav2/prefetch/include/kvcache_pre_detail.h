@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <map>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -63,6 +64,88 @@ extern "C" void __gcov_dump(void);
 #endif
     std::abort();
 }
+
+/* mUpdateReqMutex 争用/持锁埋点（A-5/A-6 锁协议的性能观测面）。
+ * 计数常开：单次获取的额外开销 ≈ 2 次 steady_clock::now + 4 次 relaxed
+ * atomic add（约 60~90ns），相对锁本身的 ~30ns 与每步 10~40µs 的估算总
+ * 开销可忽略；dump 由 UCM_PREFETCH_LOCK_PROFILE 环境变量门控（构造函数
+ * 解析，DumpUReqLockStats 输出）。只做性能观测，不参与任何同步语义。 */
+struct UReqLockStats {
+    std::atomic<uint64_t> acquisitions{0};  // 获取次数
+    std::atomic<uint64_t> contended{0};     // 等锁超过阈值的次数（真实争用）
+    std::atomic<uint64_t> waitNs{0};        // 累计等锁时长（调用 lock -> 获得锁）
+    std::atomic<uint64_t> holdNs{0};        // 累计持锁时长（获得锁 -> 析构释放）
+
+    void Reset()
+    {
+        acquisitions.store(0, std::memory_order_relaxed);
+        contended.store(0, std::memory_order_relaxed);
+        waitNs.store(0, std::memory_order_relaxed);
+        holdNs.store(0, std::memory_order_relaxed);
+    }
+};
+
+// 判定"真实争用"的等锁阈值：无竞争获取约 30ns 量级，超过 1µs 必然存在
+// 其他持锁者（wait 落点指示"哪里在等"，hold 排名指示"谁在挡"）。
+constexpr uint64_t kUReqLockContendThresholdNs = 1000;
+
+// std::lock_guard 的埋点等价物：wait 从调用 lock 前起算，hold 到析构释放。
+class UReqLockGuard {
+public:
+    UReqLockGuard(std::mutex& mutex, UReqLockStats& stats) : mutex_(mutex), stats_(stats)
+    {
+        const auto waitStart = std::chrono::steady_clock::now();
+        mutex_.lock();
+        const auto acquired = std::chrono::steady_clock::now();
+        const uint64_t waitNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(acquired - waitStart).count());
+        stats_.acquisitions.fetch_add(1, std::memory_order_relaxed);
+        stats_.waitNs.fetch_add(waitNs, std::memory_order_relaxed);
+        if (waitNs > kUReqLockContendThresholdNs) {
+            stats_.contended.fetch_add(1, std::memory_order_relaxed);
+        }
+        holdStart_ = acquired;
+    }
+
+    ~UReqLockGuard()
+    {
+        const auto holdEnd = std::chrono::steady_clock::now();
+        const uint64_t holdNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(holdEnd - holdStart_).count());
+        stats_.holdNs.fetch_add(holdNs, std::memory_order_relaxed);
+        mutex_.unlock();
+    }
+
+    UReqLockGuard(const UReqLockGuard&) = delete;
+    UReqLockGuard& operator=(const UReqLockGuard&) = delete;
+
+private:
+    std::mutex& mutex_;
+    UReqLockStats& stats_;
+    std::chrono::steady_clock::time_point holdStart_{};
+};
+
+// mUpdateReqMutex 全部获取站点（埋点归属）。顺序与 DumpUReqLockStats 的
+// 名称表一一对应，新增站点必须两处同步。
+enum class UReqLockSite : size_t {
+    WorkerCleanup = 0,        // MultiBSThreadFun 清理段（DelReqIDRun 冲刷）
+    DelBlocksMap,             // Python del_blocks_map（延迟删除门控）
+    SetBlocksMap,             // Python set_blocks_map
+    SetLastIndexerBlock,      // Python set_last_indexer_block
+    SetIndexerMap,            // Python set_indexer_map
+    UpdateIndexerMap,         // Python update_indexer_map
+    SubmitTaskIndexer,        // Python submit_task_indexer
+    SetTopkIndices,           // Python set_topk_indices（Tier-0 后仅包 map 赋值）
+    ResetReqTokenState,       // SetTokensMap 子调用（A-6）
+    ProcessTokensMapTopk,     // SetTokensMap 子调用（A-6）
+    RunLastChunkMoveGuarded,  // SetTokensMap 子调用（A-6，临界区含 H2D/同步）
+    IndexerInitLoad,          // Python indexer_init_load（A-6）
+    SubmitTask,               // Python submit_prefetch_task 提交段（A-6）
+    IndexerLoadProcess,       // indexer worker（整程持锁，最大持有者）
+    ProcessPrefetchRequest,   // prefetch worker（rank0，OMP 域内最小临界区）
+    ReadPrefetchResults,      // prefetch worker（rank!=0）
+    Count
+};
 
 struct LastKVBlockAddress {
     std::uintptr_t kAddr{0};

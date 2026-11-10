@@ -58,6 +58,20 @@ public:
     // DelBlocksMap (Python thread), SetIndexerMap (Python thread) and
     // IndexerLoadProcess (indexer worker thread).
     std::mutex mUpdateReqMutex;
+    // mUpdateReqMutex 埋点（A-5/A-6 锁协议性能观测面）：per-site wait/hold
+    // 计数常开，dump 由 UCM_PREFETCH_LOCK_PROFILE 环境变量门控（构造函数
+    // 解析、SubmitTask 触发、DumpUReqLockStats 输出）。与上方互斥锁一致
+    // 公开（线程函数 MultiBSThreadFun 直接访问）。
+    UReqLockStats mUReqLockStats[static_cast<size_t>(UReqLockSite::Count)];
+    bool mUReqLockProfileEnabled = false;
+    uint64_t mUReqLockDumpIntervalSteps = 100;
+    uint64_t mUReqLockNextDumpStep = 0;
+
+    UReqLockStats& UReqLockStatsAt(UReqLockSite site)
+    {
+        return mUReqLockStats[static_cast<size_t>(site)];
+    }
+    void DumpUReqLockStats();
     bool mStopPrefetch = false;
     std::atomic<bool> mIsPrefetchRunning{false};
     std::atomic<bool> mIsIndexerLoadRunning{false};
