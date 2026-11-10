@@ -93,6 +93,7 @@ public:
     /* UCM store for Host-only KV load */
     UC::StoreV1* mStoreV1_{nullptr};
     bool mISSPAC8{false};
+    Logger mLogger;
 
 public:
     ~GSAPrefetchEngineC();
@@ -352,7 +353,6 @@ public:
     int mStreamNum = 4;
 
     // log information
-    Logger mLogger;
     bool mIsLog = false;
 
     // ptr bound

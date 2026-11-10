@@ -438,7 +438,7 @@ int GSAPrefetchEngineC::ProcessPrefetchRequest(const TaskInfo& taskInfo,
      * slot 补齐失败），清槽跳过、消费侧按零 miss 降级；不再 KVPackAbort 误杀全
      * 进程。调用方 PublishPrefetchResultsRank0 按 failedCount 汇总记账、版本照常
      * 递增，rank 间等待协议完整。 */
-    if (static_cast<int>(useBlockTable.size()) != mSpaTopkLen) {
+    if (static_cast<uint32_t>(useBlockTable.size()) != mSpaTopkLen) {
         mLogger.log(LogLevel::ERROR,
                     "Decode step: %u, |KVCache Prefetch| useBlockTable size mismatch, skip: "
                     "req_id: %s, layerID: %d, mSpaTopkLen: %d, useBlockTableSize: %zu\n",
