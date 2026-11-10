@@ -147,10 +147,13 @@ def execute_sparse_flash_attention_process(
             actual_seq_lengths_key,
             sparse_mode=sparse_mode,
             return_lse=return_lse,
-            # actual_sparse_lengths: per-token 真实 topk 长度，由 gsa.py
-            # _copy_gsa_buffers_to_npu 准备（swap req=SPA_TOKENS_LEN，非 swap
-            # =DEFAULT_TOPK_LEN，padding=0），用于 kernel 跳过 topk_indices 尾部
-            # -1 padding 的迭代。
+            # actual_sparse_lengths: per-req 真实 topk 长度（kernel 按 bIdx=req
+            # 索引读取，batchSize = len(actual_seq_lengths_query)），由 gsa.py
+            # _update_attn_gsa_lens 准备（decode 分支下发 per-req 数组：swap req=
+            # SPA_TOKENS_LEN，非 swap=DEFAULT_TOPK_LEN，padding req=0；prefill
+            # 分支置 None——两次 SFA 的 topk 均全宽有效且 swap 子批是重排 batch，
+            # 全量数组行号与其不对应），用于 kernel 跳过 topk_indices 尾部 -1
+            # padding 的迭代与 padding req。
             actual_sparse_lengths=getattr(
                 attn_metadata, "actual_sparse_lengths", None
             ),
@@ -218,8 +221,12 @@ def execute_kv_quant_sparse_flash_attention(
     Parameter mapping: the GSA op accepts the same keyword args as the ascend
     op plus 6 optional ones (key_dequant_scale / value_dequant_scale / sinks /
     actual_sparse_lengths / pre_tokens / next_tokens). ``actual_sparse_lengths``
-    is a per-token真实 topk 长度数组（gsa.py _copy_gsa_buffers_to_npu 准备），
-    kernel 用它跳过 topk_indices 尾部 -1 padding 迭代（5120-padding-1 性能关键）；
+    is a per-req 真实 topk 长度数组（kernel 按 bIdx=req 索引读取，batchSize =
+    len(actual_seq_lengths_query) = req 数；gsa.py _update_attn_gsa_lens 准备：
+    decode 分支下发，swap req=SPA_TOKENS_LEN / 非 swap=DEFAULT_TOPK_LEN /
+    padding req=0 即跳过；prefill 分支置 None——两次 SFA 的 topk 均全宽有效且
+    swap 子批是重排 batch，全量数组行号与其不对应），kernel 用它跳过
+    topk_indices 尾部 -1 padding 迭代与 padding req（5120-padding-1 性能关键）；
     其余 5 个 optional 默认 None，省略以匹配原调用面。``key_quant_mode`` /
     ``value_quant_mode`` 在 GSA schema 中位于 optional args 之前（见
     torch_binding.cpp:223-235），用 keyword 传递以避免位置依赖。

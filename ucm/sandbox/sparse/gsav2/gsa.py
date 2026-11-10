@@ -556,6 +556,7 @@ class GSA(UcmSparseBase):
         self.has_prefill = False
         self.num_padding_reqs = 0
         self.num_actual_tokens = 0
+        self.num_reqs_padded = 0
         self.alloc_block_sch = 0
         self._store_injected = False
         self._store_inject_retries = 0
@@ -778,15 +779,18 @@ class GSA(UcmSparseBase):
             (max_graph_bs + 2), self.device, torch.int64
         )
 
-        # actual_sparse_lengths: per-token 真实 topk 长度，传给
+        # actual_sparse_lengths: per-req 真实 topk 长度，传给
         # torch.ops._C_gsa.npu_kv_quant_sparse_flash_attention_gsa 的 actual_sparse_lengths 入参。
-        # kernel 用它跳过 topk_indices 尾部 -1 padding 的迭代（5120-padding-1 场景性能关键，
-        # 见 op_kernel/kv_quant_sparse_flash_attention_kernel_mla.h:343-348）。
-        # 长度对齐 gsa_swap_index（max_graph_bs + 2，取 num_input_tokens 切片使用）：
-        #   - swap req 的 token 位置: SPA_TOKENS_LEN（gsa_topk_expand_tmp 已把 2048 pad 到 5120）
-        #   - 非 swap req 的 token 位置: DEFAULT_TOPK_LEN（原始 topk 长度）
-        #   - padding req 区域（full_decode_only 图模式）: 0（kernel 跳过该 batch）
-        # dtype int32 对齐 kernel 侧 actualSparseLengthsGm.GetValue (int32_t)。
+        # kernel 侧按 bIdx（req 索引）逐 req 读取：batchSize = len(actual_seq_lengths_query)
+        # = len(cum_query_lens) = req 数（TND 布局，tiling.cpp GetBatchSize + 上游 sfa_v1.py
+        # _build 用 cum_query_lens 作 actual_seq_lengths_query），见 kernel_mla.h
+        # InitActualSeqLen/GetSparseActualSeqLen。因此本 buffer 的**索引语义是 req 域**：
+        # 下标 i 对应 batch 内第 i 个请求（含图模式 padding req）。
+        #   - swap req（is_gsa_init）: SPA_TOKENS_LEN（gsa_topk_expand_tmp 已把 2048 pad 到 5120）
+        #   - 非 swap 真实 req: DEFAULT_TOPK_LEN（原始 topk 长度，后 3072 个 -1 padding）
+        #   - padding req（full_decode_only 图模式）: 0（kernel effCount=0 跳过）
+        # buffer 容量按 max_graph_bs + 2（token 域上界）分配，远大于 req 数，仅作容量
+        # 上界，不代表索引语义。dtype int32 对齐 kernel 侧 actualSparseLengthsGm.GetValue。
         self.actual_sparse_lengths = DSAInputStruct(
             (max_graph_bs + 2), self.device, torch.int32
         )
@@ -1386,9 +1390,10 @@ class GSA(UcmSparseBase):
         self.select_block_index.np[:] = 0
         self.gsa_swap_index.np[:] = 0
         self.gsa_prefetch_index.np[:] = 0
-        # actual_sparse_lengths 默认填充 DEFAULT_TOPK_LEN：非 swap req 的 token 走原始
-        # topk 长度（2048）。swap req 的 token 位置在 _copy_gsa_buffers_to_npu 中被
-        # 覆写为 SPA_TOKENS_LEN；padding 区域覆写为 0。
+        # actual_sparse_lengths 默认填充 DEFAULT_TOPK_LEN（per-req 语义）：
+        # 非 swap 真实 req 的有效 topk 长度。swap req 的位置在 _collect_gsa_tokens
+        # 中按 index_in_batch 覆写为 SPA_TOKENS_LEN；图模式 padding req 区域在
+        # _copy_gsa_buffers_to_npu 中清 0。
         self.actual_sparse_lengths.np[:] = DEFAULT_TOPK_LEN
 
     def _init_indexer_offload_all(self):
@@ -1539,6 +1544,10 @@ class GSA(UcmSparseBase):
         )
         use_req_ids.append(req_id)
         self.select_block_index.np[req_cnt] = index_in_batch
+        # actual_sparse_lengths（per-req）：swap req 的稀疏窗口是完整的
+        # SPA_TOKENS_LEN（上一步保存的 5120 宽表），按 index_in_batch 写 req 域位置。
+        # kernel 按 bIdx=req 索引读取，与本写入语义一致。
+        self.actual_sparse_lengths.np[index_in_batch] = SPA_TOKENS_LEN
         req_cnt += 1
         for i in range(query_local[index_in_batch], query_local[index_in_batch + 1]):
             self.swap_index.append(i)
@@ -1580,29 +1589,20 @@ class GSA(UcmSparseBase):
         self.gsa_swap_index.copy_to_npu(-1)
         self.gsa_prefetch_index.copy_to_npu(self.num_padding_reqs)
         self.gsa_warmup_index.copy_to_npu(len(warmup_index))
-        # actual_sparse_lengths: per-token 真实 topk 长度，传给
-        # torch.ops._C_gsa.npu_kv_quant_sparse_flash_attention_gsa 的 actual_sparse_lengths
-        # 入参。kernel 用它跳过 topk_indices 尾部 -1 padding 的迭代
-        # (op_kernel/kv_quant_sparse_flash_attention_kernel_mla.h:343-348)。
-        #   - swap req 的 token 位置（gsa_swap_index[:gsa_swap_len]）: SPA_TOKENS_LEN
-        #     （gsa_topk_expand_tmp 已把 topk 从 DEFAULT_TOPK_LEN pad 到 SPA_TOKENS_LEN）
-        #   - 非 swap 的真实 req token 位置 [0:num_actual_tokens): DEFAULT_TOPK_LEN
-        #     （_reset_gsa_buffers_all 已预填，此处不动）
-        #   - padding token 位置 [num_actual_tokens:num_padding_reqs): 0
-        #     （full_decode_only 图模式 pad 到 capture size 的空位，无真实 topk，
-        #      kernel 见 0 即 effCount=0 跳过该 batch，避免遍历 -1 padding 空转）
-        # 注意 gsa_swap_index 的 padding 区域填的是 num_padding_reqs 常数值（用于
-        # gather 跳转索引），actual_sparse_lengths 的 padding 区域填 0（长度值），
-        # 二者语义不同。
-        if len(self.swap_index) != 0:
-            self.actual_sparse_lengths.np[
-                self.gsa_swap_index.np[: len(self.swap_index)]
-            ] = SPA_TOKENS_LEN
-        # padding 区域覆写为 0（覆盖 _reset 预填的 DEFAULT_TOPK_LEN）
+        # actual_sparse_lengths（per-req 语义，见 buffer 定义处注释）：
+        #   - swap req: SPA_TOKENS_LEN（已在 _collect_gsa_tokens 按 index_in_batch 写入）
+        #   - 非 swap 真实 req: DEFAULT_TOPK_LEN（_reset_gsa_buffers_all 预填）
+        #   - padding req（图模式 pad 到 capture size 的空位，本步未调度）: 0，
+        #     kernel effCount=0 跳过该 batch，避免遍历 -1 padding 空转。
+        # 注意 req 域边界：真实 req 数 = len(self.req_ids_bs)（本步调度的请求），
+        # padded req 数 = num_reqs_padded（= kernel batchSize = len(cum_query_lens)）。
+        # 不使用 token 域的 num_actual_tokens/num_padding_reqs（那是 gsa_swap_index
+        # 等 token 域 buffer 的边界，两个域不可混用）。
+        num_reqs_actual = len(self.req_ids_bs)
         self.actual_sparse_lengths.np[
-            self.num_actual_tokens : self.num_padding_reqs
+            num_reqs_actual : self.num_reqs_padded
         ] = 0
-        self.actual_sparse_lengths.copy_to_npu(self.num_padding_reqs)
+        self.actual_sparse_lengths.copy_to_npu(self.num_reqs_padded)
         indexer_len = 0
         if IS_INDEXER_OFFLOAD:
             flattened = [
@@ -1631,13 +1631,20 @@ class GSA(UcmSparseBase):
             if IS_INDEXER_OFFLOAD:
                 attn.indexer_last_query_len = indexer_len
             attn.select_block_index = self.select_block_index.npu[:req_cnt]
-            # actual_sparse_lengths: per-token 真实 topk 长度，传给
-            # npu_kv_quant_sparse_flash_attention_gsa；长度对齐 num_input_tokens
-            # （含图模式 padding），真实 token 区域为 SPA_TOKENS_LEN/DEFAULT_TOPK_LEN，
-            # padding 区域为 0。
-            attn.actual_sparse_lengths = self.actual_sparse_lengths.npu[
-                : self.num_padding_reqs
-            ]
+            # actual_sparse_lengths（per-req）仅在 decode 分支下发：
+            #   - decode（has_prefill=False）单次 SFA 用 5120 宽 merged topk
+            #     （swap 行=5120 全有效 / 非 swap 行=2048+3072 个 -1 / padding req
+            #     无 topk），kernel 按 per-req 长度跳过 -1 空转与 padding req。
+            #   - prefill（has_prefill=True）两次 SFA（全 batch 2048 宽 + swap 子批
+            #     5120 宽）的 topk 均全宽有效，无需收缩；且 swap 子批是重排后的
+            #     batch（bIdx=子批内序号），全量 per-req 数组的行号与其不对应，
+            #     下发反而引入错位——故置 None。
+            if getattr(attn, "has_prefill", False):
+                attn.actual_sparse_lengths = None
+            else:
+                attn.actual_sparse_lengths = self.actual_sparse_lengths.npu[
+                    : self.num_reqs_padded
+                ]
         self.log.info(
             f"[GSA] gsa_prefetch_len {gsa_prefetch_len} gsa_swap_len {gsa_swap_len}"
             f"gsa_warmup_len {gsa_warmup_len} attn.gsa_slot_len {gsa_slot_len}"
@@ -1831,11 +1838,18 @@ class GSA(UcmSparseBase):
         self.gsa_stats = self.gsa_metadata.gsa_stats
         attn = next(iter(attn_metadata.values()))
         self.num_padding_reqs = attn.num_input_tokens
-        # num_actual_tokens: 真实调度 token 数（不含图模式 padding）。
-        # actual_sparse_lengths 的 [num_actual_tokens:num_input_tokens] 区域是 padding
-        # token（full_decode_only 图模式下 pad 到 capture size 的空位），需填 0 让 kernel
-        # 跳过；[0:num_actual_tokens] 是真实 token，按 swap/非 swap 填长度。
+        # num_actual_tokens: 真实调度 token 数（不含图模式 padding）。token 域，
+        # 供 token 域 buffer（gsa_swap_index 等）参考；actual_sparse_lengths 是
+        # req 域，padding 边界用下面的 num_reqs_padded，勿混用。
         self.num_actual_tokens = getattr(attn, "num_actual_tokens", attn.num_input_tokens)
+        # num_reqs_padded: kernel batchSize = len(actual_seq_lengths_query) =
+        # len(cum_query_lens)（req 域，图模式含 pad 到 capture size 的空 req）。
+        # actual_sparse_lengths 按此长度切片下发。
+        cum_query_lens = getattr(attn, "cum_query_lens", None)
+        if cum_query_lens is not None:
+            self.num_reqs_padded = int(cum_query_lens.shape[0])
+        else:
+            self.num_reqs_padded = len(req_ids)
         gsa_slot_len = self.get_dsa_input()
         self.get_model_input_all(attn_metadata, gsa_slot_len)
         if IS_PERFORMANCE_LOG:

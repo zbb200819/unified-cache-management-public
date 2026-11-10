@@ -1229,6 +1229,39 @@ ge::graphStatus QSFATilingCheck::CheckActualSeqLensShape()
     return ge::GRAPH_SUCCESS;
 }
 
+ge::graphStatus QSFATilingCheck::CheckActualSparseLengths()
+{
+    if (opParamInfo_.actualSparseLengths.tensor == nullptr) {
+        return ge::GRAPH_SUCCESS;
+    }
+    if (opParamInfo_.actualSparseLengths.desc == nullptr) {
+        OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(opName_, "actualSparseLengths",
+            "actualSparseLengths is not empty, but actualSparseLengths's dtype is nullptr");
+        return ge::GRAPH_FAILED;
+    }
+    if (opParamInfo_.actualSparseLengths.desc->GetDataType() != ge::DT_INT32) {
+        OP_LOGE_FOR_INVALID_DTYPE_WITH_REASON(opName_, "actualSparseLengths",
+            QSFADataTypeToSerialString(opParamInfo_.actualSparseLengths.desc->GetDataType()).c_str(),
+            "The dtype of actualSparseLengths must be DT_INT32");
+    }
+    // actualSparseLengths 是 per-req 真实 topk 长度（kernel_mla.h GetSparseActualSeqLen
+    // 按 bIdx 读取，bIdx 域 = batchSize = len(actualSeqLengthsQ)），shape size 必须等于
+    // batch size；下发 token 域数组（长度对齐 num_input_tokens）属于契约错位，拒绝。
+    uint32_t qsfaShapeSizeSparse = 0;
+    if (GetActualSeqLenSize(qsfaShapeSizeSparse, opParamInfo_.actualSparseLengths.tensor,
+        "actualSparseLengths", opName_) != ge::GRAPH_SUCCESS) {
+        return ge::GRAPH_FAILED;
+    }
+    if (qsfaShapeSizeSparse != bSize_) {
+        OP_LOGE_FOR_INVALID_SHAPESIZE_WITH_REASON(opName_, "actualSparseLengths",
+            std::to_string(qsfaShapeSizeSparse).c_str(),
+            "The shape size of actualSparseLengths (per-req topk length) should be equal to batch size "
+                + std::to_string(bSize_));
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
 ge::graphStatus QSFATilingCheck::CheckMultiParaConsistency()
 {
     SetQSFAShapeCompare();
@@ -1237,6 +1270,7 @@ ge::graphStatus QSFATilingCheck::CheckMultiParaConsistency()
         ge::GRAPH_SUCCESS != CheckAttenOut() ||
         ge::GRAPH_SUCCESS != CheckActualSeqLensQ() ||
         ge::GRAPH_SUCCESS != CheckActualSeqLens() ||
+        ge::GRAPH_SUCCESS != CheckActualSparseLengths() ||
         ge::GRAPH_SUCCESS != CheckBlockTable()) {
         return ge::GRAPH_FAILED;
     }

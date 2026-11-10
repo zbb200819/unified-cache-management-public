@@ -454,6 +454,9 @@ private:
     ge::graphStatus CheckActualSeqLens();
     ge::graphStatus CheckActualSeqLensDType();
     ge::graphStatus CheckActualSeqLensShape();
+    // actualSparseLengths: per-req 真实 topk 长度（kernel 按 bIdx 读取，
+    // batchSize = len(actualSeqLengthsQ)），可选输入，nullptr 时跳过校验
+    ge::graphStatus CheckActualSparseLengths();
     ge::graphStatus CheckMultiParaConsistency();
 
     ge::graphStatus CheckFeatureMlaAntiquantShape() const;

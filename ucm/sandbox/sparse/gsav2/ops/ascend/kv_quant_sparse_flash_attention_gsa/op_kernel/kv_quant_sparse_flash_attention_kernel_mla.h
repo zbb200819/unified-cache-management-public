@@ -337,12 +337,17 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::GetSparseActualSeq
         threshold = static_cast<int64_t>(tempLoopInfo.nextTokensPerBatch) + s1Idx + 1;
     }
     if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
-        // 用 per-batch 真实 topk 长度替代 sparseBlockCount， 跳过 -1 padding 迭代
-        // 这是 5120-padding-1 场景性能从 429us 回到 ~95us 的关键改动
+        // 用 per-batch（per-req，bIdx=batchSize 内请求索引）真实 topk 长度替代
+        // sparseBlockCount，跳过 -1 padding 迭代。
+        // 这是 5120-padding-1 场景性能从 429us 回到 ~95us 的关键改动。
+        // perBatch 语义（Python 侧 gsa.py 按 req 域填充）:
+        //   - swap req: SPA_TOKENS_LEN(5120)  - 非 swap 真实 req: DEFAULT_TOPK_LEN(2048)
+        //   - padding req(图模式): 0 -> effCount=0 -> curActualSeqLen=0 -> 走
+        //     DealActSeqLenIsZero 跳过该 batch
         uint32_t effCount = constInfo.sparseBlockCount;
         if (hasActualSparseLengths) {
             int32_t perBatch = actualSparseLengthsGm.GetValue(bIdx);
-            if (perBatch > 0 && static_cast<uint32_t>(perBatch) < effCount) {
+            if (perBatch >= 0 && static_cast<uint32_t>(perBatch) < effCount) {
                 effCount = static_cast<uint32_t>(perBatch);
             }
         }
