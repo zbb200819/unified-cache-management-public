@@ -42,6 +42,33 @@ export HCCL_INTRA_PCIE_ENABLE=0
 export HCCL_INTRA_ROCE_ENABLE=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export ENABLE_UCM_PATCH=1
+export ENABLE_GSA_PATCH=1
+
+# ---------------------------------------------------------------------------
+# GSA 自定义算子库环境（aclnnKvQuantSparseFlashAttentionGsa 等符号由
+# libcust_opapi.so 提供，进程内 dlopen 只认启动时的 LD_LIBRARY_PATH，必须
+# 在 vllm serve 启动前注入；路径前置，优先于其他 vendor 的同名 libcust_opapi.so，
+# 否则首个 decode step 报 "aclnn... not in libopapi.so"）。
+# 安装：bash ucm/sandbox/sparse/gsav2/ops/ascend/install.sh（装 GSA-custom_ops*.run
+# 到 opp/vendors/gsa 并生成 setenv.bash）。
+# ---------------------------------------------------------------------------
+GSA_VENDOR_BASE=""
+for _base in /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/gsa \
+             "${HOME}/Ascend/ascend-toolkit/latest/opp/vendors/gsa"; do
+    if [ -d "${_base}/op_api/lib" ]; then GSA_VENDOR_BASE="$_base"; break; fi
+done
+if [ -n "$GSA_VENDOR_BASE" ]; then
+    if [ -f "${GSA_VENDOR_BASE}/setenv.bash" ]; then
+        source "${GSA_VENDOR_BASE}/setenv.bash"
+    else
+        export LD_LIBRARY_PATH="${GSA_VENDOR_BASE}/op_api/lib:${LD_LIBRARY_PATH}"
+    fi
+    echo "[GSA] custom ops lib: ${GSA_VENDOR_BASE}/op_api/lib"
+else
+    echo "[GSA][WARN] opp/vendors/gsa 未找到: GSA-custom_ops 未安装, C8 sparse attention 将不可用"
+    echo "[GSA][WARN] 请先执行: bash ucm/sandbox/sparse/gsav2/ops/ascend/install.sh 再重启服务"
+fi
+unset _base
 
 export PYTHONHASHSEED=0
 export ACL_OP_INIT_MODE=1

@@ -47,6 +47,61 @@ GSA_PATCH_REQUESTED = os.environ.get("ENABLE_GSA_PATCH", "").lower() in ("1", "t
 ENABLE_GSA_PATCH = ENABLE_UCM_PATCH and GSA_PATCH_REQUESTED
 
 
+def _preflight_gsa_cust_opapi() -> bool:
+    """预检 libcust_opapi.so 提供 GSA aclnn 符号（部署问题前移到启动期）。
+
+    ``torch.ops._C_gsa.npu_kv_quant_sparse_flash_attention_gsa`` 的
+    EXEC_NPU_CMD 用 static 惰性初始化，在首次调用算子时才
+    dlopen("libcust_opapi.so")，找不到符号时回退内置 libopapi.so 后报
+    "aclnnKvQuantSparseFlashAttentionGsa ... not in libopapi.so"——晚到
+    第一个 decode step 才爆，且信息误导：真正缺的是 GSA-custom_ops 安装到
+    opp/vendors/gsa/op_api/lib 的 libcust_opapi.so（或被 LD_LIBRARY_PATH
+    靠前的其他 vendor 同名库遮蔽）。
+
+    参照 gsa_on_device（import ucm_custom_ops 早期显式化、失败即报）的模式，
+    此处用 ctypes 复现 C++ 侧同一 dlopen 搜索路径并检查符号，把失败提前到
+    补丁应用期并给出可执行的修复指引。
+
+    注意：进程内修改 os.environ["LD_LIBRARY_PATH"] 不影响 dlopen（ld.so 在
+    进程启动时已缓存搜索路径），故只能报错指引、无法自愈；修复后必须重启服务。
+    """
+    import ctypes
+
+    try:
+        # 默认 mode（RTLD_LOCAL）即可：仅检查符号存在性，与 C++ 侧
+        # dlopen(RTLD_LAZY) 命中同一进程内已加载的 libcust_opapi.so。
+        lib = ctypes.CDLL("libcust_opapi.so")
+    except OSError as exc:
+        logger.error(
+            "GSA custom op lib libcust_opapi.so not loadable (dlopen search = "
+            "this process's LD_LIBRARY_PATH). torch.ops._C_gsa."
+            "npu_kv_quant_sparse_flash_attention_gsa will fail at the first "
+            "decode step with 'aclnnKvQuantSparseFlashAttentionGsa ... not in "
+            "libopapi.so'. Fix: (1) bash "
+            "ucm/sandbox/sparse/gsav2/ops/ascend/install.sh (installs "
+            "GSA-custom_ops*.run into opp/vendors/gsa and writes setenv.bash); "
+            "(2) source .../opp/vendors/gsa/setenv.bash, or prepend "
+            ".../opp/vendors/gsa/op_api/lib to LD_LIBRARY_PATH, in the service "
+            "launch environment (start_online_pdmix.sh / gsa_online.sh / "
+            "start_decode_glm52.sh already do this); (3) restart the service. "
+            "dlopen error: %s",
+            exc,
+        )
+        return False
+    if not hasattr(lib, "aclnnKvQuantSparseFlashAttentionGsaGetWorkspaceSize"):
+        logger.error(
+            "libcust_opapi.so loaded but lacks aclnnKvQuantSparseFlashAttentionGsa "
+            "symbols: the first libcust_opapi.so on this process's "
+            "LD_LIBRARY_PATH belongs to another vendor (ucm/custom_transformer/"
+            "...). npu_kv_quant_sparse_flash_attention_gsa will fail at the "
+            "first decode step. Fix: prepend .../opp/vendors/gsa/op_api/lib to "
+            "LD_LIBRARY_PATH (before other vendors) and restart the service."
+        )
+        return False
+    logger.info("GSA custom op lib libcust_opapi.so OK (aclnn symbols present)")
+    return True
+
+
 def _ensure_gsa_ops_loaded() -> None:
     """加载 gsa_ops C++ 扩展，注册 torch.ops._C_gsa 命名空间。
 
@@ -67,6 +122,10 @@ def _ensure_gsa_ops_loaded() -> None:
     try:
         import gsa_ops  # noqa: F401  触发 torch.ops._C_gsa 注册
         logger.info("gsa_ops C++ extension loaded; torch.ops._C_gsa registered")
+        # 注册成功不等于 aclnn 符号可解析：gsa_ops.so 只在首次调用算子时才
+        # dlopen libcust_opapi.so，部署问题会晚到首个 decode step 才爆——
+        # 此处预检前移（参照 gsa_on_device import ucm_custom_ops 的显式化模式）。
+        _preflight_gsa_cust_opapi()
     except ImportError as e:
         logger.warning(
             "ENABLE_GSA_PATCH=1 but gsa_ops C++ extension not installed; "
