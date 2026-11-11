@@ -112,9 +112,6 @@ class GSABlockTable:
         self.np = self.cpu.numpy()
         self.len = 0
 
-    def update_len(self, new_len):
-        self.len = new_len
-
 
 class GSASharedCPUPool:
     def __init__(self, num_slots):
@@ -263,12 +260,6 @@ class GSAReqStat:
             and self.stage() != SequenceStage.PREFILL
         )
 
-    def is_indexer_sparse(self) -> bool:
-        return (
-            self.num_prompt_tokens > INDEXER_PREFETCH_TOKENS
-            and self.stage() != SequenceStage.PREFILL
-        )
-
     def is_last_chunk(self) -> bool:
         # 区分 PD 分离与 PD 混合模式：
         # - PD 混合：当前为 prefill 的最后一块
@@ -389,15 +380,6 @@ class GSAReqStat:
         if self.num_prompt_tokens <= INDEXER_PREFETCH_TOKENS:
             return self.get_seq_len()
         sparse_len = (self.prompt_block_len - self.prompt_sparse_len) * self.block_size
-        return self.get_seq_len() - sparse_len
-
-    def get_indexer_remain_len(self):
-        if self.num_prompt_tokens <= INDEXER_PREFETCH_TOKENS:
-            return self.get_seq_len()
-        sparse_len = (
-            self.prompt_block_len
-            - math.ceil(self.prompt_sparse_len * INDEXER_PREFETCH_RATIO)
-        ) * self.block_size
         return self.get_seq_len() - sparse_len
 
 
@@ -2079,7 +2061,7 @@ class GSA(UcmSparseBase):
 
         if self.num_spec_tokens != 1 and rec_result is not None:
             last_q_index_fb = list(accumulate(self.indexer_last_q_index_fb))
-            # B-1 整改：被拒请求的 rec_result 哨兵为 -1（model_runner_v1_patch 的
+            # 被拒请求的 rec_result 哨兵为 -1（model_runner_v1_patch 的
             # where(valid_counts>0, valid_counts-1, -1)），直接参与列索引得到
             # last_q_index_fb[i] - 1 的负下标（落到上一请求或回绕到末列），
             # torch 索引静默取错 query 向量；钳到 0 = 该请求首个候选位置，
@@ -2374,7 +2356,7 @@ class GSA(UcmSparseBase):
             index_in_batch = req_meta.index_in_batch
             req_meta.prefetch_topk_step = self.prefetch_engine.step_time
             if self.num_spec_tokens != 1 and rec_result is not None:
-                # B-1 整改：rec_result 哨兵 -1 表示该 req 本步无任何有效采样
+                # rec_result 哨兵 -1 表示该 req 本步无任何有效采样
                 # token。req_seq_len 公式 (- num_spec_tokens + rec + 1) 对 -1
                 # 恰好退化为"本步提交 0 token"，语义正确，必须保留原值不可钳制；
                 # 但两处张量列索引必须钳到 0，否则负列下标被 torch 静默回绕
@@ -2502,9 +2484,6 @@ class GSA(UcmSparseBase):
 
     def update_state_after_alloc(self, request: Request, num_blocks: int):
         pass
-
-    def begin_sch_flag(self):
-        self.alloc_block_sch = 0
 
     def update_scheduler_free_slot(self, num):
         if num == 0:

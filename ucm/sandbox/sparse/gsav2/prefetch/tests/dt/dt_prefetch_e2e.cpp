@@ -4,11 +4,11 @@
  * DT (end-to-end): GSAPrefetchEngineC block-map lifecycle pipeline.
  *
  * Drives the engine through the public block-map lifecycle:
- *   SetBlocksMap -> SetTokensMap-skip -> DelBlocksMap -> GetReqUseBlockTable
+ *   SetBlocksMap -> SetTokensMap-skip -> DelBlocksMap
  * and verifies the observable outputs are consistent:
- *   - the block table stored by SetBlocksMap is retrievable
+ *   - the block table stored by SetBlocksMap is observable in per-request state
  *   - DelBlocksMap clears the per-request state
- *   - the Get* accessors return the stored values
+ *   - the remaining raw accessors (StoreV1 raw pointers) round-trip
  *
  * All ACL H2D / scatter ops and the UCM store are stubbed so the lifecycle
  * runs deterministically on a plain host without spawning worker threads or

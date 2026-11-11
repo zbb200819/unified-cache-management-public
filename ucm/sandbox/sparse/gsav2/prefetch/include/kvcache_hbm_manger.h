@@ -12,7 +12,6 @@
 #include <iostream>
 #include <kvcache_log.h>
 #include <random>
-#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -39,23 +38,20 @@ public:
         mDramTensorCount = dramTensorCount;
         mHbmCapacity = hbmCapacity;
         mHbmImmutableSize = hbmImmutableSize;
-        mHbmMutableSize = hbmCapacity - hbmImmutableSize;
         mTopkSize = topkSize;
         mMaxTotalSlots = (maxTotalSlots > hbmCapacity) ? maxTotalSlots : hbmCapacity;
         mPinnedSlotCount = 0;
         mLogger.log(
             LogLevel::DEBUG,
             "|HBM Manager| Init mDramTensorCount: %u, mHbmCapacity: %d, mHbmImmutableSize: %d, "
-            "mHbmMutableSize: %d, mTopkSize: %d, mMaxTotalSlots: %d \n",
-            mDramTensorCount, mHbmCapacity, mHbmImmutableSize, mHbmMutableSize, mTopkSize,
-            mMaxTotalSlots);
+            "mTopkSize: %d, mMaxTotalSlots: %d \n",
+            mDramTensorCount, mHbmCapacity, mHbmImmutableSize, mTopkSize, mMaxTotalSlots);
         mGlobalToSlot.assign(mDramTensorCount, -1);
         // mSlotToGlobal 仅覆盖常规 slot [0, mHbmCapacity-1]
         // pinned slot 的 gid 映射由公式推导: gid = slot - mHbmCapacity + mDramTensorCount
         mSlotToGlobal.assign(mHbmCapacity, -1);
         mLruPrev.assign(mMaxTotalSlots, -1);
         mLruNext.assign(mMaxTotalSlots, -1);
-        mIsImmutable.assign(mMaxTotalSlots, false);
         mIsPinned.assign(mMaxTotalSlots, false);
         mAddedSlotFlag.assign(mMaxTotalSlots, 0);
         // 初始化常规 slot 映射
@@ -72,10 +68,10 @@ public:
                 mGlobalToSlot[slotIdx] = slotIdx;
                 mSlotToGlobal[slotIdx] = slotIdx;
             }
-            /* B-3 整改：loop1 已恒等映射 gid [0, identityCount)。loop2 倒序回填
-             * 剩余 slot 时必须止步于该区间——原条件 gid >= 0 在 mHbmCapacity >
-             * mDramTensorCount（短 prompt 常见）时会把已映射的高位 gid 再映射
-             * 一遍：恒等 slot 沦为幽灵（mSlotToGlobal[k]=k 但 mGlobalToSlot[k]
+            /* loop1 已恒等映射 gid [0, identityCount)。loop2 倒序回填
+             * 剩余 slot 时必须止步于该区间——若在 mHbmCapacity >
+             * mDramTensorCount（短 prompt 常见）时回填 gid >= 0 的已映射高位
+             * gid，恒等 slot 沦为幽灵（mSlotToGlobal[k]=k 但 mGlobalToSlot[k]
              * 指向逆序重映射的高位 slot），validateMapping 必败、LRU 驱逐误杀
              * 正身映射（多余 DRAM 重载）、buildTopkOutput 冷填不排除幽灵导致
              * 同一 global 双槽 gather（softmax 权重双计）。被排除的剩余 slot
@@ -95,9 +91,7 @@ public:
             mLruPrev[i] = (i == 0) ? -1 : i - 1;
             mLruNext[i] = (i == mHbmCapacity - 1) ? -1 : i + 1;
         }
-        mGeneration = 0;
         mAddedSlotGeneration = 0;
-        updateImmutableZoneLogic();
         mInitialized = true;
     }
 
@@ -106,11 +100,8 @@ public:
                                   std::vector<int>& missIndices, Logger& mLogger)
     {
         int dedupedSize = dedupedTopkIds.size();
-        std::ostringstream oss;
-        oss << "|HBM Manager|: " << " topk len: " << mTopkSize << " topk: ";
         for (int i = 0; i < dedupedSize; ++i) {
             int gid = dedupedTopkIds[i];
-            oss << gid << " ";
             if (gid >= mDramTensorCount) {
                 int transformedSlot = gid - mDramTensorCount + mHbmCapacity;
                 if (transformedSlot >= mMaxTotalSlots) {
@@ -150,8 +141,6 @@ public:
             int thresaholdSub = 2047;
             if (i == thresaholdSub) { mHitRate = 1 - missIndices.size() * 1.0 / thresahold; }
         }
-        oss << "------\n";
-        oss.str("");
     }
 
     void processTopkMisses(const std::vector<int>& dedupedTopkIds, std::vector<int>& topkSlotIds,
@@ -238,7 +227,6 @@ public:
         std::vector<int> topkSlotIds(mTopkSize, -1);
         missGlobalIds.reserve(mTopkSize);
         missSlots.reserve(mTopkSize);
-        mGeneration = (mGeneration == INT_MAX) ? 1 : mGeneration + 1;
         mAddedSlotGeneration = (mAddedSlotGeneration == INT_MAX) ? 1 : mAddedSlotGeneration + 1;
         std::unordered_set<int> seenGids;
         std::vector<int> dedupedTopkIds;
@@ -260,7 +248,6 @@ public:
         collectTopkHitsAndMisses(dedupedTopkIds, topkSlotIds, missGlobalIds, missIndices, mLogger);
         processTopkMisses(dedupedTopkIds, topkSlotIds, missGlobalIds, missSlots, missIndices,
                           mLogger);
-        updateImmutableZoneLogic();
         buildTopkOutput(topkSlotIds, dedupedSize, output);
     }
 
@@ -342,20 +329,17 @@ private:
     int mDramTensorCount;
     int mHbmCapacity;
     int mHbmImmutableSize;
-    int mHbmMutableSize;
     int mTopkSize;
     int mPinnedSlotCount;
     int mMaxTotalSlots;
 
     std::vector<int> mLruPrev;
     std::vector<int> mLruNext;
-    std::vector<bool> mIsImmutable;
     std::vector<bool> mIsPinned;
     std::vector<int> mAddedSlotFlag;
 
     int mLruHead;
     int mLruTail;
-    int mGeneration;
     int mAddedSlotGeneration;
     bool mInitialized;
 
@@ -387,18 +371,6 @@ private:
         if (slot == mLruHead) return;
         removeFromList(slot);
         insertToHead(slot);
-    }
-
-    inline void updateImmutableZoneLogic()
-    {
-        std::fill(mIsImmutable.begin(), mIsImmutable.end(), false);
-        int count = 0;
-        int curr = mLruHead;
-        while (curr != -1 && count < mHbmImmutableSize) {
-            mIsImmutable[curr] = true;
-            curr = mLruNext[curr];
-            count++;
-        }
     }
 };
 

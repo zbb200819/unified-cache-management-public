@@ -72,7 +72,6 @@ public:
         return mUReqLockStats[static_cast<size_t>(site)];
     }
     void DumpUReqLockStats();
-    bool mStopPrefetch = false;
     std::atomic<bool> mIsPrefetchRunning{false};
     std::atomic<bool> mIsIndexerLoadRunning{false};
     int mRank = -1;
@@ -81,10 +80,7 @@ public:
     // task manager class
     std::unique_ptr<TaskManager> mTaskManger;
     std::unique_ptr<TaskManager> mIndexerTaskManger;
-    std::vector<int> mPrefetchLen;
     std::vector<bool> mIsIndexerOffload;
-    std::vector<void*> mDumpKBuffer;
-    std::vector<void*> mDumpVBuffer;
     std::map<std::string, std::vector<std::vector<int>>> mUseBlockTableIdx;
     std::map<std::string, std::vector<std::vector<int>>> mRealTimeIdx;
     std::map<std::string, std::vector<std::vector<int>>> mPrefetchBlockTableIdx;
@@ -114,7 +110,7 @@ public:
                       const std::vector<int>& remainBlockTable, int maxIdx,
                       const std::vector<int>& slots, bool isNeedInit);
 
-    // SetTokensMap 分解辅助（L-6 判别式整改）
+    // SetTokensMap 分解辅助（持有方调用，内部判别式访问 per-request 状态）
     void ResetReqTokenState(const std::string& reqID, const std::vector<int>& remainBlockTable,
                             int maxIdx, const std::vector<int>& slots);
 
@@ -134,9 +130,6 @@ public:
     // UC::Detail::BlockId ToBlockId(const std::string& hash);
     void UCMTensorMerge(int layerID, int streamIdx, std::vector<uint64_t>& hbmSlotIndex,
                         const std::string& reqID, uint32_t requestIndex);
-    /* Host-only KV load from UCM */
-    int LoadMissKVFromUCMHost(int reqID, int layerID, const std::vector<int>& missIdxs,
-                              void* kBufferOffset, void* vBufferOffset);
     void SetStoreV1(UC::StoreV1* store) { mStoreV1_ = store; }
 
     void SetStoreV1Raw(uintptr_t storePtr) { mStoreV1_ = reinterpret_cast<UC::StoreV1*>(storePtr); }
@@ -172,22 +165,8 @@ public:
                        std::vector<uintptr_t>& spaTokensPtr, std::vector<std::string>& reqIDs,
                        int sparseLen, int spaMaxBs, int mtpToken);
 
-    void TopkExpend(std::vector<int>& topkLensInput, std::string reqID);
-
     // Prefetch running status
     bool GetPrefetchStatus();
-
-    void SetModelRunningStatus(bool flag);
-
-    std::vector<int> GetTokenBlockMap(int layerID, std::string reqID);
-
-    std::vector<int> GetBlockTokenMap(int layerID, std::string reqID);
-
-    std::map<int, std::pair<int, int>> GetPrefetchToken(int layerID, std::string reqID);
-
-    std::vector<int> GetReqUseBlockTable(std::string reqID);
-
-    int GetSparseSeqLen(std::string reqID);
 
     // indexer offload
     void SetIndexerMap(std::string reqID, std::vector<int>& blockTableList,
@@ -229,10 +208,6 @@ public:
 
     bool GetIndexerStatus();
 
-    std::map<int, int> GetIndexerBlockMap(int layerID, std::string reqID);
-
-    std::map<int, int> GetIndexerTokensMap(int layerID, std::string reqID);
-
     void SetLastIndexerBlock(const std::string& reqID, const std::vector<int>& blockIdxs,
                              const std::vector<uintptr_t>& indexerAddrs);
 
@@ -242,9 +217,6 @@ public:
 #endif
     // HBM manager mapping
     // tokens topks
-    // mTokenBlockMaps  LN[{reqID, [token-idx]}]
-    // mBlockTokenMaps  LN[{reqID, {blockID, [token-idx]}}]
-    // mPrefetchTokens LN[{reqID, {token-idx, (blockID, slot)}}]
     std::map<std::string, std::vector<int>> mAllReqIdSlots;
     std::map<std::string, std::vector<int>> mReqUseBlockTable;
     std::map<std::string, int> mPromptLen;
@@ -310,7 +282,6 @@ public:
     std::vector<torch::Tensor> mIndexerTensor;
     std::vector<uint64_t> mIndexerPtr;
     uint32_t mIndexerSizeBytesBlock = 0;
-    int mLocalWindows = 5;
 
     int mSparseLen = 0;
     void* mStream;
@@ -352,12 +323,7 @@ public:
     int mThreadNum = 16;
     int mStreamNum = 4;
 
-    // log information
-    bool mIsLog = false;
-
-    // ptr bound
     uint32_t mIndexerSparseLen = 0;
-    int mKVHostBlockLen = 0;
     int mKVHBMBlockLen = 0;
     int mLastChunkNum = 0;
     int mKVBufferLen = 0;

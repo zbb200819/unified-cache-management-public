@@ -10,6 +10,7 @@
 3. 提供 FakeVllmConfig / GSA 构造 fixtures，将 buffer 规模压缩到 MB 级。
 """
 import logging
+import os
 import sys
 import types
 from pathlib import Path
@@ -216,11 +217,15 @@ def install_stubs():
 
 install_stubs()
 
+# UCM_SPARSE_GSA_ENABLE：IS_OPEN_GSA 在 ucm.sparse.utils 模块导入时求值，
+# 生产默认 False（显式 opt-in）；UT 被测对象即 GSA 全链路，必须置 1，
+# 否则 worker 初始化链（含 topk_layer_num）被短路。
+os.environ.setdefault("UCM_SPARSE_GSA_ENABLE", "1")
+
 # 被测模块：导入即覆盖其模块级代码（含 gsa.py L30-43 平台分支 True 侧）
 import ucm.sandbox.sparse.gsav2.gsa  # noqa: E402,F401
 import ucm.sandbox.sparse.gsav2.gsa_log  # noqa: E402,F401
 import ucm.sandbox.sparse.gsav2.gsa_shared_memory  # noqa: E402,F401
-import ucm.sandbox.sparse.gsav2.gsa_tensor_slot_manager_ds  # noqa: E402,F401
 import ucm.sandbox.sparse.gsav2.prefetch.prefetch_engine  # noqa: E402,F401
 
 

@@ -56,8 +56,6 @@ class TestSmallClasses:
         assert bt.len == 0
         bt.np[0, 0] = 7
         assert bt.cpu[0, 0].item() == 7
-        bt.update_len(4)
-        assert bt.len == 4
 
     def test_gsa_shared_cpu_pool(self):
         pool = gsa_mod.GSASharedCPUPool(5)
@@ -161,15 +159,6 @@ class TestGSAReqStat:
         # 短 prompt → False
         stat = self._stat(num_prompt_tokens=10, num_computed_tokens=10)
         assert stat.is_gsa() is False
-
-    def test_is_indexer_sparse_combinations(self, monkeypatch):
-        monkeypatch.setattr(gsa_mod, "INDEXER_PREFETCH_TOKENS", 64)
-        stat = self._stat(num_prompt_tokens=100, num_computed_tokens=100)
-        assert stat.is_indexer_sparse() is True
-        stat = self._stat(num_prompt_tokens=100, num_computed_tokens=50)
-        assert stat.is_indexer_sparse() is False
-        stat = self._stat(num_prompt_tokens=10, num_computed_tokens=10)
-        assert stat.is_indexer_sparse() is False
 
     def test_is_last_chunk_pd_mix(self):
         cfg = fakes.FakeVllmConfig(producer=True, consumer=True)
@@ -315,22 +304,6 @@ class TestGSAReqStat:
         stat.num_computed_tokens = 100
         stat.num_scheduled_tokens = 28
         assert stat.get_indexer_sparse_len() == 128  # 早退：get_seq_len()
-
-    def test_get_indexer_remain_len(self, monkeypatch):
-        monkeypatch.setattr(gsa_mod, "IS_INDEXER_OFFLOAD", True)
-        monkeypatch.setattr(gsa_mod, "INDEXER_PREFETCH_TOKENS", 64)
-        stat = self._stat(
-            num_prompt_tokens=100,
-            num_computed_tokens=100,
-            num_scheduled_tokens=28,
-            prompt_block_len=4,
-            prompt_sparse_len=2,
-        )
-        # sparse_len = (4 - ceil(2*1.5)) * 128 = 128；seq = 128 → 0
-        assert stat.get_indexer_remain_len() == 0
-        monkeypatch.setattr(gsa_mod, "INDEXER_PREFETCH_TOKENS", 32768)
-        stat.num_prompt_tokens = 100
-        assert stat.get_indexer_remain_len() == 128  # 早退：get_seq_len()
 
 
 # ===========================================================================
@@ -2435,14 +2408,12 @@ class TestSchedulerSide:
         g.request_finished_in_worker("r1")
         assert len(ec.called("get_indexer_status")) == 2
 
-    def test_begin_sch_flag_and_update(self, gsa_worker):
+    def test_update_scheduler_free_slot(self, gsa_worker):
         g = gsa_worker
         g.update_scheduler_free_slot(7)
         assert g.alloc_block_sch == 7
         g.update_scheduler_free_slot(3)
         assert g.alloc_block_sch == 10
-        g.begin_sch_flag()
-        assert g.alloc_block_sch == 0
         g.update_scheduler_free_slot(0)  # 归零分支
         assert g.alloc_block_sch == 0
 
@@ -2455,7 +2426,7 @@ class TestSchedulerSide:
         g = gsa_worker
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 64)
         req = fakes.FakeRequest(prompt_token_ids=list(range(100)))
-        g.begin_sch_flag()
+        g.update_scheduler_free_slot(0)  # 归零起点
         # free_i 100-0=100：100-50=50 ≥ 20 → False，累计 alloc
         assert g.estimate_free_slots_sparse(req, 50, 0) is False
         assert g.alloc_block_sch == 50
@@ -2576,7 +2547,7 @@ class TestSchedulerSide:
     def test_allocate_slots_sparse_preempted(self, gsa_worker, monkeypatch):
         monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 64)
         g = gsa_worker
-        g.begin_sch_flag()
+        g.update_scheduler_free_slot(0)  # 归零起点
         mgr = _fake_kv_cache_manager(coordinator=_FakeCoordinator(num_blocks=90))
         req = fakes.FakeRequest(num_output_tokens=5, prompt_token_ids=list(range(100)))
         # num_output > 1 → estimate：free_i(100)-90 < 20 → 判定抢占 → None

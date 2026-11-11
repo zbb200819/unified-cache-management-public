@@ -84,15 +84,6 @@ TEST_F(GSAEngineTest, ConstructWithIndexerOffloadCreatesIndexerTaskManager)
     EXPECT_NE(engine_, nullptr);
 }
 
-TEST_F(GSAEngineTest, SetModelRunningStatusTogglesFlag)
-{
-    engine_ = MakeEngine();
-    engine_->SetModelRunningStatus(true);
-    EXPECT_TRUE(engine_->mStopPrefetch);
-    engine_->SetModelRunningStatus(false);
-    EXPECT_FALSE(engine_->mStopPrefetch);
-}
-
 /* ---- StoreV1 raw pointer accessors ---- */
 
 TEST_F(GSAEngineTest, StoreV1RawAccessorsRoundTrip)
@@ -314,21 +305,4 @@ TEST_F(GSAEngineTest, IndexerStatusFlagReflectsAtomic)
     EXPECT_TRUE(engine_->GetIndexerStatus());
     engine_->mIsIndexerLoadRunning.store(false);
     EXPECT_FALSE(engine_->GetIndexerStatus());
-}
-
-/* ---- Get* accessors on populated maps ---- */
-
-TEST_F(GSAEngineTest, GetReqUseBlockTableReturnsStoredTable)
-{
-    engine_ = MakeEngine();
-    engine_->mReqUseBlockTable["req1"] = {3, 4, 5};
-    auto out = engine_->GetReqUseBlockTable("req1");
-    EXPECT_EQ(out, (std::vector<int>{3, 4, 5}));
-}
-
-TEST_F(GSAEngineTest, GetSparseSeqLenReturnsStoredValue)
-{
-    engine_ = MakeEngine();
-    engine_->mSparseSeqLen["req1"] = 256;
-    EXPECT_EQ(engine_->GetSparseSeqLen("req1"), 256);
 }

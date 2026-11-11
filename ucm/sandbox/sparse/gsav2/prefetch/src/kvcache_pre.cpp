@@ -52,8 +52,6 @@
 #define MAX_LOAD_NUM 2000u
 #define H2D_INFO_SIZE 6
 #define MAX_TOPK_SIZE 3200lu
-// 0表示使用原来的HOST预取、组合，1表示优化后的UCM统一管理
-#define IS_UCM_BUFFER_OPEN 1
 
 namespace ucmprefetch {
 
@@ -405,7 +403,6 @@ void GSAPrefetchEngineC::InitModelInfo(std::vector<int>& modelInfo, bool isLog,
     mMaxBs = modelInfo[ToIndex(ModelInfoIndex::MaxBs)];
     mTopkLayerMap = topkLayerMap;
     if (!mTopkLayerMap.empty()) { mTopkIndexerNum = mTopkLayerMap.back() + 1; }
-    mIsLog = isLog;
     mRank = rank;
     mKVPackDpRank = modelInfo[ToIndex(ModelInfoIndex::DpRank)];
     mTpSize = modelInfo[ToIndex(ModelInfoIndex::TpSize)];
@@ -671,9 +668,9 @@ void GSAPrefetchEngineC::SetBlocksMap(const std::string& reqID,
         mLogger.log(LogLevel::ERROR, "|SetBlocksMap| vAddrs size mismatch\n");
         return;
     }
-    /* L-7 整改（最小改动·性能优先）：admission 与 indexer worker（IndexerLoadProcess
-     * 全程持 mUpdateReqMutex find 本函数写入的两张 map）对称加锁，杜绝 std::map
-     * 新 key 插入 vs 并发 find 的结构级 UB。每请求一次，非解码热路径。 */
+    /* admission 写侧与 indexer worker（IndexerLoadProcess 全程持 mUpdateReqMutex
+     * find 本函数写入的两张 map）对称加锁，杜绝 std::map 新 key 插入 vs 并发
+     * find 的结构级 UB。每请求一次，非解码热路径。 */
     UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::SetBlocksMap));
     mAllBlocksHash[reqID] = blocksHash;
     mPromptLen[reqID] = maxIdx;
@@ -695,8 +692,8 @@ void GSAPrefetchEngineC::SetLastIndexerBlock(const std::string& reqID,
                     reqID.c_str());
         return;
     }
-    /* L-7 整改（最小改动）：与 SetBlocksMap 同理，写侧补 mUpdateReqMutex 对称
-     * （读侧 indexer worker 已持同锁）。 */
+    /* 与 SetBlocksMap 同理：写侧补 mUpdateReqMutex 对称（读侧 indexer worker
+     * 已持同锁）。 */
     UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::SetLastIndexerBlock));
     auto reqIt = mLastKVBlockAddress.find(reqID);
     if (reqIt == mLastKVBlockAddress.end()) {
@@ -768,8 +765,8 @@ void GSAPrefetchEngineC::ResetReqTokenState(const std::string& reqID,
                                             const std::vector<int>& slots)
 {
     /* layer0 每步重建 per-request 容器（原 SetTokensMap 内联块提取），
-     * managers/miss/loadSlot 三表同步扩容是下游下标访问的相关性前提。 */
-    /* A-6 整改：本函数写 mHBMMangers/mAllReqIdSlots/mReqUseBlockTable/mSparseSeqLen/
+     * managers/miss/loadSlot 三表同步扩容是下游下标访问的相关性前提。
+     * 本函数写 mHBMMangers/mAllReqIdSlots/mReqUseBlockTable/mSparseSeqLen/
      * mPromptLen/mMissGlobalToken/mLoadSlot 七张 per-request map（operator[] 含
      * 插入/重平衡），与 prefetch worker 清理段 erase（DelReqIDRun，持
      * mUpdateReqMutex）及 indexer worker 写侧并发。调用方 SetTokensMap 已持
@@ -796,14 +793,14 @@ void GSAPrefetchEngineC::ResetReqTokenState(const std::string& reqID,
 void GSAPrefetchEngineC::RunLastChunkMoveGuarded(int layerID, const std::string& reqID,
                                                  int curTopkIndex)
 {
-    /* A-6 整改：LastChunkMove 子树无锁读 mAllBlocksHash/mReqUseBlockTable/
-     * mLastKVBlockAddress（find 于 LastChunkMove/BuildLastChunkSources，引用跨函数
-     * 全程持有），与 prefetch worker 清理段 erase（持 mUpdateReqMutex）并发；引用
-     * 无法在锁外安全使用（拷出会引入逐层分配），全程持锁——临界区含 H2D 拷贝与
-     * 同步，每层一次，代价记录在案。调用方 SetTokensMap 已持 mMutexUseToken，
+    /* LastChunkMove 子树读 mAllBlocksHash/mReqUseBlockTable/mLastKVBlockAddress
+     * （find 于 LastChunkMove/BuildLastChunkSources，引用跨函数全程持有），与
+     * prefetch worker 清理段 erase（持 mUpdateReqMutex）并发；引用无法在锁外
+     * 安全使用（拷出会引入逐层分配），全程持锁——临界区含 H2D 拷贝与同步，
+     * 每层一次，代价记录在案。调用方 SetTokensMap 已持 mMutexUseToken，
      * 锁序 mMutexUseToken → mUpdateReqMutex。 */
     UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::RunLastChunkMoveGuarded));
-    /* L-6 整改：判别式替代无条件 `*mHBMMangers[reqID][curTopkIndex]` 解引用。
+    /* 判别式替代无条件 `*mHBMMangers[reqID][curTopkIndex]` 解引用：
      * ProcessTokensMapTopk 的任何早退（张量判别失败）都会使 manager 停留为
      * null；reqID 条目被 DelReqIDRun 抹除后的陈旧调用会走 operator[] 插空
      * 分支。两类情况一律日志 + 跳过 LastChunkMove（允许个别精度问题），
@@ -827,8 +824,8 @@ void GSAPrefetchEngineC::ProcessTokensMapTopk(int layerID, const std::string& re
                                               torch::Tensor& qTopkTensor, int maxIdx,
                                               size_t sparseSeqLen)
 {
-    /* 提前识别：循环外完成张量判别并一次性提取只读视图（含读取范围校验）。 */
-    /* A-6 整改：函数体写 mHBMMangers/mMissGlobalToken/mLoadSlot 并经
+    /* 提前识别：循环外完成张量判别并一次性提取只读视图（含读取范围校验）。
+     * 函数体写 mHBMMangers/mMissGlobalToken/mLoadSlot 并经
      * CopyUseBlockTableToIndicesTensor 读 mAllTopkIndicesTensor（其自身不加锁，
      * 由调用方持锁，见其头注释），与 worker 清理段 erase（持 mUpdateReqMutex）
      * 及 SetTopkIndices 写侧并发，统一锁协议。调用方 SetTokensMap 已持
@@ -1040,11 +1037,9 @@ void GSAPrefetchEngineC::SetIndexerMapForLayer(const std::string& reqID, int lay
 
 void GSAPrefetchEngineC::UpdateIndexerMap(std::string reqID, int idx)
 {
-    /* L-3 整改：提前识别 + 判别。生产调用链（Python update_indexer_map）只
-     * 使用 "add" 语义（新分配块后追加槽位索引），原 "lastdel"/"del" 分支
-     * 零调用且 "del" 分支仅打印无任何状态变更——死代码，一并删除。
-     * 守卫三连：offload 开关、请求已初始化（find 判别，杜绝 operator[]
-     * 插入空条目后 [layerID] 越界 UB）、层数就绪。 */
+    /* 提前识别 + 判别：生产调用链（Python update_indexer_map）只使用 "add"
+     * 语义（新分配块后追加槽位索引）。守卫三连：offload 开关、请求已初始化
+     * （find 判别，杜绝 operator[] 插入空条目后 [layerID] 越界 UB）、层数就绪。 */
     if (!mOpenIndexerOffload || mLayerNum <= 0) { return; }
     UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::UpdateIndexerMap));
     auto it = mUseBlockTableIdx.find(reqID);
@@ -1074,7 +1069,7 @@ void GSAPrefetchEngineC::TokenIndexMapInter(std::vector<int>& oneTopkList, int b
                     mBlockSize, reqID.c_str());
         return;
     }
-    /* L-5 整改（提前识别）：循环外一次性 find 取表与 seqLen，杜绝插空+越界 UB。 */
+    /* 循环外一次性 find 取表与 seqLen，杜绝插空+越界 UB。 */
     auto realTimeIt = mRealTimeIdx.find(reqID);
     auto seqLenIt = mSeqLen.find(reqID);
     if (realTimeIt == mRealTimeIdx.end() || seqLenIt == mSeqLen.end() ||
@@ -1085,8 +1080,8 @@ void GSAPrefetchEngineC::TokenIndexMapInter(std::vector<int>& oneTopkList, int b
     }
     const auto& realTimeIdx = realTimeIt->second[static_cast<size_t>(layerID)];
     const int seqLen = seqLenIt->second;
-    /* L-5 整改（判别式门控）：负 token / 块序号越界 / 翻译后越界三类非法输入
-     * 一律"日志 + 跳过翻译（保留原值）"，杜绝 OOB 读与负 slot 伪装。 */
+    /* 判别式门控：负 token / 块序号越界 / 翻译后越界三类非法输入一律
+     * "日志 + 跳过翻译（保留原值）"，杜绝 OOB 读与负 slot 伪装。 */
     for (int j = 0; j < topkLen; j++) {
         const int ori = oneTopkList[j];
         if (ori < 0) {
