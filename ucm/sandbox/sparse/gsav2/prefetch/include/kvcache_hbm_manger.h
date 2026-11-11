@@ -8,6 +8,7 @@
 #include <cassert>
 #include <chrono>
 #include <climits>
+#include <cstdint>
 #include <functional>
 #include <iostream>
 #include <kvcache_log.h>
@@ -54,6 +55,11 @@ public:
         mLruNext.assign(mMaxTotalSlots, -1);
         mIsPinned.assign(mMaxTotalSlots, false);
         mAddedSlotFlag.assign(mMaxTotalSlots, 0);
+        // 去重标记数组：覆盖两段连续 gid 域——常规 [0, mDramTensorCount) 与
+        // pinned [mDramTensorCount, mDramTensorCount + mMaxTotalSlots - mHbmCapacity)
+        // （pinned gid = slot - mHbmCapacity + mDramTensorCount）。
+        mSeenGidFlag.assign(mDramTensorCount + mMaxTotalSlots - mHbmCapacity, 0);
+        mSeenGidGeneration = 0;
         // 初始化常规 slot 映射
         if (preloadHbm) {
             // local slot [0, mHbmCapacity-1] 映射为 global 组合:
@@ -95,55 +101,10 @@ public:
         mInitialized = true;
     }
 
-    void collectTopkHitsAndMisses(const std::vector<int>& dedupedTopkIds,
-                                  std::vector<int>& topkSlotIds, std::vector<int>& missGlobalIds,
-                                  std::vector<int>& missIndices, Logger& mLogger)
-    {
-        int dedupedSize = dedupedTopkIds.size();
-        for (int i = 0; i < dedupedSize; ++i) {
-            int gid = dedupedTopkIds[i];
-            if (gid >= mDramTensorCount) {
-                int transformedSlot = gid - mDramTensorCount + mHbmCapacity;
-                if (transformedSlot >= mMaxTotalSlots) {
-                    mLogger.log(LogLevel::ERROR,
-                                "|HBM Manager| Pinned slot %d exceeds maxTotalSlots %d, gid: %d\n",
-                                transformedSlot, mMaxTotalSlots, gid);
-                    topkSlotIds[i] = transformedSlot;
-                    continue;
-                }
-                if (!mIsPinned[transformedSlot]) {
-                    mIsPinned[transformedSlot] = true;
-                    insertToHead(transformedSlot);
-                    mPinnedSlotCount++;
-                } else {
-                    moveToHead(transformedSlot);
-                }
-                topkSlotIds[i] = transformedSlot;
-                mAddedSlotFlag[transformedSlot] = mAddedSlotGeneration;
-                continue;
-            }
-            if (gid < 0) {
-                mLogger.log(LogLevel::ERROR, "|KVCache Prefetch| Topk is abnormal value: %d \n",
-                            gid);
-                continue;
-            }
-            int slot = mGlobalToSlot[gid];
-            int thresahold = 2048;
-            if (slot != -1) {
-                moveToHead(slot);
-                topkSlotIds[i] = slot;
-                mAddedSlotFlag[slot] = mAddedSlotGeneration;
-            } else {
-                missGlobalIds.push_back(gid);
-                missIndices.push_back(i);
-                if ((int)missIndices.size() == thresahold) { break; }
-            }
-            int thresaholdSub = 2047;
-            if (i == thresaholdSub) { mHitRate = 1 - missIndices.size() * 1.0 / thresahold; }
-        }
-    }
-
-    void processTopkMisses(const std::vector<int>& dedupedTopkIds, std::vector<int>& topkSlotIds,
+    /* miss 换入与回填：victim 自 LRU 尾部驱逐（跳过 pinned）。missGlobalIds 与
+     * missIndices 平行入栈（missIndices[j] 为第 j 个 miss 的去重后序号），回填
+     * 直接取 missGlobalIds[j]，无需 deduped 序列二次查表。 */
+    void processTopkMisses(std::vector<int>& topkSlotIds,
                            std::vector<int>& missGlobalIds, std::vector<int>& missSlots,
                            const std::vector<int>& missIndices, Logger& mLogger)
     {
@@ -184,10 +145,8 @@ public:
             }
             missGlobalIds.resize(loadedCount);
             for (int j = 0; j < loadedCount; ++j) {
-                int idx = missIndices[j];
-                int gid = dedupedTopkIds[idx];
-                int slot = mGlobalToSlot[gid];
-                topkSlotIds[idx] = slot;
+                int slot = mGlobalToSlot[missGlobalIds[j]];
+                topkSlotIds[missIndices[j]] = slot;
                 if (slot >= 0 && slot < mMaxTotalSlots) {
                     mAddedSlotFlag[slot] = mAddedSlotGeneration;
                 }
@@ -218,37 +177,97 @@ public:
         }
     }
 
+    /* topk 查找主路径：去重 + hit/miss 分类 + miss 换入 + 输出组装。
+     *
+     * 去重：代际标记数组（mSeenGidFlag/mSeenGidGeneration）替代 unordered_set，
+     * 覆盖常规 gid 域与 pinned gid 公式域两段连续区间；域外 gid（负值/超界
+     * pinned）不参与去重，直通各自异常分支（日志条数随重复次数变化，可接受；
+     * 超界 pinned 的原始 slot 值照写，行为不变）。代际推进到 255 时全量清零回 1，
+     * 陈旧标记不可能与新代际别名命中。
+     *
+     * 去重与分类合流单循环：dedupedCount 即去重后序号（与原 topkSlotIds 下标
+     * 语义一致，负 gid 占据序号但不出槽，保持原采样点），miss 的 gid 与序号
+     * 平行入栈供 processTopkMisses 免查表回填。scratch 复用类成员：
+     * mScratchSlotIds 同尺寸 assign 免分配、mScratchMissIndices clear 保留
+     * capacity；manager 为 per-(req,layer) 独占对象，无跨线程共享。 */
     void processTopkWithDebug(const std::vector<int>& topkIds, std::vector<int>& output,
                               std::vector<int>& missGlobalIds, std::vector<int>& missSlots,
                               Logger& mLogger)
     {
         HBM_ASSERT(mInitialized);
         mTopkSize = topkIds.size();
-        std::vector<int> topkSlotIds(mTopkSize, -1);
         missGlobalIds.reserve(mTopkSize);
         missSlots.reserve(mTopkSize);
         mAddedSlotGeneration = (mAddedSlotGeneration == INT_MAX) ? 1 : mAddedSlotGeneration + 1;
-        std::unordered_set<int> seenGids;
-        std::vector<int> dedupedTopkIds;
-        dedupedTopkIds.reserve(mTopkSize);
+        if (mSeenGidGeneration == 255) {
+            std::fill(mSeenGidFlag.begin(), mSeenGidFlag.end(), 0);
+            mSeenGidGeneration = 1;
+        } else {
+            ++mSeenGidGeneration;
+        }
+        const int gidBound = static_cast<int>(mSeenGidFlag.size());
+        mScratchSlotIds.assign(mTopkSize, -1);
+        mScratchMissIndices.clear();
+        const int thresahold = 2048;
+        const int thresaholdSub = 2047;
+        int dedupedCount = 0;
         for (int i = 0; i < mTopkSize; ++i) {
             int gid = topkIds[i];
-            if (seenGids.count(gid)) {
-                mLogger.log(LogLevel::ERROR,
-                            "|HBM Manager| Duplicate gid in topkIds: %d at index: %d, skipping\n",
-                            gid, i);
+            if (gid >= 0 && gid < gidBound) {
+                if (mSeenGidFlag[gid] == mSeenGidGeneration) {
+                    mLogger.log(LogLevel::ERROR,
+                                "|HBM Manager| Duplicate gid in topkIds: %d at index: %d, "
+                                "skipping\n",
+                                gid, i);
+                    continue;
+                }
+                mSeenGidFlag[gid] = mSeenGidGeneration;
+            }
+            if (gid >= mDramTensorCount) {
+                int transformedSlot = gid - mDramTensorCount + mHbmCapacity;
+                if (transformedSlot >= mMaxTotalSlots) {
+                    mLogger.log(LogLevel::ERROR,
+                                "|HBM Manager| Pinned slot %d exceeds maxTotalSlots %d, gid: %d\n",
+                                transformedSlot, mMaxTotalSlots, gid);
+                    mScratchSlotIds[dedupedCount] = transformedSlot;
+                    ++dedupedCount;
+                    continue;
+                }
+                if (!mIsPinned[transformedSlot]) {
+                    mIsPinned[transformedSlot] = true;
+                    insertToHead(transformedSlot);
+                    mPinnedSlotCount++;
+                } else {
+                    moveToHead(transformedSlot);
+                }
+                mScratchSlotIds[dedupedCount] = transformedSlot;
+                mAddedSlotFlag[transformedSlot] = mAddedSlotGeneration;
+                ++dedupedCount;
                 continue;
             }
-            seenGids.insert(gid);
-            dedupedTopkIds.push_back(gid);
+            if (gid < 0) {
+                mLogger.log(LogLevel::ERROR, "|KVCache Prefetch| Topk is abnormal value: %d \n",
+                            gid);
+                ++dedupedCount;
+                continue;
+            }
+            int slot = mGlobalToSlot[gid];
+            if (slot != -1) {
+                moveToHead(slot);
+                mScratchSlotIds[dedupedCount] = slot;
+                mAddedSlotFlag[slot] = mAddedSlotGeneration;
+            } else {
+                missGlobalIds.push_back(gid);
+                mScratchMissIndices.push_back(dedupedCount);
+                if ((int)mScratchMissIndices.size() == thresahold) { break; }
+            }
+            if (dedupedCount == thresaholdSub) {
+                mHitRate = 1 - mScratchMissIndices.size() * 1.0 / thresahold;
+            }
+            ++dedupedCount;
         }
-        int dedupedSize = dedupedTopkIds.size();
-        std::vector<int> missIndices;
-        missIndices.reserve(dedupedSize);
-        collectTopkHitsAndMisses(dedupedTopkIds, topkSlotIds, missGlobalIds, missIndices, mLogger);
-        processTopkMisses(dedupedTopkIds, topkSlotIds, missGlobalIds, missSlots, missIndices,
-                          mLogger);
-        buildTopkOutput(topkSlotIds, dedupedSize, output);
+        processTopkMisses(mScratchSlotIds, missGlobalIds, missSlots, mScratchMissIndices, mLogger);
+        buildTopkOutput(mScratchSlotIds, dedupedCount, output);
     }
 
     int getSlotForGlobal(int gid) const
@@ -337,10 +356,17 @@ private:
     std::vector<int> mLruNext;
     std::vector<bool> mIsPinned;
     std::vector<int> mAddedSlotFlag;
+    // 去重标记数组（代际模式；与 mAddedSlotFlag 的 INT_MAX 翻转不同：uint8 空间
+    // 小，代际到 255 时全量清零回 1，杜绝 8bit 空间的陈旧别名命中）
+    std::vector<uint8_t> mSeenGidFlag;
+    // 每调用 scratch：同尺寸 assign / clear 复用，免逐步堆分配
+    std::vector<int> mScratchSlotIds;
+    std::vector<int> mScratchMissIndices;
 
     int mLruHead;
     int mLruTail;
     int mAddedSlotGeneration;
+    int mSeenGidGeneration;
     bool mInitialized;
 
     inline void removeFromList(int slot)
