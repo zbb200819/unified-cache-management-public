@@ -39,7 +39,7 @@ NUM_GSA_BLOCKS = 1
 # (e.g. via env var UCM_SPARSE_GSA_ENABLE=1), so non-GSA deployments are not
 # affected. Other sparse methods (ESA / KVStar / GSAOnDevice / Blend) are driven
 # by their own kv_transfer_config and do not consume this switch.
-IS_OPEN_GSA = _env_bool("UCM_SPARSE_GSA_ENABLE", True)
+IS_OPEN_GSA = _env_bool("UCM_SPARSE_GSA_ENABLE", False)
 # Topk-prefetch switch consumed by the legacy ucm.sparse.gsa chain only.
 # NOTE: gsav2 and its vLLM integration patches
 # (ucm.sandbox.sparse.gsav2.patch) no longer read this switch -- it was
