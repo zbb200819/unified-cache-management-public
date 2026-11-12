@@ -127,6 +127,13 @@ PYBIND11_MODULE(gsa_prefetch, m)
         .def("update_indexer_map", &ucmprefetch::GSAPrefetchEngineC::UpdateIndexerMap)
         .def("submit_task_indexer", &ucmprefetch::GSAPrefetchEngineC::SubmitTaskIndexer)
         .def("get_indexer_status", &ucmprefetch::GSAPrefetchEngineC::GetIndexerStatus)
+        // D1：任务完成事件等待。call_guard<gil_scoped_release> 必须——pybind
+        // 默认持 GIL 进入 C++，阻塞等待会卡死所有 Python 线程；time.sleep
+        // 本身是释放 GIL 的，此处对齐其语义。
+        .def("wait_prefetch_idle", &ucmprefetch::GSAPrefetchEngineC::WaitPrefetchIdle,
+             pybind11::arg("timeout_ms"), pybind11::call_guard<pybind11::gil_scoped_release>())
+        .def("wait_indexer_idle", &ucmprefetch::GSAPrefetchEngineC::WaitIndexerIdle,
+             pybind11::arg("timeout_ms"), pybind11::call_guard<pybind11::gil_scoped_release>())
         .def("indexer_init_load", &ucmprefetch::GSAPrefetchEngineC::IndexerInitLoad)
         .def("set_store_v1", &ucmprefetch::GSAPrefetchEngineC::SetStoreV1Raw)
         .def("get_store_v1_ptr", &ucmprefetch::GSAPrefetchEngineC::GetStoreV1Raw)

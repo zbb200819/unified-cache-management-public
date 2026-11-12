@@ -121,7 +121,8 @@ TEST_F(ReadPrefetchResultsTest, WriteThenReadRoundTripsMissTokensAndSlots)
     engine->mLoadSlot[reqID][0] = {5, 6};
     std::vector<int> useBlockTable(engine->mSpaTopkLen, 42);
     auto layout = MakeLayout();
-    engine->WritePrefetchResult(reqID, /*i=*/0, /*layerID=*/0, useBlockTable, layout);
+    engine->WritePrefetchResult(/*i=*/0, /*layerID=*/0, useBlockTable, layout,
+                               engine->mMissGlobalToken[reqID][0], engine->mLoadSlot[reqID][0]);
 
     // Clear local state to simulate a reader.
     engine->mMissGlobalToken[reqID][0].clear();
@@ -160,7 +161,8 @@ TEST_F(ReadPrefetchResultsTest, ReadPrefetchResultsHandlesZeroMissTokens)
     // Write with zero miss tokens and zero load slots.
     std::vector<int> useBlockTable(engine->mSpaTopkLen, 7);
     auto layout = MakeLayout();
-    engine->WritePrefetchResult(reqID, 0, 0, useBlockTable, layout);
+    engine->WritePrefetchResult(0, 0, useBlockTable, layout, engine->mMissGlobalToken[reqID][0],
+                                engine->mLoadSlot[reqID][0]);
     // Clear + read back.
     engine->mMissGlobalToken[reqID][0].clear();
     engine->mLoadSlot[reqID][0].clear();
@@ -192,7 +194,8 @@ TEST_F(ReadPrefetchResultsTest, PreparePrefetchResultsNonRank0ReadsBackShm)
     engine->mLoadSlot[reqID][0] = {50, 60};
     std::vector<int> useBlockTable(engine->mSpaTopkLen, 11);
     auto layout = MakeLayout();
-    engine->WritePrefetchResult(reqID, 0, 0, useBlockTable, layout);
+    engine->WritePrefetchResult(0, 0, useBlockTable, layout, engine->mMissGlobalToken[reqID][0],
+                                engine->mLoadSlot[reqID][0]);
     // Clear local state.
     engine->mMissGlobalToken[reqID][0].clear();
     engine->mLoadSlot[reqID][0].clear();

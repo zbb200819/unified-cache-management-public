@@ -141,7 +141,8 @@ enum class UReqLockSite : size_t {
     RunLastChunkMoveGuarded,  // SetTokensMap 子调用（A-6，临界区含 H2D/同步）
     IndexerInitLoad,          // Python indexer_init_load（A-6）
     SubmitTask,               // Python submit_prefetch_task 提交段（A-6）
-    IndexerLoadProcess,       // indexer worker（整程持锁，最大持有者）
+    IndexerLoadProcess,       // indexer worker 段1表事务（A3 锁收窄后仅表演化，IO 段出锁）
+    IndexerLoadResolve,       // indexer worker 段2装载计划解析（A3：共享表查找+任务组装 mini 段）
     ProcessPrefetchRequest,   // prefetch worker（rank0，OMP 域内最小临界区）
     ReadPrefetchResults,      // prefetch worker（rank!=0）
     Count

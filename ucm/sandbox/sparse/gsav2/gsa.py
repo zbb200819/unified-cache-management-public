@@ -1352,8 +1352,10 @@ class GSA(UcmSparseBase):
 
     def _update_prefetch_status_all(self):
         if len(self.need_prefetch_index) > 0:
+            # D1: 条件变量等待（worker 尾部 notify，µs 级唤醒）替代 sleep(1ms)
+            # 轮询；外层 while 保留为超时兜底重查。等待在 C++ 侧释放 GIL。
             while self.prefetch_engine.prefetch_engine_c.get_prefetch_status():
-                time.sleep(0.001)
+                self.prefetch_engine.prefetch_engine_c.wait_prefetch_idle(1000)
             self.is_prefetch_token = True
         elif len(self.gsa_index) > 0:
             is_done = not self.prefetch_engine.prefetch_engine_c.get_prefetch_status()
@@ -1754,10 +1756,10 @@ class GSA(UcmSparseBase):
         for req_id in scheduler_output.preempted_req_ids:
             self._release_preempted_gsa_stats(req_id)
             while self.prefetch_engine.prefetch_engine_c.get_prefetch_status():
-                time.sleep(0.001)
+                self.prefetch_engine.prefetch_engine_c.wait_prefetch_idle(1000)
             if IS_INDEXER_OFFLOAD:
                 while self.prefetch_engine.prefetch_engine_c.get_indexer_status():
-                    time.sleep(0.001)
+                    self.prefetch_engine.prefetch_engine_c.wait_indexer_idle(1000)
             self.prefetch_engine.del_finish_meta(req_id)
             self._block_hash_injected_reqs.discard(req_id)
             self.preempt_req_output_tokens[req_id] = len(
@@ -2465,10 +2467,10 @@ class GSA(UcmSparseBase):
         if not IS_OPEN_GSA or not self.is_decode_node:
             return
         while self.prefetch_engine.prefetch_engine_c.get_prefetch_status():
-            time.sleep(0.001)
+            self.prefetch_engine.prefetch_engine_c.wait_prefetch_idle(1000)
         if IS_INDEXER_OFFLOAD:
             while self.prefetch_engine.prefetch_engine_c.get_indexer_status():
-                time.sleep(0.001)
+                self.prefetch_engine.prefetch_engine_c.wait_indexer_idle(1000)
         if request_id in self.gsa_stats:
             stats = self.gsa_stats.pop(request_id)
             if self.rank == 0:

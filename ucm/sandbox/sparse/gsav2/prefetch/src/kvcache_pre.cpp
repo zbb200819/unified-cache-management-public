@@ -289,9 +289,22 @@ void MultiBSThreadFun(const TaskInfo& taskInfo, ThreadInfo& threadInfo)
     {
         UReqLockGuard lock(engine->mUpdateReqMutex,
                            engine->UReqLockStatsAt(UReqLockSite::WorkerCleanup));
-        engine->DelReqIDRun();
+        /* A3：IndexerLoadProcess 的 IO 段出锁后，本清理段与 indexer worker
+         * 的并发不再被整程锁隐式排除；对齐 DelBlocksMap 的状态门控——
+         * indexer worker 在跑（mIsIndexerLoadRunning=true，含其无锁 IO 段，
+         * 该段仍迭代 allNeedLoadBlock / 读 allMissIdxs）则延迟冲刷，
+         * mDelSeqIds 留存至 DelBlocksMap 或下次 worker 尾部（DelReqIDRun
+         * 幂等，尾部 clear）。本线程自身 mIsPrefetchRunning 在下一行才
+         * 清零，自检恒真无意义，只门控对侧 worker。 */
+        if (!engine->GetIndexerStatus()) { engine->DelReqIDRun(); }
     }
-    engine->mIsPrefetchRunning.store(false, std::memory_order_release);
+    /* D1：在 mTaskDoneMutex 保护内翻转状态位，锁外 notify_all——等待侧
+     * predicate 持锁判定，杜绝"判定后、休眠前"的丢唤醒窗口。 */
+    {
+        std::lock_guard<std::mutex> doneLock(engine->mTaskDoneMutex);
+        engine->mIsPrefetchRunning.store(false, std::memory_order_release);
+    }
+    engine->mPrefetchDoneCv.notify_all();
 }
 
 void MultiBSThreadFunIndexer(const TaskInfo& taskInfo, ThreadInfo& threadInfo)
@@ -304,7 +317,12 @@ void MultiBSThreadFunIndexer(const TaskInfo& taskInfo, ThreadInfo& threadInfo)
                             "ret=%d\n",
                             taskInfo.taskID, ret);
     }
-    engine->mIsIndexerLoadRunning.store(false, std::memory_order_release);
+    /* D1：与 MultiBSThreadFun 尾部同协议——mutex 内翻转、锁外 notify。 */
+    {
+        std::lock_guard<std::mutex> doneLock(engine->mTaskDoneMutex);
+        engine->mIsIndexerLoadRunning.store(false, std::memory_order_release);
+    }
+    engine->mIndexerDoneCv.notify_all();
 }
 
 enum class ModelInfoIndex {
@@ -363,8 +381,8 @@ void GSAPrefetchEngineC::DumpUReqLockStats()
         "WorkerCleanup",     "DelBlocksMap",        "SetBlocksMap",     "SetLastIndexerBlock",
         "SetIndexerMap",     "UpdateIndexerMap",    "SubmitTaskIndexer", "SetTopkIndices",
         "ResetReqTokenState", "ProcessTokensMapTopk", "RunLastChunkMoveGuarded",
-        "IndexerInitLoad",   "SubmitTask",          "IndexerLoadProcess", "ProcessPrefetchRequest",
-        "ReadPrefetchResults",
+        "IndexerInitLoad",   "SubmitTask",          "IndexerLoadProcess", "IndexerLoadResolve",
+        "ProcessPrefetchRequest", "ReadPrefetchResults",
     };
     static_assert(sizeof(kUReqLockSiteNames) / sizeof(kUReqLockSiteNames[0]) ==
                       static_cast<size_t>(UReqLockSite::Count),
@@ -668,9 +686,9 @@ void GSAPrefetchEngineC::SetBlocksMap(const std::string& reqID,
         mLogger.log(LogLevel::ERROR, "|SetBlocksMap| vAddrs size mismatch\n");
         return;
     }
-    /* admission 写侧与 indexer worker（IndexerLoadProcess 全程持 mUpdateReqMutex
-     * find 本函数写入的两张 map）对称加锁，杜绝 std::map 新 key 插入 vs 并发
-     * find 的结构级 UB。每请求一次，非解码热路径。 */
+    /* admission 写侧与 indexer worker（其段1 表事务 / 段2 IndexerLoadResolve
+     * mini 段均持 mUpdateReqMutex find 本函数写入的两张 map）对称加锁，杜绝
+     * std::map 新 key 插入 vs 并发 find 的结构级 UB。每请求一次，非解码热路径。 */
     UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::SetBlocksMap));
     mAllBlocksHash[reqID] = blocksHash;
     mPromptLen[reqID] = maxIdx;
@@ -793,31 +811,37 @@ void GSAPrefetchEngineC::ResetReqTokenState(const std::string& reqID,
 void GSAPrefetchEngineC::RunLastChunkMoveGuarded(int layerID, const std::string& reqID,
                                                  int curTopkIndex)
 {
-    /* LastChunkMove 子树读 mAllBlocksHash/mReqUseBlockTable/mLastKVBlockAddress
-     * （find 于 LastChunkMove/BuildLastChunkSources，引用跨函数全程持有），与
-     * prefetch worker 清理段 erase（持 mUpdateReqMutex）并发；引用无法在锁外
-     * 安全使用（拷出会引入逐层分配），全程持锁——临界区含 H2D 拷贝与同步，
-     * 每层一次，代价记录在案。调用方 SetTokensMap 已持 mMutexUseToken，
-     * 锁序 mMutexUseToken → mUpdateReqMutex。 */
-    UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::RunLastChunkMoveGuarded));
-    /* 判别式替代无条件 `*mHBMMangers[reqID][curTopkIndex]` 解引用：
-     * ProcessTokensMapTopk 的任何早退（张量判别失败）都会使 manager 停留为
-     * null；reqID 条目被 DelReqIDRun 抹除后的陈旧调用会走 operator[] 插空
-     * 分支。两类情况一律日志 + 跳过 LastChunkMove（允许个别精度问题），
-     * 杜绝 Python 线程空指针 core。 */
-    auto managersIt = mHBMMangers.find(reqID);
-    if (managersIt == mHBMMangers.end() || curTopkIndex < 0 ||
-        static_cast<size_t>(curTopkIndex) >= managersIt->second.size() ||
-        !managersIt->second[static_cast<size_t>(curTopkIndex)]) {
-        mLogger.log(LogLevel::ERROR,
-                    "Decode step: %u, |KVCache Prefetch| SetTokensMap manager not ready, "
-                    "skip last chunk move: reqID=%s layerID=%d topkIndex=%d tableSize=%zu\n",
-                    mDecodeStep, reqID.c_str(), layerID, curTopkIndex,
-                    managersIt == mHBMMangers.end() ? 0 : managersIt->second.size());
-        return;
+    /* A2 分相（保守档）：mUpdateReqMutex 从全程（含 LastChunkMove 的
+     * LoadOnToken DDR IO / CopyTrans H2D / Synchronize，ms 级）收窄为本
+     * 函数的 moveMap 快照段 + LastChunkMove / BuildLastChunkSources 内的
+     * 表快照段（见各自头注释）。mHBMMangers 的 mSlotToGlobal 引用原先跨
+     * IO 全程持有，现改为值拷贝——锁外 WorkerCleanup 的 DelReqIDRun
+     * erase（其它 req）不再影响本段。调用方 SetTokensMap 仍全程持
+     * mMutexUseToken（保守档：与 prefetch worker 的互斥语义不变），锁序
+     * mMutexUseToken → mUpdateReqMutex。 */
+    std::vector<int> moveMap;
+    {
+        UReqLockGuard lock(mUpdateReqMutex,
+                           UReqLockStatsAt(UReqLockSite::RunLastChunkMoveGuarded));
+        /* 判别式替代无条件 `*mHBMMangers[reqID][curTopkIndex]` 解引用：
+         * ProcessTokensMapTopk 的任何早退（张量判别失败）都会使 manager 停留为
+         * null；reqID 条目被 DelReqIDRun 抹除后的陈旧调用会走 operator[] 插空
+         * 分支。两类情况一律日志 + 跳过 LastChunkMove（允许个别精度问题），
+         * 杜绝 Python 线程空指针 core。 */
+        auto managersIt = mHBMMangers.find(reqID);
+        if (managersIt == mHBMMangers.end() || curTopkIndex < 0 ||
+            static_cast<size_t>(curTopkIndex) >= managersIt->second.size() ||
+            !managersIt->second[static_cast<size_t>(curTopkIndex)]) {
+            mLogger.log(LogLevel::ERROR,
+                        "Decode step: %u, |KVCache Prefetch| SetTokensMap manager not ready, "
+                        "skip last chunk move: reqID=%s layerID=%d topkIndex=%d tableSize=%zu\n",
+                        mDecodeStep, reqID.c_str(), layerID, curTopkIndex,
+                        managersIt == mHBMMangers.end() ? 0 : managersIt->second.size());
+            return;
+        }
+        moveMap = managersIt->second[static_cast<size_t>(curTopkIndex)]->mSlotToGlobal;
     }
-    LastChunkMove(layerID, reqID,
-                  managersIt->second[static_cast<size_t>(curTopkIndex)]->mSlotToGlobal);
+    LastChunkMove(layerID, reqID, moveMap);
 }
 
 void GSAPrefetchEngineC::ProcessTokensMapTopk(int layerID, const std::string& reqID,
@@ -1061,7 +1085,7 @@ void GSAPrefetchEngineC::UpdateIndexerMap(std::string reqID, int idx)
 }
 
 void GSAPrefetchEngineC::TokenIndexMapInter(std::vector<int>& oneTopkList, int bsIndex, int layerID,
-                                            int topkLen, std::string reqID)
+                                            int topkLen, const std::string& reqID)
 {
     if (!mOpenIndexerOffload) { return; }
     if (mBlockSize <= 0) {
@@ -1119,20 +1143,33 @@ void GSAPrefetchEngineC::LastChunkMove(int layerID, const std::string& reqID,
         mLogger.log(LogLevel::ERROR, "|LastChunkMove| mStoreV1_ is nullptr");
         return;
     }
-    auto hashIt = mAllBlocksHash.find(reqID);
-    auto blockTableIt = mReqUseBlockTable.find(reqID);
-    if (hashIt == mAllBlocksHash.end() || blockTableIt == mReqUseBlockTable.end()) {
-        mLogger.log(LogLevel::ERROR, "|LastChunkMove| Cannot find hash/blockTable");
-        return;
+    /* A2 分相：mAllBlocksHash / mReqUseBlockTable 的读取与值快照约束在
+     * mini 段内——blockTable 引用原先跨 IO 全程持有（LoadOnToken /
+     * CopyTrans / Synchronize），现改为值拷贝，锁外并发 erase / rehash
+     * 不再影响。hashIt 仅用于 sourceBlocks 容量，一并快照。下游
+     * BuildLastChunkSources 有独立的 hashVec / 非 UCM 地址快照段。 */
+    std::vector<int> blockTableCopy;
+    size_t hashCount = 0;
+    {
+        UReqLockGuard lock(mUpdateReqMutex,
+                           UReqLockStatsAt(UReqLockSite::RunLastChunkMoveGuarded));
+        auto hashIt = mAllBlocksHash.find(reqID);
+        auto blockTableIt = mReqUseBlockTable.find(reqID);
+        if (hashIt == mAllBlocksHash.end() || blockTableIt == mReqUseBlockTable.end()) {
+            mLogger.log(LogLevel::ERROR, "|LastChunkMove| Cannot find hash/blockTable");
+            return;
+        }
+        hashCount = hashIt->second.size();
+        blockTableCopy = blockTableIt->second;
     }
-    const auto& blockTable = blockTableIt->second;
+    const std::vector<int>& blockTable = blockTableCopy;
     const size_t blockSize = static_cast<size_t>(mBlockSize);
     const size_t blockCount = moveMap.size() / blockSize;
     const size_t kBlockBytes = blockSize * static_cast<size_t>(mKVSizeBytesToken);
     const size_t vBlockBytes = blockSize * static_cast<size_t>(mKVSizeBytesTokenRe);
     // sourceBlocks 仅保留非 UCM 块的 host 源地址；UCM 块的 token 由 LoadOnToken
     // 在接口内直接拷贝到 last chunk staging buffer。
-    std::vector<LastChunkSourceBlock> sourceBlocks(hashIt->second.size() + 1);
+    std::vector<LastChunkSourceBlock> sourceBlocks(hashCount + 1);
     UCMTokenLoadPlan plan;
     if (!PrepareLastChunkSources(layerID, reqID, moveMap, blockTable, sourceBlocks, plan)) {
         return;
@@ -1193,13 +1230,23 @@ bool GSAPrefetchEngineC::BuildLastChunkSources(int layerID, const std::string& r
                                                std::vector<LastChunkSourceBlock>& sourceBlocks,
                                                UCMTokenLoadPlan& plan)
 {
-    auto hashItLastChunk = mAllBlocksHash.find(reqID);
-    if (hashItLastChunk == mAllBlocksHash.end()) {
-        mLogger.log(LogLevel::ERROR,
-                    "|LastChunkMove| Cannot find hashVec, reqID=%s\n", reqID.c_str());
-        return false;
+    /* A2 分相：hashVec 与非 UCM 块源地址（mLastKVBlockAddress 条目）在
+     * mini 段内值快照——token 循环及其后的 LoadOnToken DDR IO 不再持
+     * mUpdateReqMutex。非 UCM 条目按 blockIdx >= lastUCMBlockIdx 过滤拷贝
+     * （通常仅最后一块），避免整表拷贝。 */
+    std::vector<BlockId> hashVecCopy;
+    {
+        UReqLockGuard lock(mUpdateReqMutex,
+                           UReqLockStatsAt(UReqLockSite::RunLastChunkMoveGuarded));
+        auto hashItLastChunk = mAllBlocksHash.find(reqID);
+        if (hashItLastChunk == mAllBlocksHash.end()) {
+            mLogger.log(LogLevel::ERROR,
+                        "|LastChunkMove| Cannot find hashVec, reqID=%s\n", reqID.c_str());
+            return false;
+        }
+        hashVecCopy = hashItLastChunk->second;
     }
-    const auto& hashVec = hashItLastChunk->second;
+    const auto& hashVec = hashVecCopy;
     const size_t blockSize = static_cast<size_t>(mBlockSize);
     const size_t kTokenBytes = static_cast<size_t>(mKVSizeBytesToken);
     const size_t vTokenBytes = static_cast<size_t>(mKVSizeBytesTokenRe);
@@ -1218,10 +1265,18 @@ bool GSAPrefetchEngineC::BuildLastChunkSources(int layerID, const std::string& r
         mLogger.log(LogLevel::ERROR, "|LastChunkMove| last chunk buffer is nullptr\n");
         return false;
     }
-    auto lastKVReqIt = mLastKVBlockAddress.find(reqID);
-    if (lastKVReqIt == mLastKVBlockAddress.end()) {
-        mLogger.log(LogLevel::ERROR, "|LastChunkMove| no non-UCM block\n");
-        return false;
+    std::unordered_map<int, LastKVBlockAddress> lastKVCopy;
+    {
+        UReqLockGuard lock(mUpdateReqMutex,
+                           UReqLockStatsAt(UReqLockSite::RunLastChunkMoveGuarded));
+        auto lastKVReqIt = mLastKVBlockAddress.find(reqID);
+        if (lastKVReqIt == mLastKVBlockAddress.end()) {
+            mLogger.log(LogLevel::ERROR, "|LastChunkMove| no non-UCM block\n");
+            return false;
+        }
+        for (const auto& kv : lastKVReqIt->second) {
+            if (kv.first >= lastUCMBlockIdx) { lastKVCopy.emplace(kv.first, kv.second); }
+        }
     }
     // 每个 UCM 块对应一个 shard：目的首地址为该块首个 token 在 last chunk
     // staging buffer 中的落位（kDstBase + firstDst * kTokenBytes）；块内每个
@@ -1239,8 +1294,8 @@ bool GSAPrefetchEngineC::BuildLastChunkSources(int layerID, const std::string& r
         }
         const int blockIdx = globalToken / mBlockSize;
         if (blockIdx >= lastUCMBlockIdx) {
-            auto blockIt = lastKVReqIt->second.find(blockIdx);
-            if (blockIt == lastKVReqIt->second.end()) {
+            auto blockIt = lastKVCopy.find(blockIdx);
+            if (blockIt == lastKVCopy.end()) {
                 mLogger.log(LogLevel::ERROR, "|LastChunkMove| non-UCM block not found\n");
                 return false;
             }

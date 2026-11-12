@@ -39,6 +39,13 @@ public:
 
     void SetLevel(LogLevel level) { mMinLevel = level; }
 
+    /* 调用方在构造昂贵日志实参（如 O(n) 聚合、字符串拼接）前判别，避免
+     * 实参求值开销；判别条件与 log() 的早退条件完全一致。 */
+    bool enabledFor(LogLevel level) const
+    {
+        return mEnable && mLogFile.is_open() && level >= mMinLevel;
+    }
+
     void log(LogLevel level, const char* format, ...)
     {
         if (level < mMinLevel || !mLogFile.is_open() || !mEnable) { return; }

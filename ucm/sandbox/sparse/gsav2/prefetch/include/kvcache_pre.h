@@ -74,6 +74,14 @@ public:
     void DumpUReqLockStats();
     std::atomic<bool> mIsPrefetchRunning{false};
     std::atomic<bool> mIsIndexerLoadRunning{false};
+    /* D1：任务完成事件（等待原语见 WaitPrefetchIdle/WaitIndexerIdle）。
+     * 状态位翻转与 notify 的协议：worker 尾部先在 mTaskDoneMutex 内
+     * store(false)，再 notify_all——等待侧 predicate 在持锁状态下判定，
+     * 杜绝"判定后、休眠前"的丢唤醒窗口。本互斥锁不与任何引擎锁嵌套
+     * （notify 点位于 WorkerCleanup 的 mUpdateReqMutex 块之后）。 */
+    std::mutex mTaskDoneMutex;
+    std::condition_variable mPrefetchDoneCv;
+    std::condition_variable mIndexerDoneCv;
     int mRank = -1;
     uint32_t mSpaTopkLen = 5120;
     std::vector<std::vector<float>> mAvgHitRate;
@@ -168,6 +176,13 @@ public:
     // Prefetch running status
     bool GetPrefetchStatus();
 
+    /* D1：任务完成事件等待——Python 侧替代 sleep(1ms) 轮询（平均唤醒延迟
+     * ~0.5ms → notify 后 µs 级）。带 timeout 上限，外层 Python 循环保留
+     * 作超时兜底重查。绑定侧必须 gil_scoped_release（阻塞期间释放 GIL，
+     * 对齐 time.sleep 语义），见 pybinds.cpp。 */
+    void WaitPrefetchIdle(uint64_t timeoutMs);
+    void WaitIndexerIdle(uint64_t timeoutMs);
+
     // indexer offload
     void SetIndexerMap(std::string reqID, std::vector<int>& blockTableList,
                        std::vector<std::vector<int>>& remainIdx,
@@ -204,7 +219,7 @@ public:
                          std::vector<std::vector<int>>& slabIdx, std::string reqID);
 
     void TokenIndexMapInter(std::vector<int>& oneTopkList, int bsIndex, int layerID, int topkLen,
-                            std::string reqID);
+                            const std::string& reqID);
 
     bool GetIndexerStatus();
 
@@ -469,17 +484,26 @@ public:
     int SyncPrefetchResultsFromRank0(const TaskInfo& taskInfo, const PrefetchShmLayout& layout,
                                      uint32_t* versionPtr);
 
+    /* oneTopkListScratch/useBlockTableScratch 由调用方（OMP 每 layerID 迭代）
+     * 提供并跨请求复用，免 per-(req,layer) 堆分配；本函数对二者只做
+     * assign/clear + 全量覆写，不跨调用持有内容。 */
     int ProcessPrefetchRequest(const TaskInfo& taskInfo, const PrefetchTopkView& topkView, size_t i,
-                               int layerID, const PrefetchShmLayout& layout);
+                               int layerID, const PrefetchShmLayout& layout,
+                               std::vector<int>& oneTopkListScratch,
+                               std::vector<int>& useBlockTableScratch);
 
     // ProcessPrefetchRequest 分解辅助
     HBMManager* FindReqLayerManager(const std::string& reqID, int layerID);
+    /* missGlobalIds/loadSlots 由调用方检索后传入（每 (req,layer) 一次 find），
+     * 本函数不再访问 mMissGlobalToken/mLoadSlot 两张 map。 */
     bool RunHbmTopkLookup(const std::string& oneReqID, std::vector<int>& oneTopkList, int layerID,
-                          int bsIndex, int oneTopkLen, std::vector<int>& useBlockTable);
+                          int bsIndex, int oneTopkLen, std::vector<int>& useBlockTable,
+                          std::vector<int>& missGlobalIds, std::vector<int>& loadSlots);
 
-    void WritePrefetchResult(const std::string& oneReqID, size_t i, int layerID,
-                             const std::vector<int>& useBlockTable,
-                             const PrefetchShmLayout& layout);
+    void WritePrefetchResult(size_t i, int layerID, const std::vector<int>& useBlockTable,
+                             const PrefetchShmLayout& layout,
+                             const std::vector<int>& missGlobalIds,
+                             const std::vector<int>& loadSlots);
 
     void ClearPrefetchResultSlot(size_t i, int layerID, const PrefetchShmLayout& layout);
 
