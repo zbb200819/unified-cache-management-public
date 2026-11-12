@@ -408,33 +408,14 @@ int GSAPrefetchEngineC::ProcessPrefetchRequest(const TaskInfo& taskInfo,
                                                std::vector<int>& useBlockTableScratch)
 {
     const std::string& oneReqID = taskInfo.reqIdList[i];
-    int oneTopkLen = taskInfo.topkLenList[i];
-    if (oneTopkLen <= 0) {
-        mLogger.log(LogLevel::ERROR,
-                    "Decode step: %u, |KVCache Prefetch| topk len is zero: "
-                    "%d for req_id: %s, rank: %d, taskID: %d, i: %zu\n",
-                    mDecodeStep, oneTopkLen, oneReqID.c_str(), mRank, taskInfo.taskID, i);
-        // 清零槽位避免消费侧读到上一 step 的陈旧结果（零 miss = 该请求本步无加载）。
-        ClearPrefetchResultSlot(i, layerID, layout);
-        return 0;
-    }
-    /* 平坦读边界：topkLen 以外的长度越界一律拒绝（防 OOB 读与脏数据扩散）。 */
-    const int64_t topkOffset = static_cast<int64_t>(layerID) * topkView.stride0 +
-                               static_cast<int64_t>(i) * topkView.stride1;
-    if (topkView.base == nullptr ||
-        topkOffset + static_cast<int64_t>(oneTopkLen) > topkView.numel) {
-        mLogger.log(LogLevel::ERROR,
-                    "Decode step: %u, |KVCache Prefetch| topk view out of range: "
-                    "req_id: %s, layerID: %d, i: %zu, offset: %lld, topkLen: %d, numel: %lld\n",
-                    mDecodeStep, oneReqID.c_str(), layerID, i, static_cast<long long>(topkOffset),
-                    oneTopkLen, static_cast<long long>(topkView.numel));
-        ClearPrefetchResultSlot(i, layerID, layout);
-        return -1;
-    }
-    /* 每 (req,layer) 一次 map 检索即取得 miss/loadSlot 引用，供
-     * RunHbmTopkLookup / WritePrefetchResult 直通复用（原先两函数合计约
-     * 10 次 std::map 树查找+串比较）。容器与 manager 在 ResetReqTokenState
-     * 同步扩容；find 判别替代 operator[]，杜绝未注册 key 的插空+越界 UB。 */
+    const int* topkPtr = nullptr;
+    int oneTopkLen = 0;
+    const int state = AcquirePrefetchRequestState(taskInfo, topkView, i, layerID, layout, topkPtr,
+                                                  oneTopkLen);
+    if (state == 0) { return 0; }
+    if (state < 0) { return -1; }
+    // miss/loadSlot 取 map 槽位引用（RunHbmTopkLookup 就地演化，供后续
+    // MergeAndCopyPrefetchLayer 消费）；find 判别杜绝插空+越界 UB。
     auto missIt = mMissGlobalToken.find(oneReqID);
     auto loadIt = mLoadSlot.find(oneReqID);
     if (missIt == mMissGlobalToken.end() || loadIt == mLoadSlot.end() ||
@@ -449,7 +430,6 @@ int GSAPrefetchEngineC::ProcessPrefetchRequest(const TaskInfo& taskInfo,
     }
     std::vector<int>& missGlobalIds = missIt->second[static_cast<size_t>(layerID)];
     std::vector<int>& loadSlots = loadIt->second[static_cast<size_t>(layerID)];
-    const int* topkPtr = topkView.base + topkOffset;
     oneTopkListScratch.assign(topkPtr, topkPtr + oneTopkLen);
     useBlockTableScratch.clear();
     if (!RunHbmTopkLookup(oneReqID, oneTopkListScratch, layerID, static_cast<int>(i), oneTopkLen,
@@ -457,34 +437,76 @@ int GSAPrefetchEngineC::ProcessPrefetchRequest(const TaskInfo& taskInfo,
         ClearPrefetchResultSlot(i, layerID, layout);
         return -1;
     }
-    /* 与 init 路径（ProcessTokensMapTopk 尾部同判）一致——useBlockTable 尺寸
-     * 与 mSpaTopkLen 不一致属可恢复场景（短/年轻请求 sparse 窗口不足、LRU 冷
-     * slot 补齐失败），清槽跳过、消费侧按零 miss 降级。调用方
-     * PublishPrefetchResultsRank0 按 failedCount 汇总记账、版本照常递增，
-     * rank 间等待协议完整。 */
-    if (static_cast<uint32_t>(useBlockTableScratch.size()) != mSpaTopkLen) {
+    return FinishPrefetchRequest(i, layerID, layout, oneReqID, useBlockTableScratch,
+                                 missGlobalIds, loadSlots);
+}
+
+// 尾段：尺寸校验 + mAllTopkIndicesTensor 拷贝（最小锁临界区）+ shm 写结果。
+// 返回 0=成功，-1=失败（尺寸不匹配/拷贝失败均已清槽）。
+int GSAPrefetchEngineC::FinishPrefetchRequest(size_t i, int layerID, const PrefetchShmLayout& layout,
+                                               const std::string& oneReqID,
+                                               std::vector<int>& useBlockTable,
+                                               std::vector<int>& missGlobalIds,
+                                               std::vector<int>& loadSlots)
+{
+    // useBlockTable 尺寸与 mSpaTopkLen 不一致属可恢复场景（短/年轻请求 sparse
+    // 窗口不足），清槽跳过、消费侧按零 miss 降级。
+    if (static_cast<uint32_t>(useBlockTable.size()) != mSpaTopkLen) {
         mLogger.log(LogLevel::ERROR,
                     "Decode step: %u, |KVCache Prefetch| useBlockTable size mismatch, skip: "
                     "req_id: %s, layerID: %d, mSpaTopkLen: %d, useBlockTableSize: %zu\n",
-                    mDecodeStep, oneReqID.c_str(), layerID, mSpaTopkLen,
-                    useBlockTableScratch.size());
+                    mDecodeStep, oneReqID.c_str(), layerID, mSpaTopkLen, useBlockTable.size());
         ClearPrefetchResultSlot(i, layerID, layout);
         return -1;
     }
-    /* mAllTopkIndicesTensor 读侧与写侧（SetTopkIndices，Python 线程）统一
-     * mUpdateReqMutex 协议；本调用点位于 OMP 并行域，锁缩到仅包住 find+memcpy
-     * 的最小临界区。 */
+    // mAllTopkIndicesTensor 读侧与写侧统一 mUpdateReqMutex 协议，锁缩到
+    // find+memcpy 最小临界区（本调用点位于 OMP 并行域）。
     int copyRet = 0;
     {
         UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::ProcessPrefetchRequest));
-        copyRet = CopyUseBlockTableToIndicesTensor(oneReqID, layerID, useBlockTableScratch);
+        copyRet = CopyUseBlockTableToIndicesTensor(oneReqID, layerID, useBlockTable);
     }
     if (copyRet != 0) {
         ClearPrefetchResultSlot(i, layerID, layout);
         return -1;
     }
-    WritePrefetchResult(i, layerID, useBlockTableScratch, layout, missGlobalIds, loadSlots);
+    WritePrefetchResult(i, layerID, useBlockTable, layout, missGlobalIds, loadSlots);
     return 0;
+}
+
+/* 校验单请求查找输入：topkLen / 平坦读边界。返回 1=就绪（topkPtr/oneTopkLen
+ * 填充），0=topkLen 空（软跳过，已清槽），-1=非法（已日志+清槽）。 */
+int GSAPrefetchEngineC::AcquirePrefetchRequestState(const TaskInfo& taskInfo,
+                                                    const PrefetchTopkView& topkView, size_t i,
+                                                    int layerID, const PrefetchShmLayout& layout,
+                                                    const int*& topkPtr, int& oneTopkLen)
+{
+    const std::string& oneReqID = taskInfo.reqIdList[i];
+    oneTopkLen = taskInfo.topkLenList[i];
+    if (oneTopkLen <= 0) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| topk len is zero: "
+                    "%d for req_id: %s, rank: %d, taskID: %d, i: %zu\n",
+                    mDecodeStep, oneTopkLen, oneReqID.c_str(), mRank, taskInfo.taskID, i);
+        // 清零槽位避免消费侧读到上一 step 的陈旧结果（零 miss = 本步无加载）。
+        ClearPrefetchResultSlot(i, layerID, layout);
+        return 0;
+    }
+    // 平坦读边界：topkLen 以外的长度越界一律拒绝（防 OOB 读与脏数据扩散）。
+    const int64_t topkOffset = static_cast<int64_t>(layerID) * topkView.stride0 +
+                               static_cast<int64_t>(i) * topkView.stride1;
+    if (topkView.base == nullptr ||
+        topkOffset + static_cast<int64_t>(oneTopkLen) > topkView.numel) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| topk view out of range: "
+                    "req_id: %s, layerID: %d, i: %zu, offset: %lld, topkLen: %d, numel: %lld\n",
+                    mDecodeStep, oneReqID.c_str(), layerID, i, static_cast<long long>(topkOffset),
+                    oneTopkLen, static_cast<long long>(topkView.numel));
+        ClearPrefetchResultSlot(i, layerID, layout);
+        return -1;
+    }
+    topkPtr = topkView.base + topkOffset;
+    return 1;
 }
 
 HBMManager* GSAPrefetchEngineC::FindReqLayerManager(const std::string& reqID, int layerID)
@@ -581,71 +603,71 @@ void GSAPrefetchEngineC::ClearPrefetchResultSlot(size_t i, int layerID,
     std::memset(static_cast<uint8_t*>(mPrefetchResultShm) + slotOffset, 0, layout.totalSize);
 }
 
+// shm 槽内单段"定长计数 + 变长数据"读回（count 为 0 时仅清空）。
+void ReadShmCountedSlot(const uint8_t* base, size_t countOffset, size_t dataOffset,
+                        uint32_t countSize, std::vector<int>& out)
+{
+    uint32_t count = 0;
+    memcpy(&count, base + countOffset, countSize);
+    out.clear();
+    if (count > 0) {
+        out.resize(count);
+        memcpy(out.data(), base + dataOffset, count * sizeof(int));
+    }
+}
+
 void GSAPrefetchEngineC::ReadPrefetchResults(const TaskInfo& taskInfo,
                                              const PrefetchShmLayout& layout)
 {
     uint32_t oneRunBsLen = taskInfo.reqIdList.size();
-    /* 循环外一次性 scratch：resize 后逐槽 memcpy 全量覆写，免除
-     * per-(req,layer) 的 ~mSpaTopkLen×4B 堆分配。 */
+    // 循环外一次性 scratch：resize 后逐槽 memcpy 全量覆写，免逐 (req,layer) 分配。
     std::vector<int> useBlockTable(static_cast<size_t>(mSpaTopkLen));
     for (int layerID = 0; layerID < mTopkIndexerNum; layerID++) {
         for (size_t i = 0; i < oneRunBsLen; i++) {
             if (taskInfo.topkLenList[i] <= 0) { continue; }
-            const std::string& oneReqID = taskInfo.reqIdList[i];
-            /* 每 (req,layer) 两次 find 取槽位引用，替代原先 miss/slot 各 3 次
-             * （清空/扩容/取数据指针）+ 失败路径 2 次的 operator[] 树查找；
-             * 判别失败（注册不变式破坏）打日志跳过，消费侧按零加载降级，
-             * 杜绝 operator[] 的插空 + 越界 UB。 */
-            auto missIt = mMissGlobalToken.find(oneReqID);
-            auto loadIt = mLoadSlot.find(oneReqID);
-            if (missIt == mMissGlobalToken.end() || loadIt == mLoadSlot.end() ||
-                static_cast<size_t>(layerID) >= missIt->second.size() ||
-                static_cast<size_t>(layerID) >= loadIt->second.size()) {
-                mLogger.log(LogLevel::ERROR,
-                            "Decode step: %u, |KVCache Prefetch| read: miss/loadSlot state "
-                            "missing: req_id: %s, layerID: %d, rank: %d, i: %zu\n",
-                            mDecodeStep, oneReqID.c_str(), layerID, mRank, i);
-                continue;
-            }
-            std::vector<int>& missGlobalIds = missIt->second[static_cast<size_t>(layerID)];
-            std::vector<int>& loadSlots = loadIt->second[static_cast<size_t>(layerID)];
-            size_t reqLayerOffset = (i * mTopkIndexerNum + layerID) * layout.totalSize;
-            uint8_t* shmBase =
-                static_cast<uint8_t*>(mPrefetchResultShm) + layout.versionSize + reqLayerOffset;
-            uint32_t missTokenCount = 0;
-            memcpy(&missTokenCount, shmBase, layout.countSize);
-            missGlobalIds.clear();
-            if (missTokenCount > 0) {
-                missGlobalIds.resize(missTokenCount);
-                memcpy(missGlobalIds.data(), shmBase + layout.countSize,
-                       missTokenCount * sizeof(int));
-            }
-            uint32_t loadSlotCount = 0;
-            memcpy(&loadSlotCount, shmBase + layout.missTokenSize, layout.countSize);
-            loadSlots.clear();
-            if (loadSlotCount > 0) {
-                loadSlots.resize(loadSlotCount);
-                memcpy(loadSlots.data(), shmBase + layout.missTokenSize + layout.countSize,
-                       loadSlotCount * sizeof(int));
-            }
-            memcpy(useBlockTable.data(), shmBase + layout.missTokenSize + layout.loadSlotSize,
-                   mSpaTopkLen * sizeof(int));
-            /* 读侧统一 mUpdateReqMutex 协议（写侧 SetTopkIndices、erase 侧
-             * DelReqIDRun 均持该锁），并复用 CopyUseBlockTableToIndicesTensor
-             * 的 find+四重判别替代 operator[]——未注册 key 的默认插入既是并发
-             * 写的结构级 UB，也是注册不变式被破坏时 torch select 抛
-             * c10::Error 的确定抛点。判别失败清空本 (req,layer) 的 miss/slot，
-             * 消费侧按零加载降级。 */
-            int copyRet = 0;
-            {
-                UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::ReadPrefetchResults));
-                copyRet = CopyUseBlockTableToIndicesTensor(oneReqID, layerID, useBlockTable);
-            }
-            if (copyRet != 0) {
-                missGlobalIds.clear();
-                loadSlots.clear();
-            }
+            ReadOneReqLayerResults(taskInfo, layout, i, layerID, useBlockTable);
         }
+    }
+}
+
+// 单 (req,layer) 的 shm 槽位读回 + 拷贝到 mAllTopkIndicesTensor。
+void GSAPrefetchEngineC::ReadOneReqLayerResults(const TaskInfo& taskInfo,
+                                                 const PrefetchShmLayout& layout, size_t i,
+                                                 int layerID, std::vector<int>& useBlockTable)
+{
+    const std::string& oneReqID = taskInfo.reqIdList[i];
+    // find 判别取槽位引用（判别失败打日志跳过，消费侧按零加载降级）。
+    auto missIt = mMissGlobalToken.find(oneReqID);
+    auto loadIt = mLoadSlot.find(oneReqID);
+    if (missIt == mMissGlobalToken.end() || loadIt == mLoadSlot.end() ||
+        static_cast<size_t>(layerID) >= missIt->second.size() ||
+        static_cast<size_t>(layerID) >= loadIt->second.size()) {
+        mLogger.log(LogLevel::ERROR,
+                    "Decode step: %u, |KVCache Prefetch| read: miss/loadSlot state "
+                    "missing: req_id: %s, layerID: %d, rank: %d, i: %zu\n",
+                    mDecodeStep, oneReqID.c_str(), layerID, mRank, i);
+        return;
+    }
+    std::vector<int>& missGlobalIds = missIt->second[static_cast<size_t>(layerID)];
+    std::vector<int>& loadSlots = loadIt->second[static_cast<size_t>(layerID)];
+    size_t reqLayerOffset = (i * mTopkIndexerNum + layerID) * layout.totalSize;
+    uint8_t* shmBase =
+        static_cast<uint8_t*>(mPrefetchResultShm) + layout.versionSize + reqLayerOffset;
+    ReadShmCountedSlot(shmBase, 0, layout.countSize, layout.countSize, missGlobalIds);
+    ReadShmCountedSlot(shmBase, layout.missTokenSize, layout.missTokenSize + layout.countSize,
+                       layout.countSize, loadSlots);
+    memcpy(useBlockTable.data(), shmBase + layout.missTokenSize + layout.loadSlotSize,
+           mSpaTopkLen * sizeof(int));
+    // 读侧统一 mUpdateReqMutex 协议（写侧 SetTopkIndices、erase 侧 DelReqIDRun
+    // 均持该锁）；判别失败清空本 (req,layer) 的 miss/slot，按零加载降级。
+    int copyRet = 0;
+    {
+        UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::ReadPrefetchResults));
+        copyRet = CopyUseBlockTableToIndicesTensor(oneReqID, layerID, useBlockTable);
+    }
+    if (copyRet != 0) {
+        missGlobalIds.clear();
+        loadSlots.clear();
     }
 }
 
@@ -659,11 +681,8 @@ void GSAPrefetchEngineC::MergeAndCopyPrefetchLayer(const TaskInfo& taskInfo, Thr
     if (BeginKVPackSlot(streamIdx, epoch) != 0) { KVPackAbort(mKVPackControl); }
     std::vector<uint64_t> hbmSlotIndex;
     auto cpuStart = std::chrono::high_resolution_clock::now();
-    /* Whole-batch merge: one LoadOnToken task per leg for all valid requests
-     * of this layer (backend IO of all requests overlaps; the load runs on a
-     * worker thread in parallel with the engine-side non-UCM token copies).
-     * Shared staging capacity is still guarded per request (cumulative
-     * mLoadNum vs mKVBufferLen / mLoadIndexBufferLen in ValidateUCMMergeRequest). */
+    /* Whole-batch merge：本层全部有效请求合成一个 LoadOnToken 任务（后端 IO
+     * 重叠）；staging 容量按请求累计校验（ValidateUCMMergeRequest）。 */
     std::vector<uint32_t> requestIndices;
     requestIndices.reserve(oneRunBsLen);
     for (size_t i = 0; i < oneRunBsLen; i++) {
@@ -788,18 +807,10 @@ int GSAPrefetchEngineC::IndexerLoadProcess(const TaskInfo& taskInfo, ThreadInfo&
     auto start = std::chrono::high_resolution_clock::now();
     uint32_t runBsLen = taskInfo.reqIdList.size();
     int ret = 0;
-    /* A3 锁收窄段1（表事务）：hit/miss 判定、空闲块分配与六张 indexer 表
-     * 演化，全部为纯 CPU 表操作（µs~百 µs 级）。段2 的 DDR IO
-     * （UCMIndexerLoadAsync：store Load/Wait + 非 UCM memcpy，ms 级）不再
-     * 持有 mUpdateReqMutex——decode 热路径的 Python 同步调用（SubmitTask /
-     * SetTopkIndices / UpdateIndexerMap / DelBlocksMap）与段2 的共享数据面
-     * 仅剩 mAllBlocksHash / mLastKVBlockAddress，由 LoadIndexerRequest 内的
-     * IndexerLoadResolve mini 段保护；allNeedLoadBlock / allMissIdxs 为本
-     * worker 私有中间态（写者仅本函数，erase 者 DelReqIDRun 已被
-     * mIsIndexerLoadRunning 状态门控延迟，见 MultiBSThreadFun 尾部）。
-     * 该状态位在含段2 的全函数期间保持 true（清零点在
-     * MultiBSThreadFunIndexer 尾部、本函数返回之后），Python
-     * is_indexer_load 门控与 DelBlocksMap 延迟删除语义不变。 */
+    /* 段1（表事务，持锁）：hit/miss 判定与六张 indexer 表演化；段2 的 ms 级 DDR IO
+     * 出锁，共享面仅剩 mAllBlocksHash/mLastKVBlockAddress（mini 段保护）。
+     * allNeedLoadBlock/allMissIdxs 为 worker 私有（erase 被 mIsIndexerLoadRunning
+     * 门控，该位在本函数返回后才清零）。 */
     {
         UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::IndexerLoadProcess));
         allNeedLoadBlock.clear();
@@ -853,9 +864,7 @@ int GSAPrefetchEngineC::RunOneBsPrefetch(std::string reqID, int topkLen, int top
                                          const torch::Tensor& topkList)
 {
     if (!mOpenIndexerOffload) { return 0; }
-    /* 提前识别：进入并行域前完成张量判别并一次性提取只读视图（含读取
-     * 范围校验），OMP 域内不再触碰任何 torch API（消除 data_ptr dtype
-     * 抛异常、下标越界抛 IndexError 与张量切片堆分配三类异常/终止源）。 */
+    // 进入并行域前完成张量判别并提取只读视图，OMP 域内不触碰 torch API。
     PrefetchTopkView topkView;
     if (AcquireIndexerTopkBase(topkList, reqID, topkLen, topkView) != 0) {
         return -1;
@@ -1039,12 +1048,8 @@ void GSAPrefetchEngineC::IndexerInitLoad(std::vector<std::vector<int>>& blockTab
                                          std::vector<std::vector<int>>& slabIdx, std::string reqID)
 {
     if (!mOpenIndexerOffload) { return; }
-    /* A1 锁收窄：mUpdateReqMutex 从整程（含每层 store Load/Wait 的 ms 级
-     * DDR IO）收窄为 mini 段——本函数的存在性校验与
-     * ProcessIndexerInitLoadLayer 内的表读取+任务组装（见其头注释）。
-     * IO 出锁后，锁外并发的 SetBlocksMap 插入（其它 req 的 admission，可
-     * 触发 unordered_map rehash）与 WorkerCleanup 的 DelReqIDRun erase 不再
-     * 与本子树持有的 map 引用交叠。一次性 init 路径，非解码热路径。 */
+    /* 整程锁收窄为存在性校验 mini 段（含子层任务组装 mini 段，
+     * SubmitIndexerInitLoadTask 的 store Load/Wait 锁外）。 */
     mLogger.log(LogLevel::INFO, "Decode step: %u, |KVCache Prefetch| Start IndexerInitLoad\n",
                 mDecodeStep);
     auto start = std::chrono::high_resolution_clock::now();
@@ -1106,11 +1111,8 @@ bool GSAPrefetchEngineC::ProcessIndexerInitLoadLayer(std::vector<std::vector<int
     UC::Detail::TaskDesc task;
     task.reserve(number);
     task.brief = "UCMIndexerInitLoad";
-    /* A1 mini 段：mAllBlocksHash 查找 + BuildIndexerInitLoadShards 的
-     * hashVec 读取与 LoadNonUcmIndexerBlock 的 mLastKVBlockAddress 查找
-     * （引用不跨出本段）全部约束在锁内——纯 CPU 任务组装 + 少量非 UCM
-     * 块的 aclrtMemcpy（µs~十 µs 级）；ms 级的 store Load/Wait
-     * （SubmitIndexerInitLoadTask）留在锁外。 */
+    /* mini 段：mAllBlocksHash 查找 + shard 组装（hashVec 引用与
+     * mLastKVBlockAddress 查找不跨段）锁内；store Load/Wait 锁外。 */
     {
         UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::IndexerInitLoad));
         auto hashIt = mAllBlocksHash.find(reqID);
@@ -1136,48 +1138,58 @@ bool GSAPrefetchEngineC::BuildIndexerInitLoadShards(std::vector<std::vector<int>
                                                     const std::vector<BlockId>& hashVec,
                                                     UC::Detail::TaskDesc& task)
 {
-    size_t shardIndex = static_cast<size_t>(layerID);
+    const size_t shardIndex = static_cast<size_t>(layerID);
     for (int i = 0; i < number; i++) {
-        if (static_cast<size_t>(i) >= blockTable[layerID].size() ||
-            static_cast<size_t>(i) >= slabIdx[layerID].size()) {
-            mLogger.log(LogLevel::ERROR,
-                        "[ERROR] IndexerInitLoad row too short: reqID=%s layerID=%d i=%d "
-                        "blockRow=%zu slabRow=%zu\n",
-                        reqID.c_str(), layerID, i, blockTable[layerID].size(), slabIdx[layerID].size());
-            continue;
+        if (!TryAppendInitShard(i, blockTable, slabIdx, reqID, layerID, number, indexerBaseAddr,
+                                hashVec, shardIndex, task)) {
+            return false;
         }
-        int deviceBlockId = blockTable[layerID][i];
-        int blockIdx = slabIdx[layerID][i];
-        if (deviceBlockId < 0 || deviceBlockId >= mDeviceIndexerLen) {
-            mLogger.log(LogLevel::ERROR,
-                        "[ERROR] IndexerInitLoad deviceBlockId out of range, "
-                        "reqID=%s layerID=%d deviceBlockId=%d mDeviceIndexerLen=%d\n",
-                        reqID.c_str(), layerID, deviceBlockId, mDeviceIndexerLen);
-            continue;
-        }
-        auto* indexerAddr =
-            indexerBaseAddr + static_cast<size_t>(deviceBlockId) * mIndexerSizeBytesBlock;
-        if (blockIdx >= static_cast<int>(hashVec.size())) {
-            if (!LoadNonUcmIndexerBlock(reqID, layerID, blockIdx, deviceBlockId, indexerAddr)) {
-                return false;
-            }
-            continue;
-        }
-        if (blockIdx < 0) {
-            mLogger.log(LogLevel::ERROR,
-                        "[ERROR] IndexerInitLoad blockIdx out of range, "
-                        "reqID=%s layerID=%d blockIdx=%d hashNum=%zu\n",
-                        reqID.c_str(), layerID, blockIdx, hashVec.size());
-            continue;
-        }
-        /* One address per store tensor slot: the store's H2D path reads addrs[i]
-         * for every slot, so pad to the full count with the indexer address at
-         * kIndexerTensorIndex (ghost slots stay nullptr). */
-        std::vector<void*> tensorAddrs(kStoreTensorCount, nullptr);
-        tensorAddrs[kIndexerTensorIndex] = indexerAddr;
-        task.emplace_back(UC::Detail::Shard{hashVec[static_cast<size_t>(blockIdx)], shardIndex,
-                                            std::move(tensorAddrs)});
     }
+    return true;
+}
+
+// 单块分类：UCM 块追加 shard（地址按 store 张量槽位数 padding，ghost 槽留
+// nullptr）；非 UCM 块走 LoadNonUcmIndexerBlock；非法输入日志跳过。
+bool GSAPrefetchEngineC::TryAppendInitShard(int i, std::vector<std::vector<int>>& blockTable,
+                                            std::vector<std::vector<int>>& slabIdx,
+                                            const std::string& reqID, int layerID, int number,
+                                            std::uint8_t* indexerBaseAddr,
+                                            const std::vector<BlockId>& hashVec, size_t shardIndex,
+                                            UC::Detail::TaskDesc& task)
+{
+    if (static_cast<size_t>(i) >= blockTable[layerID].size() ||
+        static_cast<size_t>(i) >= slabIdx[layerID].size()) {
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] IndexerInitLoad row too short: reqID=%s layerID=%d i=%d "
+                    "blockRow=%zu slabRow=%zu\n",
+                    reqID.c_str(), layerID, i, blockTable[layerID].size(), slabIdx[layerID].size());
+        return true;
+    }
+    int deviceBlockId = blockTable[layerID][i];
+    int blockIdx = slabIdx[layerID][i];
+    if (deviceBlockId < 0 || deviceBlockId >= mDeviceIndexerLen) {
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] IndexerInitLoad deviceBlockId out of range, "
+                    "reqID=%s layerID=%d deviceBlockId=%d mDeviceIndexerLen=%d\n",
+                    reqID.c_str(), layerID, deviceBlockId, mDeviceIndexerLen);
+        return true;
+    }
+    auto* indexerAddr =
+        indexerBaseAddr + static_cast<size_t>(deviceBlockId) * mIndexerSizeBytesBlock;
+    if (blockIdx >= static_cast<int>(hashVec.size())) {
+        return LoadNonUcmIndexerBlock(reqID, layerID, blockIdx, deviceBlockId, indexerAddr);
+    }
+    if (blockIdx < 0) {
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] IndexerInitLoad blockIdx out of range, "
+                    "reqID=%s layerID=%d blockIdx=%d hashNum=%zu\n",
+                    reqID.c_str(), layerID, blockIdx, hashVec.size());
+        return true;
+    }
+    std::vector<void*> tensorAddrs(kStoreTensorCount, nullptr);
+    tensorAddrs[kIndexerTensorIndex] = indexerAddr;
+    task.emplace_back(UC::Detail::Shard{hashVec[static_cast<size_t>(blockIdx)], shardIndex,
+                                        std::move(tensorAddrs)});
     return true;
 }
 
@@ -1313,48 +1325,48 @@ bool GSAPrefetchEngineC::LoadIndexerRequest(const std::string& reqID,
     UC::Detail::TaskDesc task;
     task.reserve(number);
     task.brief = "UCMIndexerLoad";
-    /* A3 段2 前置 mini 段：mAllBlocksHash / mLastKVBlockAddress 的查找与
-     * 引用（BuildIndexerLoadTask 经 hashVec 参数读、CopyNonUCMIndexerBlock
-     * 内部 find）全部约束在本锁内——锁外并发 SetBlocksMap（其它 req 的
-     * admission 插入）可触发 unordered_map rehash 使引用失效。本段为纯
-     * CPU 任务组装 + 少量非 UCM 块的 aclrtMemcpy（µs~十 µs 级）；ms 级的
-     * store Load/Wait（LoadIndexerTask）留在锁外。allMissIdxs 为 indexer
-     * worker 私有（erase 者 DelReqIDRun 被 mIsIndexerLoadRunning 门控），
-     * 其引用跨出本段安全。 */
-    {
-        UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::IndexerLoadResolve));
-        auto hashIt = mAllBlocksHash.find(reqID);
-        if (hashIt == mAllBlocksHash.end()) {
-            mLogger.log(LogLevel::ERROR,
-                        "[ERROR] UCMIndexerLoadAsync no hash, "
-                        "reqID=%s layerID=%d\n",
-                        reqID.c_str(), layerID);
-            return false;
-        }
-        auto missIt = allMissIdxs.find(reqID);
-        if (missIt == allMissIdxs.end()) {
-            mLogger.log(LogLevel::ERROR,
-                        "[ERROR] UCMIndexerLoadAsync no miss indexes, "
-                        "reqID=%s layerID=%d\n",
-                        reqID.c_str(), layerID);
-            return false;
-        }
-        const auto& hashVec = hashIt->second;
-        const auto& missBlockIdxs = missIt->second[layerID];
-        if (hbmBlockIDs.size() != missBlockIdxs.size()) {
-            mLogger.log(LogLevel::ERROR,
-                        "[ERROR] UCMIndexerLoadAsync size mismatch, "
-                        "reqID=%s layerID=%d hbmNum=%zu missNum=%zu\n",
-                        reqID.c_str(), layerID, hbmBlockIDs.size(), missBlockIdxs.size());
-            return false;
-        }
-        if (!BuildIndexerLoadTask(reqID, layerID, indexerBaseAddr, hbmBlockIDs, missBlockIdxs,
-                                  hashVec, task, totalNumber)) {
-            return false;
-        }
+    if (!ResolveIndexerLoadTask(reqID, hbmBlockIDs, layerID, indexerBaseAddr, task, totalNumber)) {
+        return false;
     }
     if (task.empty()) { return true; }
     return LoadIndexerTask(reqID, layerID, task, totalNumber);
+}
+
+// mini 段：mAllBlocksHash/mLastKVBlockAddress/allMissIdxs 查找与任务组装锁内
+//（防 rehash 引用失效）；ms 级 store Load/Wait 留给调用方锁外执行。
+bool GSAPrefetchEngineC::ResolveIndexerLoadTask(const std::string& reqID,
+                                                const std::vector<int>& hbmBlockIDs, int layerID,
+                                                std::uint8_t* indexerBaseAddr,
+                                                UC::Detail::TaskDesc& task, size_t& totalNumber)
+{
+    UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::IndexerLoadResolve));
+    auto hashIt = mAllBlocksHash.find(reqID);
+    if (hashIt == mAllBlocksHash.end()) {
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] UCMIndexerLoadAsync no hash, "
+                    "reqID=%s layerID=%d\n",
+                    reqID.c_str(), layerID);
+        return false;
+    }
+    auto missIt = allMissIdxs.find(reqID);
+    if (missIt == allMissIdxs.end()) {
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] UCMIndexerLoadAsync no miss indexes, "
+                    "reqID=%s layerID=%d\n",
+                    reqID.c_str(), layerID);
+        return false;
+    }
+    const auto& hashVec = hashIt->second;
+    const auto& missBlockIdxs = missIt->second[layerID];
+    if (hbmBlockIDs.size() != missBlockIdxs.size()) {
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] UCMIndexerLoadAsync size mismatch, "
+                    "reqID=%s layerID=%d hbmNum=%zu missNum=%zu\n",
+                    reqID.c_str(), layerID, hbmBlockIDs.size(), missBlockIdxs.size());
+        return false;
+    }
+    return BuildIndexerLoadTask(reqID, layerID, indexerBaseAddr, hbmBlockIDs, missBlockIdxs,
+                                hashVec, task, totalNumber);
 }
 
 bool GSAPrefetchEngineC::BuildIndexerLoadTask(const std::string& reqID, int layerID,
@@ -1578,15 +1590,13 @@ void GSAPrefetchEngineC::SubmitTask(std::vector<int>& topkLensInput, std::vector
                 mDecodeStep, reqIDList.size());
     auto start = std::chrono::high_resolution_clock::now();
     mDecodeStep = stepTime;
-    /* UReqLock 埋点 dump 触发点（提交路径每步必经）：UCM_PREFETCH_LOCK_PROFILE
-     * 开启时按 mUReqLockDumpIntervalSteps 周期输出争用画像（exchange 清零，
-     * 输出为距上次 dump 的区间值）。 */
+    // 埋点 dump 触发点：PROFILE 开启时按间隔周期输出争用画像。
     if (mUReqLockProfileEnabled && static_cast<uint64_t>(mDecodeStep) >= mUReqLockNextDumpStep) {
         DumpUReqLockStats();
         mUReqLockNextDumpStep = static_cast<uint64_t>(mDecodeStep) + mUReqLockDumpIntervalSteps;
     }
-    // 提前识别：set_kv_buffer 未完成（KVPack 控制块为空）时提交任务会在 worker 路径
-    // 空指针崩溃，这里直接打错误日志并跳过本步提交（running 标志保持未置位）。
+    // set_kv_buffer 未完成（KVPack 控制块为空）时提交会在 worker 路径空指针
+    // 崩溃，直接日志+跳过本步提交。
     if (mKVPackControl == nullptr) {
         mLogger.log(LogLevel::ERROR,
                     "Decode step: %u, |KVCache Prefetch| set_kv_buffer not done yet, "
@@ -1598,12 +1608,23 @@ void GSAPrefetchEngineC::SubmitTask(std::vector<int>& topkLensInput, std::vector
     TaskInfo inputInfo(totalTaskNum, -1, topkLists, topkLensInput, bsIndexInput, reqIDList);
     mIsPrefetchRunning.store(true, std::memory_order_release);
     mIsIndexerOffload = isIndexerOffload;
-    /* 提交期对 mRealTimeIdx/mUseBlockTableIdx/mSeqLen 的读写与 prefetch
-     * worker 清理段 erase（DelReqIDRun，持 mUpdateReqMutex）及 SubmitTaskIndexer
-     * 的 mUseBlockTableIdx 拷贝并发（gsa_index 路径 Python 采样状态后不等待 worker
-     * 空闲即提交），对称加锁；锁内仅容器操作，无设备调用。
-     * DEBUG 日志移出临界区（Logger 命中级别时含落盘 µs 级开销），
-     * 尺寸锁内取样、锁外打印。 */
+    SyncIndexerSubmitState(reqIDList, seqLens);
+    mTaskManger->SubmitTask(inputInfo, MultiBSThreadFun);
+    totalTaskNum += 1;
+    auto endLoadPre = std::chrono::high_resolution_clock::now();
+    auto durationLoadPre =
+        std::chrono::duration_cast<std::chrono::microseconds>(endLoadPre - start);
+    mLogger.log(
+        LogLevel::INFO,
+        "Decode step: %u, |KVCache Prefetch| finish SubmitTask batch size: %lu, cost: %lu\n",
+        mDecodeStep, reqIDList.size(), durationLoadPre.count());
+}
+
+// 提交期同步 indexer 状态（mRealTimeIdx/mSeqLen）到 prefetch worker 可见面。
+// 与 worker 清理段 erase 并发，对称加锁；DEBUG 日志移出临界区。
+void GSAPrefetchEngineC::SyncIndexerSubmitState(std::vector<std::string>& reqIDList,
+                                                std::vector<int>& seqLens)
+{
     struct SubmitTaskDebugSize {
         std::string reqId;
         uint32_t realTimeIdxSize;
@@ -1632,15 +1653,6 @@ void GSAPrefetchEngineC::SubmitTask(std::vector<int>& topkLensInput, std::vector
                     mDecodeStep, debugSizes[k].realTimeIdxSize,
                     debugSizes[k].useBlockTableIdxSize, debugSizes[k].reqId.c_str());
     }
-    mTaskManger->SubmitTask(inputInfo, MultiBSThreadFun);
-    totalTaskNum += 1;
-    auto endLoadPre = std::chrono::high_resolution_clock::now();
-    auto durationLoadPre =
-        std::chrono::duration_cast<std::chrono::microseconds>(endLoadPre - start);
-    mLogger.log(
-        LogLevel::INFO,
-        "Decode step: %u, |KVCache Prefetch| finish SubmitTask batch size: %lu, cost: %lu\n",
-        mDecodeStep, reqIDList.size(), durationLoadPre.count());
 }
 
 void GSAPrefetchEngineC::SubmitTaskIndexer(std::vector<int>& topkLensInput,
@@ -1653,8 +1665,8 @@ void GSAPrefetchEngineC::SubmitTaskIndexer(std::vector<int>& topkLensInput,
                 mDecodeStep, reqIDList.size());
     auto start = std::chrono::high_resolution_clock::now();
     /* mPrefetchBlockTableIdx 唯一写者为 indexer worker 的
-     * FinishOneLayerPrefetch（A3 后仍运行于 IndexerLoadProcess 段1 表事务锁内），
-     * 读侧对称加锁；is_indexer_load 门控保证提交时 indexer worker 空闲，锁无竞争。 */
+     * FinishOneLayerPrefetch（表事务锁内），读侧对称加锁；is_indexer_load
+     * 门控保证提交时 indexer worker 空闲，锁无竞争。 */
     UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::SubmitTaskIndexer));
     for (uint32_t i = 0; i < reqIDList.size(); i++) {
         for (int layerID = 0; layerID < mLayerNum; layerID++) {
@@ -1685,13 +1697,9 @@ void GSAPrefetchEngineC::SetTopkIndices(std::string reqID, torch::Tensor& topInd
     mLogger.log(LogLevel::DEBUG,
                 "Decode step: %u, |KVCache Prefetch| Start SetTopkIndices reqID: %s\n", mDecodeStep,
                 reqID.c_str());
-    /* mAllTopkIndicesTensor 全部读写统一 mUpdateReqMutex 协议（读者：worker 树
-     * ReadPrefetchResults / CopyUseBlockTableToIndicesTensor；erase 侧：DelReqIDRun）。
-     * Python 侧在等待 worker 空闲之前调用本接口（execute_begin 前置段
-     * _process_scheduled_req），新 req 首个 decode step 的 map 插入/重平衡必然与
-     * worker 并发遍历交叠，不能靠 Python 序列化避免，锁不可省。锁收窄到仅包
-     * map 赋值（百 ns 级），End 日志移出临界区——Logger 命中级别时含自身互斥
-     * 与 localtime/strftime/vsnprintf/落盘（µs 级），不应计入持锁时长。 */
+    /* mAllTopkIndicesTensor 读写统一 mUpdateReqMutex 协议（读者：worker 树；
+     * erase 侧：DelReqIDRun）。新 req 首个 decode step 的 map 插入必然与
+     * worker 并发交叠，锁不可省；收窄到仅包 map 赋值，End 日志移出临界区。 */
     {
         UReqLockGuard lock(mUpdateReqMutex, UReqLockStatsAt(UReqLockSite::SetTopkIndices));
         mAllTopkIndicesTensor[reqID] = topIndices;
@@ -1744,33 +1752,8 @@ void GSAPrefetchEngineC::PreSwapTokens(std::vector<uintptr_t>& useTokenPtrs,
     uint64_t max_tokens_time = 0;
     uint64_t cpu_copy_time = 0;
     for (size_t bs = 0; bs < useTokenPtrs.size(); bs++) {
-        auto start_max = std::chrono::high_resolution_clock::now();
-        const int32_t* data = reinterpret_cast<const int32_t*>(useTokenPtrs[bs]);
-        int maxID = *std::max_element(data, data + sparseLen * mTopkIndexerNum);
-        int start = maxID + 1;
-        int end = seqLens[bs] + mtpToken - 1;
-        int change_len = end - start;
-        std::vector<int> needAppend;
-        if (change_len <= mtpToken - 1) {
-            mLogger.log(LogLevel::ERROR,
-                        "[ERROR] PreSwapTokens change len < 0 !!!!!! start %d, end %d\n", start,
-                        end);
-            change_len = mtpToken;
-        }
-        mLogger.log(
-            LogLevel::DEBUG,
-            "Decode step: %u, |KVCache Prefetch| Start PreSwapTokens, change_len: %d, maxID: %d\n",
-            mDecodeStep, change_len, maxID);
-        needAppend.resize(change_len);
-        std::iota(needAppend.begin(), needAppend.end(), start);
-        auto max_end = std::chrono::high_resolution_clock::now();
-        max_tokens_time +=
-            std::chrono::duration_cast<std::chrono::microseconds>(max_end - start_max).count();
-        CopyPreSwapTokens(useTokenPtrs[bs], spaTokensPtr[0], swapIndex[bs], needAppend, sparseLen,
-                          spaMaxBs, mtpToken, change_len);
-        auto cpu_end = std::chrono::high_resolution_clock::now();
-        cpu_copy_time +=
-            std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - max_end).count();
+        SwapOneBsTokens(bs, useTokenPtrs, seqLens, swapIndex, spaTokensPtr, sparseLen, spaMaxBs,
+                        mtpToken, max_tokens_time, cpu_copy_time);
     }
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -1778,6 +1761,43 @@ void GSAPrefetchEngineC::PreSwapTokens(std::vector<uintptr_t>& useTokenPtrs,
                 "Decode step: %u, |KVCache Prefetch| End PreSwapTokens, "
                 "bs: %lu total time: %lu max_tokens_time: %lu cpu_copy_time: %lu\n",
                 mDecodeStep, useTokenPtrs.size(), duration.count(), max_tokens_time, cpu_copy_time);
+}
+
+// 单 bs 的 swap token 增量计算与拷贝（计时累加到出参）。
+void GSAPrefetchEngineC::SwapOneBsTokens(size_t bs, std::vector<uintptr_t>& useTokenPtrs,
+                                         std::vector<int32_t>& seqLens,
+                                         std::vector<std::vector<int>>& swapIndex,
+                                         std::vector<uintptr_t>& spaTokensPtr, int sparseLen,
+                                         int spaMaxBs, int mtpToken, uint64_t& maxTokensUs,
+                                         uint64_t& cpuCopyUs)
+{
+    auto start_max = std::chrono::high_resolution_clock::now();
+    const int32_t* data = reinterpret_cast<const int32_t*>(useTokenPtrs[bs]);
+    int maxID = *std::max_element(data, data + sparseLen * mTopkIndexerNum);
+    int start = maxID + 1;
+    int end = seqLens[bs] + mtpToken - 1;
+    int change_len = end - start;
+    std::vector<int> needAppend;
+    if (change_len <= mtpToken - 1) {
+        mLogger.log(LogLevel::ERROR,
+                    "[ERROR] PreSwapTokens change len < 0 !!!!!! start %d, end %d\n", start,
+                    end);
+        change_len = mtpToken;
+    }
+    mLogger.log(
+        LogLevel::DEBUG,
+        "Decode step: %u, |KVCache Prefetch| Start PreSwapTokens, change_len: %d, maxID: %d\n",
+        mDecodeStep, change_len, maxID);
+    needAppend.resize(change_len);
+    std::iota(needAppend.begin(), needAppend.end(), start);
+    auto max_end = std::chrono::high_resolution_clock::now();
+    maxTokensUs +=
+        std::chrono::duration_cast<std::chrono::microseconds>(max_end - start_max).count();
+    CopyPreSwapTokens(useTokenPtrs[bs], spaTokensPtr[0], swapIndex[bs], needAppend, sparseLen,
+                      spaMaxBs, mtpToken, change_len);
+    auto cpu_end = std::chrono::high_resolution_clock::now();
+    cpuCopyUs +=
+        std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - max_end).count();
 }
 
 void GSAPrefetchEngineC::DelBlocksMap(std::string reqID)
@@ -1852,9 +1872,7 @@ bool GSAPrefetchEngineC::GetIndexerStatus()
 
 void GSAPrefetchEngineC::WaitPrefetchIdle(uint64_t timeoutMs)
 {
-    /* D1：谓词式 wait_for——唤醒后重查原子位，虚假唤醒天然免疫。等待
-     * 期间 unique_lock 释放 mTaskDoneMutex（worker 尾部可正常加锁翻转
-     * 状态位），仅 predicate 判定的 µs 级窗口持锁。 */
+    // 谓词式 wait_for：唤醒后重查原子位，虚假唤醒免疫。
     std::unique_lock<std::mutex> lock(mTaskDoneMutex);
     mPrefetchDoneCv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [this] {
         return !mIsPrefetchRunning.load(std::memory_order_acquire);

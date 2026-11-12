@@ -58,10 +58,8 @@ public:
     // DelBlocksMap (Python thread), SetIndexerMap (Python thread) and
     // IndexerLoadProcess (indexer worker thread).
     std::mutex mUpdateReqMutex;
-    // mUpdateReqMutex 埋点（A-5/A-6 锁协议性能观测面）：per-site wait/hold
-    // 计数常开，dump 由 UCM_PREFETCH_LOCK_PROFILE 环境变量门控（构造函数
-    // 解析、SubmitTask 触发、DumpUReqLockStats 输出）。与上方互斥锁一致
-    // 公开（线程函数 MultiBSThreadFun 直接访问）。
+    // mUpdateReqMutex 埋点：dump 由 UCM_PREFETCH_LOCK_PROFILE 门控。
+    // 公开给线程函数（MultiBSThreadFun）直接访问。
     UReqLockStats mUReqLockStats[static_cast<size_t>(UReqLockSite::Count)];
     bool mUReqLockProfileEnabled = false;
     uint64_t mUReqLockDumpIntervalSteps = 100;
@@ -74,11 +72,8 @@ public:
     void DumpUReqLockStats();
     std::atomic<bool> mIsPrefetchRunning{false};
     std::atomic<bool> mIsIndexerLoadRunning{false};
-    /* D1：任务完成事件（等待原语见 WaitPrefetchIdle/WaitIndexerIdle）。
-     * 状态位翻转与 notify 的协议：worker 尾部先在 mTaskDoneMutex 内
-     * store(false)，再 notify_all——等待侧 predicate 在持锁状态下判定，
-     * 杜绝"判定后、休眠前"的丢唤醒窗口。本互斥锁不与任何引擎锁嵌套
-     * （notify 点位于 WorkerCleanup 的 mUpdateReqMutex 块之后）。 */
+    // 任务完成事件：worker 尾部在 mTaskDoneMutex 内翻转状态位、锁外 notify_all
+    //（杜绝丢唤醒）。本锁不与任何引擎锁嵌套。
     std::mutex mTaskDoneMutex;
     std::condition_variable mPrefetchDoneCv;
     std::condition_variable mIndexerDoneCv;
@@ -176,10 +171,8 @@ public:
     // Prefetch running status
     bool GetPrefetchStatus();
 
-    /* D1：任务完成事件等待——Python 侧替代 sleep(1ms) 轮询（平均唤醒延迟
-     * ~0.5ms → notify 后 µs 级）。带 timeout 上限，外层 Python 循环保留
-     * 作超时兜底重查。绑定侧必须 gil_scoped_release（阻塞期间释放 GIL，
-     * 对齐 time.sleep 语义），见 pybinds.cpp。 */
+    // 任务完成事件等待（带超时）：替代 Python 侧 sleep(1ms) 轮询，唤醒延迟
+    // notify 后 µs 级。绑定侧 gil_scoped_release 释放 GIL，见 pybinds.cpp。
     void WaitPrefetchIdle(uint64_t timeoutMs);
     void WaitIndexerIdle(uint64_t timeoutMs);
 
@@ -395,6 +388,11 @@ public:
     bool LoadIndexerTask(const std::string& reqID, int layerID, UC::Detail::TaskDesc& task,
                          size_t& totalNumber);
 
+    // LoadIndexerRequest 分解辅助（表查找+任务组装，内部持锁）
+    bool ResolveIndexerLoadTask(const std::string& reqID, const std::vector<int>& hbmBlockIDs,
+                                int layerID, std::uint8_t* indexerBaseAddr,
+                                UC::Detail::TaskDesc& task, size_t& totalNumber);
+
     // 从KVCacheInplaceScatter拆分出来
     void PrepareScatterAclTensor(const std::string& type, int streamIdx, torch::Tensor& dstIndexND,
                                  torch::Tensor& hbmBufferND, aclTensor*& dstIndexTensor,
@@ -406,6 +404,13 @@ public:
     void RunInplaceScatter(const std::string& type, int layerID, int streamIdx,
                            aclTensor* dstTensor, aclTensor* dstIndexTensor,
                            aclTensor* dstHBMBufferTensor, aclrtStream stream);
+
+    // SubmitTask / PreSwapTokens 分解辅助
+    void SyncIndexerSubmitState(std::vector<std::string>& reqIDList, std::vector<int>& seqLens);
+    void SwapOneBsTokens(size_t bs, std::vector<uintptr_t>& useTokenPtrs,
+                         std::vector<int32_t>& seqLens, std::vector<std::vector<int>>& swapIndex,
+                         std::vector<uintptr_t>& spaTokensPtr, int sparseLen, int spaMaxBs,
+                         int mtpToken, uint64_t& maxTokensUs, uint64_t& cpuCopyUs);
 
     // 0923 开始
     // UCMTensorMerge
@@ -428,6 +433,17 @@ public:
                               int streamIdx, std::vector<uint64_t>& hbmSlotIndex,
                               const std::string& reqID, size_t previousLoadNum,
                               bool zeroUcmOnly = false);
+
+    // BuildUCMMergeLoadPlan / FillFailedUCMMerge 分解辅助
+    void AppendMergeBlockShard(const UCMMergeBlockContext& context,
+                               const std::vector<BlockId>& hashVec,
+                               const std::vector<int>& missGlobalIds, int layerID,
+                               std::byte* kDstBase, std::byte* vDstBase, size_t previousLoadNum,
+                               UCMTokenLoadPlan& plan);
+    void BuildFallbackSlotIndices(const UCMMergeBlockContext& context, size_t dstBase,
+                                  const std::vector<int>& missSlots, const std::vector<int>& blockTable,
+                                  std::vector<uint64_t>& hbmSlotIndex, int layerID,
+                                  const std::string& reqID);
 
     // UCMTensorMerge 分解辅助方法（huge_method 序号51）
     bool ValidateUCMMergeRequest(int layerID, const std::string& reqID, size_t previousLoadNum);
@@ -494,6 +510,15 @@ public:
 
     // ProcessPrefetchRequest 分解辅助
     HBMManager* FindReqLayerManager(const std::string& reqID, int layerID);
+    /* 校验单请求查找输入（topkLen/平坦读边界）。返回 1=就绪，0=topkLen 空
+     *（软跳过，已清槽），-1=非法（已日志+清槽）。 */
+    int AcquirePrefetchRequestState(const TaskInfo& taskInfo, const PrefetchTopkView& topkView,
+                                    size_t i, int layerID, const PrefetchShmLayout& layout,
+                                    const int*& topkPtr, int& oneTopkLen);
+    // 尾段：尺寸校验 + 张量拷贝 + shm 写结果；0=成功，-1=失败（已清槽）。
+    int FinishPrefetchRequest(size_t i, int layerID, const PrefetchShmLayout& layout,
+                              const std::string& oneReqID, std::vector<int>& useBlockTable,
+                              std::vector<int>& missGlobalIds, std::vector<int>& loadSlots);
     /* missGlobalIds/loadSlots 由调用方检索后传入（每 (req,layer) 一次 find），
      * 本函数不再访问 mMissGlobalToken/mLoadSlot 两张 map。 */
     bool RunHbmTopkLookup(const std::string& oneReqID, std::vector<int>& oneTopkList, int layerID,
@@ -508,6 +533,10 @@ public:
     void ClearPrefetchResultSlot(size_t i, int layerID, const PrefetchShmLayout& layout);
 
     void ReadPrefetchResults(const TaskInfo& taskInfo, const PrefetchShmLayout& layout);
+
+    // ReadPrefetchResults 分解辅助
+    void ReadOneReqLayerResults(const TaskInfo& taskInfo, const PrefetchShmLayout& layout, size_t i,
+                                 int layerID, std::vector<int>& useBlockTable);
 
     void MergeAndCopyPrefetchLayer(const TaskInfo& taskInfo, ThreadInfo& threadInfo, int layerID,
                                    PrefetchTiming& timing);
@@ -534,6 +563,12 @@ public:
                                     std::uint8_t* indexerBaseAddr,
                                     const std::vector<BlockId>& hashVec,
                                     UC::Detail::TaskDesc& task);
+    // BuildIndexerInitLoadShards 分解辅助（单块 shard 追加，false=中止）
+    bool TryAppendInitShard(int i, std::vector<std::vector<int>>& blockTable,
+                            std::vector<std::vector<int>>& slabIdx, const std::string& reqID,
+                            int layerID, int number, std::uint8_t* indexerBaseAddr,
+                            const std::vector<BlockId>& hashVec, size_t shardIndex,
+                            UC::Detail::TaskDesc& task);
 
     void FinishOneLayerPrefetch(const std::string& reqID, int layerID,
                                 std::map<int, int>& hitBlocksIdx, std::vector<int>& missIdxs);
@@ -560,16 +595,45 @@ public:
                                std::vector<LastChunkSourceBlock>& sourceBlocks,
                                UCMTokenLoadPlan& plan);
 
+    // BuildLastChunkSources 分解辅助
+    bool AppendLastChunkTokens(int layerID, const std::string& reqID,
+                               const std::vector<int>& moveMap, const std::vector<BlockId>& hashVec,
+                               const std::unordered_map<int, LastKVBlockAddress>& lastKVCopy,
+                               int lastUCMBlockIdx,
+                               std::vector<LastChunkSourceBlock>& sourceBlocks,
+                               UCMTokenLoadPlan& plan);
+    void OpenUcmShard(size_t i, size_t blockIdxSz, int layerID, const std::vector<BlockId>& hashVec,
+                      std::vector<size_t>& blockFirstDst, std::vector<int>& blockShardIdx,
+                      UCMTokenLoadPlan& plan);
+    bool BindNonUcmSourceBlock(int blockIdx, int layerID,
+                               const std::unordered_map<int, LastKVBlockAddress>& lastKVCopy,
+                               std::vector<LastChunkSourceBlock>& sourceBlocks);
+    void CopybackLastChunkBlocks(int layerID, const std::vector<int>& blockTable,
+                                 const std::vector<int>& moveMap);
+
     void SetIndexerMapForLayer(const std::string& reqID, int layerID,
                                std::vector<int>& blockTableList,
                                std::vector<std::vector<int>>& remainIdx,
                                std::vector<std::vector<int>>& prefetchIdx,
                                std::vector<int>& blockSlot);
 
+    // SetIndexerMapForLayer 分解辅助
+    void BuildIndexerLayerTables(int layerID, std::vector<int>& blockTableList,
+                                 std::vector<std::vector<int>>& remainIdx,
+                                 std::vector<std::vector<int>>& prefetchIdx,
+                                 std::vector<int>& blockSlot,
+                                 std::map<int, int>& oneDocTable, std::map<int, int>& oneBlockMap,
+                                 std::vector<int>& onePrefetchIdx,
+                                 std::vector<std::pair<int, int>>& oneDsaSparseBlock);
+    void WriteIndexerLayerTables(const std::string& reqID, int layerID,
+                                 std::vector<std::pair<int, int>>& oneDsaSparseBlock);
+
     void ProcessTokensMapTopk(int layerID, const std::string& reqID, torch::Tensor& qTopkTensor,
                               int maxIdx, size_t sparseSeqLen);
 
     // ProcessTokensMapTopk 分解辅助
+    HBMManager* InitLayerManager(const std::string& reqID, int layerID, int maxIdx,
+                                 size_t sparseSeqLen, int topkSize);
     int AcquireQTopkView(torch::Tensor& qTopkTensor, const std::string& reqID, int layerID,
                          PrefetchTopkView& topkView, int& qTopkNum, int& topkSize);
     int CopyUseBlockTableToIndicesTensor(const std::string& reqID, int layerID,

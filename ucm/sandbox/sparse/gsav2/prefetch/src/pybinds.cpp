@@ -89,7 +89,10 @@ std::vector<uint8_t> UCMLookupFromBuffer(UCMKVPrefetch& ucmPrefetch, const pybin
     return ucmPrefetch.UCMLookup(blocksHash);
 }
 
-PYBIND11_MODULE(gsa_prefetch, m)
+namespace {
+
+// UCMKVPrefetch 绑定。
+void registerUcmKvPrefetch(pybind11::module_& m)
 {
     pybind11::class_<ucmprefetch::UCMKVPrefetch>(m, "UCMKVPrefetch")
         .def(pybind11::init<>())
@@ -99,16 +102,17 @@ PYBIND11_MODULE(gsa_prefetch, m)
              pybind11::arg("block_ids").noconvert())
         .def("ucm_lookup", &ucmprefetch::UCMLookupFromBuffer,
              pybind11::arg("block_ids").noconvert());
+}
 
+// GSAPrefetchEngineC 绑定。
+void registerPrefetchEngine(pybind11::module_& m)
+{
     pybind11::class_<ucmprefetch::GSAPrefetchEngineC>(m, "GSAPrefetchEngineC")
         .def(pybind11::init<std::vector<int>&, std::vector<int>&, bool, int, int, std::vector<int>,
                             std::vector<int>, std::string>())
         // NOTE: get_self_ptr / set_store_v1 pass raw pointers across the Python
-        // boundary as uintptr_t. The caller MUST guarantee that the engine
-        // (get_self_ptr) and the UCM store (set_store_v1) outlive every use on
-        // the Python side: any use after the C++ object/store is destroyed is a
-        // dangling-pointer use-after-free. A pybind11 owning wrapper that holds
-        // the pointer is the long-term fix.
+        // boundary as uintptr_t: the engine and the UCM store MUST outlive every
+        // Python-side use (else use-after-free); owning wrapper is the long-term fix.
         .def("set_blocks_map", &ucmprefetch::SetBlocksMapFromBuffer, pybind11::arg("req_id"),
              pybind11::arg("ids").noconvert(), pybind11::arg("max_idx"),
              pybind11::arg("block_idxs"), pybind11::arg("k_addrs"), pybind11::arg("v_addrs"))
@@ -127,9 +131,8 @@ PYBIND11_MODULE(gsa_prefetch, m)
         .def("update_indexer_map", &ucmprefetch::GSAPrefetchEngineC::UpdateIndexerMap)
         .def("submit_task_indexer", &ucmprefetch::GSAPrefetchEngineC::SubmitTaskIndexer)
         .def("get_indexer_status", &ucmprefetch::GSAPrefetchEngineC::GetIndexerStatus)
-        // D1：任务完成事件等待。call_guard<gil_scoped_release> 必须——pybind
-        // 默认持 GIL 进入 C++，阻塞等待会卡死所有 Python 线程；time.sleep
-        // 本身是释放 GIL 的，此处对齐其语义。
+        // 事件等待必须 gil_scoped_release：pybind 默认持 GIL 进 C++，阻塞等待
+        // 会卡死所有 Python 线程（time.sleep 本身是释放 GIL 的）。
         .def("wait_prefetch_idle", &ucmprefetch::GSAPrefetchEngineC::WaitPrefetchIdle,
              pybind11::arg("timeout_ms"), pybind11::call_guard<pybind11::gil_scoped_release>())
         .def("wait_indexer_idle", &ucmprefetch::GSAPrefetchEngineC::WaitIndexerIdle,
@@ -138,5 +141,13 @@ PYBIND11_MODULE(gsa_prefetch, m)
         .def("set_store_v1", &ucmprefetch::GSAPrefetchEngineC::SetStoreV1Raw)
         .def("get_store_v1_ptr", &ucmprefetch::GSAPrefetchEngineC::GetStoreV1Raw)
         .def("get_self_ptr", &ucmprefetch::GSAPrefetchEngineC::GetSelfRaw);
+}
+
+}  // namespace
+
+PYBIND11_MODULE(gsa_prefetch, m)
+{
+    registerUcmKvPrefetch(m);
+    registerPrefetchEngine(m);
 }
 }  // namespace ucmprefetch

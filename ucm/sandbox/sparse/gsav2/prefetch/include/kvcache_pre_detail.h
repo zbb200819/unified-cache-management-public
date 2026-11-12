@@ -65,11 +65,8 @@ extern "C" void __gcov_dump(void);
     std::abort();
 }
 
-/* mUpdateReqMutex 争用/持锁埋点（A-5/A-6 锁协议的性能观测面）。
- * 计数常开：单次获取的额外开销 ≈ 2 次 steady_clock::now + 4 次 relaxed
- * atomic add（约 60~90ns），相对锁本身的 ~30ns 与每步 10~40µs 的估算总
- * 开销可忽略；dump 由 UCM_PREFETCH_LOCK_PROFILE 环境变量门控（构造函数
- * 解析，DumpUReqLockStats 输出）。只做性能观测，不参与任何同步语义。 */
+/* mUpdateReqMutex 争用/持锁埋点：计数常开（单次约 60~90ns，可忽略），dump 由
+ * UCM_PREFETCH_LOCK_PROFILE 环境变量门控。只做性能观测，不参与同步语义。 */
 struct UReqLockStats {
     std::atomic<uint64_t> acquisitions{0};  // 获取次数
     std::atomic<uint64_t> contended{0};     // 等锁超过阈值的次数（真实争用）
@@ -85,8 +82,7 @@ struct UReqLockStats {
     }
 };
 
-// 判定"真实争用"的等锁阈值：无竞争获取约 30ns 量级，超过 1µs 必然存在
-// 其他持锁者（wait 落点指示"哪里在等"，hold 排名指示"谁在挡"）。
+// 判定"真实争用"的等锁阈值：无竞争获取约 30ns 量级，超过 1µs 必有其他持锁者。
 constexpr uint64_t kUReqLockContendThresholdNs = 1000;
 
 // std::lock_guard 的埋点等价物：wait 从调用 lock 前起算，hold 到析构释放。
@@ -136,13 +132,13 @@ enum class UReqLockSite : size_t {
     UpdateIndexerMap,         // Python update_indexer_map
     SubmitTaskIndexer,        // Python submit_task_indexer
     SetTopkIndices,           // Python set_topk_indices（Tier-0 后仅包 map 赋值）
-    ResetReqTokenState,       // SetTokensMap 子调用（A-6）
-    ProcessTokensMapTopk,     // SetTokensMap 子调用（A-6）
-    RunLastChunkMoveGuarded,  // SetTokensMap 子调用（A-6，临界区含 H2D/同步）
-    IndexerInitLoad,          // Python indexer_init_load（A-6）
-    SubmitTask,               // Python submit_prefetch_task 提交段（A-6）
-    IndexerLoadProcess,       // indexer worker 段1表事务（A3 锁收窄后仅表演化，IO 段出锁）
-    IndexerLoadResolve,       // indexer worker 段2装载计划解析（A3：共享表查找+任务组装 mini 段）
+    ResetReqTokenState,       // SetTokensMap 子调用
+    ProcessTokensMapTopk,     // SetTokensMap 子调用
+    RunLastChunkMoveGuarded,  // SetTokensMap 子调用
+    IndexerInitLoad,          // Python indexer_init_load
+    SubmitTask,               // Python submit_prefetch_task 提交段
+    IndexerLoadProcess,       // indexer worker 表事务（IO 段出锁）
+    IndexerLoadResolve,       // indexer worker 装载计划解析（表查找+任务组装）
     ProcessPrefetchRequest,   // prefetch worker（rank0，OMP 域内最小临界区）
     ReadPrefetchResults,      // prefetch worker（rank!=0）
     Count
@@ -165,30 +161,18 @@ struct UCMMergeBlockContext {
     bool owned;
 };
 
-/* UCM store cache-slot tensor layout expected by the GSA deployment
- * (SharedIndexerKVCacheLayout, li_c8 mode): the layer block cache slot is
- * laid out as [full K cache][full V cache][full indexer cache][full scale
- * cache], matching the indexer load task whose shards carry
- * {nullptr, nullptr, indexerAddr, nullptr}. LoadOnToken filters must
- * therefore have exactly kStoreTensorCount range groups, with K ranges under
- * kKTensorIndex and V ranges under kVTensorIndex (indexer/scale groups left
- * empty). */
+/* UCM store cache-slot 布局（SharedIndexerKVCacheLayout）：[K][V][indexer][scale]
+ * 四段。LoadOnToken filters 必须有 kStoreTensorCount 组 range，K 在
+ * kKTensorIndex、V 在 kVTensorIndex（indexer/scale 组留空）。 */
 constexpr size_t kKTensorIndex = 0;
 constexpr size_t kVTensorIndex = 1;
 constexpr size_t kIndexerTensorIndex = 2;
 constexpr size_t kScaleTensorIndex = 3;
 constexpr size_t kStoreTensorCount = 4;
 
-/* LoadOnToken plan. K and V are staged into two separate destination buffers
- * (mLastCHunkKPtr/VPtr, mSharedKBufferHostPtr/VBufferHostPtr), so each tensor
- * gets its own shard list plus a per-shard TokenFilter. Every shard carries
- * exactly one host address: the base address of that shard's destination
- * window, i.e. dst base + firstDstPos * tokenBytes. Every TokenRange
- * {offset, length, dstOffset} describes one token: offset is the token's
- * offset inside the source block's tensor, length is the per-token K/V byte
- * size (mKVSizeBytesToken / mKVSizeBytesTokenRe) and dstOffset is relative
- * to the shard's destination base address (the store copies to
- * shard.addrs.front() + dstOffset). */
+/* LoadOnToken plan：K/V 各自独立的 shard 列表 + per-shard TokenFilter。每 shard
+ * 携带一个目的窗口首地址；TokenRange{offset, length, dstOffset} 描述单 token：
+ * offset 为源块内偏移，length 为单 token 字节数，dstOffset 相对 shard 首地址。 */
 struct UCMTokenLoadPlan {
     UC::Detail::TaskDesc kTask;
     std::vector<UC::Detail::TokenFilter> kFilters;
@@ -245,12 +229,8 @@ struct PrefetchTiming {
     uint64_t ops = 0;
 };
 
-/* 非 rank0 等待 rank0 发布 prefetch 结果的超时（L-9）。默认 30s，对齐 KVPack
- * 控制面等待（kKVPackTimeout，kvcache_pre.cpp）与 Python 侧 is_version_same
- * 版本握手；环境变量 UCM_PREFETCH_SYNC_TIMEOUT_MS 可覆盖（单位毫秒）。
- * 原实现为 1s（10000×100us，旧注释误写 "Wait 1ms"），rank0 需串行完成
- * mTopkIndexerNum×bs 次 LRU 计算时（大 batch/抢占）易误超时 → KVPackAbort
- * 全进程退出。 */
+/* 非 rank0 等待 rank0 发布 prefetch 结果的超时：默认 30s，环境变量
+ * UCM_PREFETCH_SYNC_TIMEOUT_MS 可覆盖（毫秒）。原 1s 在大 batch 下易误超时。 */
 constexpr uint64_t kPrefetchSyncDefaultTimeoutMs = 30000;
 
 /* 解析上述超时（微秒）：环境变量缺失/为空/非法（<=0 或解析失败）时回落默认，

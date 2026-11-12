@@ -324,49 +324,60 @@ struct ScatterEmulator {
     /* dst[index[i][j], j] = src[i][j] over every element of the index shape. */
     static void Apply(const PendingScatter& op)
     {
-        if (op.dim != 0 || op.index.dims.empty() || op.index.dims.size() != op.src.dims.size() ||
-            op.index.dims.size() != op.dst.dims.size()) {
-            return;
-        }
-        const size_t dstElem = ElemSize(op.dst.dtype);
-        const size_t srcElem = ElemSize(op.src.dtype);
-        const size_t idxElem = ElemSize(op.index.dtype);
-        if (dstElem == 0 || srcElem == 0 || idxElem != sizeof(int64_t)) { return; }
-        const size_t copyBytes = (dstElem < srcElem) ? dstElem : srcElem;
-
+        size_t dstElem = 0, srcElem = 0, idxElem = 0, copyBytes = 0;
+        if (!ValidateScatterOp(op, dstElem, srcElem, idxElem, copyBytes)) { return; }
         int64_t total = 1;
         for (int64_t d : op.index.dims) { total *= d; }
         std::vector<int64_t> coords(op.index.dims.size(), 0);
-        auto* dstBase = static_cast<uint8_t*>(op.dst.data);
-        auto* srcBase = static_cast<uint8_t*>(op.src.data);
-        auto* idxBase = static_cast<uint8_t*>(op.index.data);
         for (int64_t flat = 0; flat < total; ++flat) {
-            /* index value + source element offset for this coordinate. */
-            int64_t idxOffset = op.index.offset;
-            int64_t srcOffset = op.src.offset;
-            for (size_t d = 0; d < coords.size(); ++d) {
-                idxOffset += coords[d] * op.index.strides[d];
-                srcOffset += coords[d] * op.src.strides[d];
-            }
-            const int64_t idxVal =
-                *reinterpret_cast<const int64_t*>(idxBase + idxOffset * idxElem);
-            if (idxVal < 0 || idxVal >= op.dst.dims[op.dim]) {
-                /* Out-of-range scatter: real ACL errors; the emulator skips
-                 * the element so a broken index cannot corrupt the dump. */
-                continue;
-            }
-            int64_t dstOffset = op.dst.offset;
-            for (size_t d = 0; d < coords.size(); ++d) {
-                dstOffset += (d == op.dim ? idxVal : coords[d]) * op.dst.strides[d];
-            }
-            std::memcpy(dstBase + dstOffset * dstElem, srcBase + srcOffset * srcElem, copyBytes);
-
+            ScatterOneElement(op, coords, dstElem, srcElem, idxElem, copyBytes);
             /* odometer increment over the index shape */
             for (size_t d = coords.size(); d-- > 0;) {
                 if (++coords[d] < op.index.dims[d]) { break; }
                 coords[d] = 0;
             }
         }
+    }
+
+    static bool ValidateScatterOp(const PendingScatter& op, size_t& dstElem, size_t& srcElem,
+                                  size_t& idxElem, size_t& copyBytes)
+    {
+        if (op.dim != 0 || op.index.dims.empty() || op.index.dims.size() != op.src.dims.size() ||
+            op.index.dims.size() != op.dst.dims.size()) {
+            return false;
+        }
+        dstElem = ElemSize(op.dst.dtype);
+        srcElem = ElemSize(op.src.dtype);
+        idxElem = ElemSize(op.index.dtype);
+        if (dstElem == 0 || srcElem == 0 || idxElem != sizeof(int64_t)) { return false; }
+        copyBytes = (dstElem < srcElem) ? dstElem : srcElem;
+        return true;
+    }
+
+    static void ScatterOneElement(const PendingScatter& op, const std::vector<int64_t>& coords,
+                                  size_t dstElem, size_t srcElem, size_t idxElem, size_t copyBytes)
+    {
+        auto* dstBase = static_cast<uint8_t*>(op.dst.data);
+        auto* srcBase = static_cast<uint8_t*>(op.src.data);
+        auto* idxBase = static_cast<uint8_t*>(op.index.data);
+        int64_t idxOffset = op.index.offset;
+        int64_t srcOffset = op.src.offset;
+        for (size_t d = 0; d < coords.size(); ++d) {
+            idxOffset += coords[d] * op.index.strides[d];
+            srcOffset += coords[d] * op.src.strides[d];
+        }
+        const int64_t idxVal =
+            *reinterpret_cast<const int64_t*>(idxBase + idxOffset * idxElem);
+        if (idxVal < 0 || idxVal >= op.dst.dims[op.dim]) {
+            /* Out-of-range scatter: real ACL errors; the emulator skips
+             * the element so a broken index cannot corrupt the dump. */
+            return;
+        }
+        int64_t dstOffset = op.dst.offset;
+        for (size_t d = 0; d < coords.size(); ++d) {
+            dstOffset += (d == op.dim ? idxVal : coords[d]) * op.dst.strides[d];
+        }
+        std::memcpy(dstBase + dstOffset * dstElem, srcBase + srcOffset * srcElem, copyBytes);
     }
 };
 
