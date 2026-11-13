@@ -137,7 +137,7 @@ def build_llm_with_uc(model: str, max_bs: int):
         enable_prefix_caching=True,
         enable_expert_parallel=True,
         quantization="ascend",
-        speculative_comfig={"method": "mtp", "num_speculative_tokens": 3, "enforce_eager": True}
+        speculative_config={"method": "mtp", "num_speculative_tokens": 3, "enforce_eager": True}
     )
     llm_kwargs = {
         field.name: getattr(llm_args, field.name)
