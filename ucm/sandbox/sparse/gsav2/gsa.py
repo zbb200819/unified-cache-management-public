@@ -547,6 +547,7 @@ class GSA(UcmSparseBase):
         self._store_inject_retries = 0
         self._store_inject_max_retries = 5
         self._block_hash_injected_reqs = set()
+        self.step_cost = 0
 
     def _init_speculative_config(self, vllm_config: VllmConfig):
         self.num_spec_tokens = 1
@@ -2454,6 +2455,13 @@ class GSA(UcmSparseBase):
     ) -> None:
         if not IS_OPEN_GSA or not self.is_decode_node:
             return
+        if IS_PERFORMANCE_LOG:
+            if self.step_cost != 0:
+                self.log.info(
+                    f"[GSA Time] one step time: "
+                    f"{(time.perf_counter() - self.step_cost) * 1_000_000}\n"
+                )
+            self.step_cost = time.perf_counter()
         self.gsa_metadata = self.build_gsa_metadata(
             scheduler_output, requests, input_batch
         )
