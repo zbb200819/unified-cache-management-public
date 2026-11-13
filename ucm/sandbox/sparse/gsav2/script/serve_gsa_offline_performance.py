@@ -86,7 +86,7 @@ Reasoning:"""
 
 
 def cut_prompt(prompt: str, cut_length: int) -> str:
-    tokenizer.encode(prompt)  # Ensure the prompt is tokenized
+    tokens = tokenizer.encode(prompt)  # Ensure the prompt is tokenized
     if len(tokens) < cut_length:
         return None
     tokens = tokens[:cut_length]
@@ -136,6 +136,7 @@ def build_llm_with_uc(model: str, max_bs: int):
         },
         enable_prefix_caching=True,
         enable_expert_parallel=True,
+        quantization="ascend",
         speculative_comfig={"method": "mtp", "num_speculative_tokens": 3, "enforce_eager": True}
     )
     llm_kwargs = {
