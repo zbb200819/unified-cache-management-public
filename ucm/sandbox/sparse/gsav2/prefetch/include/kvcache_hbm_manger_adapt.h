@@ -44,18 +44,18 @@ namespace gsa_layer_window {
 inline int getWindowSize4096(int layerId) 
 {
     if (layerId < 0) { return 5120; }
-    if (layerId < 21) { return 3072; }
-    if (layerId < 33) { return 4096; }
-    if (layerId < 65) { return 5120; }
+    if (layerId <= 21) { return 3072; }
+    if (layerId <= 33) { return 4096; }
+    if (layerId <= 65) { return 5120; }
     return 3072;
 }
 
 inline int getWindowSize5120(int layerId) 
 {
     if (layerId < 0) { return 5120; }
-    if (layerId < 21) { return 4096; }
-    if (layerId < 33) { return 5120; }
-    if (layerId < 65) { return 5120; }
+    if (layerId <= 18) { return 4096; }
+    if (layerId <= 30) { return 5120; }
+    if (layerId <= 62) { return 5120; }
     return 4096;
 }
 
@@ -85,7 +85,7 @@ inline HbmWindowPlan parseWindowPlan(const char* s, HbmWindowPlan fallback)
     std::string v(s);
     for (char&c :v) { c = (char)std::tolower((unsigned char)c); }
     if (v == "4096" || v == "budget4096") { return HbmWindowPlan::Budget4096; }
-    if (v == "lru" || v == "budget5120") { return HbmWindowPlan::Budget5120; }
+    if (v == "5120" || v == "budget5120") { return HbmWindowPlan::Budget5120; }
     if (v == "uniform" || v == "none" || v == "0") { return HbmWindowPlan::Uniform; }
     return fallback;
 }
@@ -93,7 +93,7 @@ inline HbmWindowPlan parseWindowPlan(const char* s, HbmWindowPlan fallback)
 struct GlobalConfig {
     HbmEvictMode evictMode = HbmEvictMode::Lru;
     HbmWindowPlan windowPlan = HbmWindowPlan::Uniform;
-    float decayLambda = 0.85;
+    float decayLambda = 0.85f;
     int windowSteps = 20;
     bool loadedFromEnv = false;
 };
@@ -130,7 +130,7 @@ inline bool resolveConfigFromEnv()
     }
     if (const char* v = std::getenv("UCM_HBM_WINDOW_STEPS")) {
         int n = std::atoi(v);
-        if (n > 0) { cfg.windowSteps = n; any = true; }
+        if (n >= 0) { cfg.windowSteps = n; any = true; }
     }
     return any;
 }
@@ -187,7 +187,7 @@ public:
         
         mLogger.log(
             LogLevel::DEBUG,
-            "|HBM Manager| Init layer : %d, evictMode: %s, windowPlan: %s, "
+            "|HBM Manager Layered| Init layer : %d, evictMode: %s, windowPlan: %s, "
             "mDramTensorCount: %u, mHbmCapacity: %d, mHbmImmutableSize: %d, mWindowSize: %d"
             "mTopkSize: %d, mMaxTotalSlots: %d lambda %.2f, m: %d\n",
             mLayerId, (mEvictMode == HbmEvictMode::Decay) ? "decay" : "lru",
@@ -216,6 +216,7 @@ public:
             mActiveFlag.clear();
             mActiveSlots.clear();
         }
+        mDecayStep = 0;
 
         if (preloadHbm) { preloadSlotMapping(); }
         initLruChain();
@@ -264,10 +265,11 @@ public:
     {
         HBM_ASSERT(mInitialized);
         mTopkSize = topkIds.size();
-        std::vector<int> topkSlotIds(mTopkSize - 1);
+        std::vector<int> topkSlotIds(mTopkSize, -1);
         missGlobalIds.reserve(mTopkSize);
         missSlots.reserve(mTopkSize);
         mAddedSlotGeneration = (mAddedSlotGeneration == INT_MAX) ? 1 : mAddedSlotGeneration + 1;
+        ++mDecayStep;
 
         std::unordered_set<int> seenGids;
         std::vector<int>  dedupedTopkIds;
@@ -287,9 +289,10 @@ public:
 
         std::vector<int> missIndices;
         missIndices.reserve(dedupedSize);
-        collectTopkHitAndMisses(dedupedTopkIds, topkSlotIds, missGlobalIds, missIndices, mLogger);
+        collectTopkHitsAndMisses(dedupedTopkIds, topkSlotIds, missGlobalIds, missIndices, mLogger);
 
-        processTopkMisses(dedupedTopkIds, topkSlotIds, missGlobalIds, missSlots, missIndices, mLogger);
+        processTopkMisses(dedupedTopkIds, topkSlotIds, missGlobalIds, missSlots, missIndices,
+                          mLogger);
 
         if (mEvictMode == HbmEvictMode::Decay) {
             for (int slot : missSlots) { touchDecay(slot); }
@@ -327,7 +330,7 @@ public:
     int getPinnedSlotCount() const { return mPinnedSlotCount; }
     int getMaxTotalSlots() const { return mMaxTotalSlots; }
     int getActiveSlotCount() const { return (int)mActiveSlots.size(); }
-    bool idDecayMode() const { return mEvictMode == HbmEvictMode::Decay; }
+    bool isDecayMode() const { return mEvictMode == HbmEvictMode::Decay; }
 
     const char* getEvictModeName() const
     {
@@ -336,8 +339,7 @@ public:
 
     const char* getWindowPlanName() const
     {
-        switch (mWindowPlan)
-        {
+        switch (mWindowPlan) {
             case HbmWindowPlan::Budget4096: return "4096";
             case HbmWindowPlan::Budget5120: return "5120";
             default: return "uniform";
@@ -346,14 +348,16 @@ public:
 
     void setEvictMode(HbmEvictMode mode) { mEvictMode = mode; }
 
-    void setWindowSize(int win) {
+    void setWindowSize(int win)
+    {
         if (win < mTopkSize) { win = mTopkSize; }
         if (win > mHbmImmutableSize) { win = mHbmImmutableSize; }
         mWindowSize = win;
     }
 
-    void setDecayLambda(float lam) { mDecayLambda = lam; }
-    void setWindowSteps(int steps) {
+    void setDecayLambda(float lam) { mDecayLambda = lam; rebuildPowTable(); }
+    void setWindowSteps(int steps) 
+    {
         mWindowSteps = (steps > 0) ? steps : 20;
         rebuildPowTable();
     }
@@ -443,9 +447,9 @@ private:
     std::vector<float> mPowTable;
     std::vector<std::pair<float, int>> mRankedBuf;
 
-    inline bool powLambda(int k) const
+    inline float powLambda(int k) const
     {
-        if (k > 0 && k < (int)mPowTable.size()) { return mPowTable[k]; }
+        if (k >= 0 && k < (int)mPowTable.size()) { return mPowTable[k]; }
         return std::pow(mDecayLambda, (float)k);
     }
 
@@ -461,7 +465,7 @@ private:
         int n = (mWindowSteps > 0) ? std::max(mWindowSteps, 64) : kPowTableSize;
         mPowTable.resize(n + 1);
         mPowTable[0] = 1.0f;
-        for (int k = 0; k < n; ++k) {
+        for (int k = 1; k <= n; ++k) {
             mPowTable[k] = mPowTable[k - 1] * mDecayLambda;
         }
     }
@@ -469,14 +473,14 @@ private:
     /* miss 换入与回填：victim 自 LRU 尾部驱逐（跳过 pinned）。missGlobalIds 与
      * missIndices 平行入栈（missIndices[j] 为第 j 个 miss 的去重后序号），回填
      * 直接取 missGlobalIds[j]，无需 deduped 序列二次查表。 */
-    void collectTopkHitAndMisses(std::vector<int>& dedupedTopkIds,
-                                 std::vector<int>& topkSlotIds, std::vector<int>& missGlobalIds,
-                                 std::vector<int>& missIndices, Logger& mLogger)
+    void collectTopkHitsAndMisses(const std::vector<int>& dedupedTopkIds,
+                                  std::vector<int>& topkSlotIds, std::vector<int>& missGlobalIds,
+                                  std::vector<int>& missIndices, Logger& mLogger)
     {
         int dedupedSize = dedupedTopkIds.size();
         for (int i = 0; i < dedupedSize; ++i) {
             int gid = dedupedTopkIds[i];
-            if (gid > mDramTensorCount) {
+            if (gid >= mDramTensorCount) {
                 int transformedSlot = gid - mDramTensorCount + mHbmCapacity;
                 if (transformedSlot >= mMaxTotalSlots) {
                     mLogger.log(LogLevel::ERROR,
@@ -498,7 +502,9 @@ private:
                 continue;
             }
             if (gid < 0) {
-                mLogger.log(LogLevel::ERROR, "|KVCache Prefetch| Topk is abnormal value: %d \n", gid);
+                mLogger.log(LogLevel::ERROR, "|KVCache Prefetch| Topk is abnormal value: %d \n",
+                    gid);
+                continue;
             }
             int slot = mGlobalToSlot[gid];
             int threshold = 2048;
@@ -606,12 +612,12 @@ private:
         for (int i = 0; i < dedupedSize; ++i) {
             int slot = topkSlotIds[i];
             if (slot < 0) { continue; }
-            output.push_back(topkSlotIds[i]);
+            output.push_back(slot);
             mAddedSlotFlag[slot] = mAddedSlotGeneration;
             realTopkSlotNum += 1;
         }
 
-        int histNeeded = mHbmImmutableSize - realTopkSlotNum;
+        int histNeeded = mWindowSize - realTopkSlotNum;
         if (histNeeded > 0 && !mActiveSlots.empty()) {
             mRankedBuf.clear();
             for (int slot : mActiveSlots) {
@@ -622,28 +628,29 @@ private:
                 if (eff <= 0.0f) { continue; }
                 mRankedBuf.emplace_back(eff, slot);
             }
-        }
-        auto& ranked = mRankedBuf;
-        if ((int)ranked.size() > histNeeded) {
-            std::nth_element(ranked.begin(), ranked.begin() + histNeeded, ranked.end(),
-                            [](const std::pair<float, int>& a,
-                            const std::pair<float, int>& b) {
-                                if (a.first != b.first) return a.first > b.first;
-                                return a.second < b.second; 
-                            });
-            ranked.resize(histNeeded);
-        }
-        std::sort(ranked.begin(), ranked.end(),
-                [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
-                    if (a.first != b.first) return a.first > b.first;
-                    return a.second < b.second; 
-                });
         
-        for (const auto& kv : ranked) {
-            if ((int)output.size() >= mWindowSize) { break; }
-            if (mAddedSlotFlag[kv.second] == mAddedSlotGeneration) { continue; }
-            output.push_back(kv.second);
-            mAddedSlotFlag[kv.second] = mAddedSlotGeneration;
+            auto& ranked = mRankedBuf;
+            if ((int)ranked.size() > histNeeded) {
+                std::nth_element(ranked.begin(), ranked.begin() + histNeeded, ranked.end(),
+                                [](const std::pair<float, int>& a,
+                                const std::pair<float, int>& b) {
+                                    if (a.first != b.first) return a.first > b.first;
+                                    return a.second < b.second; 
+                                });
+                ranked.resize(histNeeded);
+            }
+            std::sort(ranked.begin(), ranked.end(),
+                    [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+                        if (a.first != b.first) return a.first > b.first;
+                        return a.second < b.second; 
+                    });
+            
+            for (const auto& kv : ranked) {
+                if ((int)output.size() >= mWindowSize) { break; }
+                if (mAddedSlotFlag[kv.second] == mAddedSlotGeneration) { continue; }
+                output.push_back(kv.second);
+                mAddedSlotFlag[kv.second] = mAddedSlotGeneration;
+            }
         }
 
         while ((int)output.size() < mHbmImmutableSize) {
@@ -675,7 +682,7 @@ private:
 
     inline void clearDecay(int slot)
     {
-        if (mEvictMode == HbmEvictMode::Decay) { return; }
+        if (mEvictMode != HbmEvictMode::Decay) { return; }
         if (slot < 0 || slot >= mMaxTotalSlots) { return; }
         mDecayScore[slot] = 0.0f;
         mDecayLastStep[slot] = -1;
@@ -683,7 +690,7 @@ private:
 
     void pruneDecay()
     {
-        if (mEvictMode == HbmEvictMode::Decay) { return; }
+        if (mEvictMode != HbmEvictMode::Decay) { return; }
         int write = 0;
         for (int read = 0; read < (int)mActiveSlots.size(); ++ read) {
             int slot = mActiveSlots[read];
@@ -731,4 +738,4 @@ private:
     }
 };
 
-#endif  // GSA_HBM_MANAGER_H
+#endif  // GSA_HBM_MANAGER_ADAPT_H
