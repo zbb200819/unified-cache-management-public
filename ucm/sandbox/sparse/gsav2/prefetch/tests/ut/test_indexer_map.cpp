@@ -427,7 +427,7 @@ TEST_F(IndexerMapTest, SetTokensMapLayerZeroClearsAndResizesState)
     engine = MakeEngine(/*layerNum=*/2);
     const std::string reqID = "req1";
     // Pre-seed existing state for req1 (will be cleared because mHBMMangers has it).
-    engine->mHBMMangers[reqID].push_back(std::make_unique<HBMManager>());
+    engine->mHBMMangers[reqID].push_back(std::make_unique<HBMManagerLayered>());
     engine->mAllReqIdSlots[reqID] = {1};
     engine->mReqUseBlockTable[reqID] = {2};
     engine->mMissGlobalToken[reqID] = {{3}};
@@ -461,7 +461,7 @@ TEST_F(IndexerMapTest, SetTokensMapLayerNonZeroReusesExistingManagers)
     // mPromptLen (only layer-0 sets it).
     engine = MakeEngine(/*layerNum=*/2);
     const std::string reqID = "req1";
-    engine->mHBMMangers[reqID].push_back(std::make_unique<HBMManager>());
+    engine->mHBMMangers[reqID].push_back(std::make_unique<HBMManagerLayered>());
     auto qTopk = torch::zeros({1, 1, 2}, torch::dtype(torch::kInt32));
     std::vector<int> remainBlockTable = {0, 1, 2, 3, 4, 5, 6, 7};
     std::vector<int> slots = {10, 20};

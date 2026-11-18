@@ -257,14 +257,16 @@ class FakeEngineC:
 
 
 class FakeUCMPrefetch:
-    """gsa_prefetch.UCMKVPrefetch 的 mock：ucm_lookup 支持脚本化重试序列"""
+    """gsa_prefetch.UCMKVPrefetch 的 mock：ucm_lookup/check/wait 支持脚本化序列"""
 
     def __init__(self):
         self.calls = []
         self.lookup_results = None  # e.g. [[False]*4, [True]*4]
+        self.check_results = None   # e.g. [0, 1]（0=运行中，1=完成，负数=错误）
+        self.wait_results = None    # e.g. [0, -50003]（0=成功，负数=失败）
 
-    def store_init(self, ptr, layer_num):
-        self.calls.append(("store_init", ptr, layer_num))
+    def store_init(self, ptr, layer_num, tensor_count):
+        self.calls.append(("store_init", ptr, layer_num, tensor_count))
 
     def ucm_lookup(self, ids):
         self.calls.append(("ucm_lookup", len(ids)))
@@ -276,7 +278,23 @@ class FakeUCMPrefetch:
 
     def ucm_load_ssd(self, ids):
         self.calls.append(("ucm_load_ssd", len(ids)))
-        return True
+        return 1000
+
+    def ucm_check(self, task_id):
+        self.calls.append(("ucm_check", task_id))
+        if self.check_results is not None and len(self.check_results) > 1:
+            return self.check_results.pop(0)
+        if self.check_results:
+            return self.check_results[0]
+        return 1
+
+    def ucm_wait(self, task_id):
+        self.calls.append(("ucm_wait", task_id))
+        if self.wait_results is not None and len(self.wait_results) > 1:
+            return self.wait_results.pop(0)
+        if self.wait_results:
+            return self.wait_results[0]
+        return 0
 
 
 # ---------------------------------------------------------------------------

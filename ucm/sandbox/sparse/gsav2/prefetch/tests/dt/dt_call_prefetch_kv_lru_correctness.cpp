@@ -438,7 +438,7 @@ struct KVFixture {
     {
         return engine->mAllTopkIndicesTensor.at(reqID)[0].data_ptr<int>();
     }
-    HBMManager* Manager(const std::string& reqID) const
+    HBMManagerLayered* Manager(const std::string& reqID) const
     {
         return engine->mHBMMangers.at(reqID)[0].get();
     }
@@ -491,7 +491,7 @@ void VerifySingleRequestStep(KVFixture& f, const RefLru& model, const RefLru::St
                       e.vRows[i], "h2dVDev", row);
     }
     /* Manager bookkeeping vs the model for the whole gid domain. */
-    HBMManager* mgr = f.Manager(reqID);
+    HBMManagerLayered* mgr = f.Manager(reqID);
     for (int gid = 0; gid < RefLru::kDramGids; ++gid) {
         EXPECT_EQ(mgr->getSlotForGlobal(gid), model.slotOf(gid)) << "gid " << gid;
     }

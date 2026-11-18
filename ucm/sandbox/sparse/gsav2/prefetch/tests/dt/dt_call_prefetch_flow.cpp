@@ -260,7 +260,7 @@ struct FlowFixture {
             EXPECT_EQ(ptr[i], expected[i]) << reqID << " topkIndices[" << i << "]";
         }
     }
-    HBMManager* Manager(const std::string& reqID) const
+    HBMManagerLayered* Manager(const std::string& reqID) const
     {
         return engine->mHBMMangers.at(reqID)[0].get();
     }
@@ -325,7 +325,7 @@ TEST(PrefetchFlowDt, ThreeDecodeStepsLoadHitEvictCorrectness)
     EXPECT_TRUE(VecEq(f.engine->mMissGlobalToken["req1"][0], {17, 18, 29}));
     EXPECT_TRUE(VecEq(f.engine->mLoadSlot["req1"][0], {15, 14, 13}));
     {
-        HBMManager* mgr = f.Manager("req1");
+        HBMManagerLayered* mgr = f.Manager("req1");
         EXPECT_EQ(mgr->getSlotForGlobal(0), 0);   // hit token stayed resident
         EXPECT_EQ(mgr->getSlotForGlobal(17), 15); // misses landed at victims
         EXPECT_EQ(mgr->getSlotForGlobal(18), 14);
@@ -409,7 +409,7 @@ TEST(PrefetchFlowDt, ThreeDecodeStepsLoadHitEvictCorrectness)
     /* Published slot index untouched by the zero-load step. */
     EXPECT_EQ(f.LoadIndexHost()[0], 163);
     {
-        HBMManager* mgr = f.Manager("req1");
+        HBMManagerLayered* mgr = f.Manager("req1");
         EXPECT_EQ(mgr->getSlotForGlobal(17), 15);
         EXPECT_EQ(mgr->getSlotForGlobal(18), 14);
         EXPECT_EQ(mgr->getSlotForGlobal(12), 12);  // still resident
@@ -428,7 +428,7 @@ TEST(PrefetchFlowDt, ThreeDecodeStepsLoadHitEvictCorrectness)
     EXPECT_EQ(f.LoadIndexHost()[0], 160);  // 40*4 + 0
     f.ExpectTopkIndices("req1", {12, 14, 15, 13});
     {
-        HBMManager* mgr = f.Manager("req1");
+        HBMManagerLayered* mgr = f.Manager("req1");
         EXPECT_EQ(mgr->getSlotForGlobal(19), 12);
         EXPECT_EQ(mgr->getSlotForGlobal(12), -1);  // old resident evicted
         EXPECT_TRUE(mgr->validateLruChain());

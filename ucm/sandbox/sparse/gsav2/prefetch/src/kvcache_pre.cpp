@@ -863,24 +863,41 @@ void GSAPrefetchEngineC::ProcessTokensMapTopk(int layerID, const std::string& re
     CopyUseBlockTableToIndicesTensor(reqID, layerID, useBlockTable);
 }
 
-// ProcessTokensMapTopk 分解辅助：重建 (req,layer) 的 HBMManager，未注册/越界返回 nullptr。
-HBMManager* GSAPrefetchEngineC::InitLayerManager(const std::string& reqID, int layerID, int maxIdx,
-                                                 size_t sparseSeqLen, int topkSize)
+// ProcessTokensMapTopk 分解辅助：重建 (req,layer) 的 HBM 管理器，未注册/越界返回 nullptr。
+HBMManagerLayered* GSAPrefetchEngineC::InitLayerManager(const std::string& reqID, int layerID,
+                                                        int maxIdx, size_t sparseSeqLen,
+                                                        int topkSize)
 {
     auto managersIt = mHBMMangers.find(reqID);
     if (managersIt == mHBMMangers.end() ||
         static_cast<size_t>(layerID) >= managersIt->second.size()) {
         mLogger.log(LogLevel::ERROR,
-                    "Decode step: %u, |KVCache Prefetch| HBM managers not initialized, "
-                    "skip topk map: reqID=%s layerID=%d managerSize=%zu\n",
-                    mDecodeStep, reqID.c_str(), layerID,
-                    managersIt == mHBMMangers.end() ? 0 : managersIt->second.size());
+                     "Decode step: %u, |KVCache Prefetch| HBM managers not initialized, "
+                     "skip topk map: reqID=%s layerID=%d managerSize=%zu\n",
+                     mDecodeStep, reqID.c_str(), layerID,
+                     managersIt == mHBMMangers.end() ? 0 : managersIt->second.size());
         return nullptr;
     }
-    managersIt->second[static_cast<size_t>(layerID)] = std::make_unique<HBMManager>();
+    /* layerId 供分层窗口表取值（与 mTopkIndexerNum 同一索引空间）；evictMode /
+     * windowPlan 来自 Python 配置（SetHbmEvictMode），默认 Lru + Uniform 时与
+     * 原 HBMManager 行为逐字节一致。 */
+    managersIt->second[static_cast<size_t>(layerID)] = std::make_unique<HBMManagerLayered>();
     auto& manager = *managersIt->second[static_cast<size_t>(layerID)];
-    manager.init(maxIdx, sparseSeqLen, mSpaTopkLen, topkSize, mLogger);
+    manager.init(maxIdx, sparseSeqLen, mSpaTopkLen, topkSize, mLogger, /*preloadHbm=*/true,
+                 /*maxTotalSlots=*/32768, /*layerId=*/layerID, mHbmEvictMode, mHbmWindowPlan);
     return &manager;
+}
+
+void GSAPrefetchEngineC::SetHbmEvictMode(int mode)
+{
+    mHbmEvictMode = (mode == 1) ? 1 : 0;
+    /* Decay 与分层窗口表联动（gsa_layer_window::Budget5120）：indexer layer<=18 →
+     * 4096、19..62 → 5120、>=63 → 4096，窗口值 clamp 到 [topkSize, mSpaTopkLen]。 */
+    mHbmWindowPlan = (mHbmEvictMode == 1) ? 2 : 0;
+    mLogger.log(LogLevel::INFO,
+                "GSAPrefetchEngineC set HBM evict mode: %d (%s), window plan: %d (%s)\n",
+                mHbmEvictMode, mHbmEvictMode == 1 ? "decay" : "lru", mHbmWindowPlan,
+                mHbmWindowPlan == 2 ? "budget5120" : "uniform");
 }
 
 int GSAPrefetchEngineC::AcquireQTopkView(torch::Tensor& qTopkTensor, const std::string& reqID,

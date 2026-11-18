@@ -77,10 +77,20 @@ void SetBlocksMapFromBuffer(GSAPrefetchEngineC& engine, const std::string& reqID
     engine.SetBlocksMap(reqID, blocksHash, maxIdx, blockIdxs, kAddrs, vAddrs);
 }
 
-int32_t UCMLoadSSDFromBuffer(UCMKVPrefetch& ucmPrefetch, const pybind11::buffer& ids)
+int64_t UCMLoadSSDFromBuffer(UCMKVPrefetch& ucmPrefetch, const pybind11::buffer& ids)
 {
     std::vector<BlockId> blocksHash = BlockIdsFromBuffer(ids);
     return ucmPrefetch.UCMLoadSSD(blocksHash);
+}
+
+int32_t UCMCheckTask(UCMKVPrefetch& ucmPrefetch, std::uint64_t taskId)
+{
+    return ucmPrefetch.UCMCheck(taskId);
+}
+
+int32_t UCMWaitTask(UCMKVPrefetch& ucmPrefetch, std::uint64_t taskId)
+{
+    return ucmPrefetch.UCMWait(taskId);
 }
 
 std::vector<uint8_t> UCMLookupFromBuffer(UCMKVPrefetch& ucmPrefetch, const pybind11::buffer& ids)
@@ -97,9 +107,12 @@ void registerUcmKvPrefetch(pybind11::module_& m)
     pybind11::class_<ucmprefetch::UCMKVPrefetch>(m, "UCMKVPrefetch")
         .def(pybind11::init<>())
         .def("store_init", &ucmprefetch::UCMKVPrefetch::StoreInit, pybind11::arg("store_ptr"),
-             pybind11::arg("layer_num"))
+             pybind11::arg("layer_num"), pybind11::arg("tensor_count"))
         .def("ucm_load_ssd", &ucmprefetch::UCMLoadSSDFromBuffer,
              pybind11::arg("block_ids").noconvert())
+        .def("ucm_check", &ucmprefetch::UCMCheckTask, pybind11::arg("task_id"))
+        .def("ucm_wait", &ucmprefetch::UCMWaitTask, pybind11::arg("task_id"),
+             pybind11::call_guard<pybind11::gil_scoped_release>())
         .def("ucm_lookup", &ucmprefetch::UCMLookupFromBuffer,
              pybind11::arg("block_ids").noconvert());
 }
@@ -119,6 +132,11 @@ void registerPrefetchEngine(pybind11::module_& m)
         .def("set_last_indexer_block", &ucmprefetch::GSAPrefetchEngineC::SetLastIndexerBlock,
              pybind11::arg("req_id"), pybind11::arg("block_idxs"), pybind11::arg("indexer_addrs"))
         .def("set_tokens_map", &ucmprefetch::GSAPrefetchEngineC::SetTokensMap)
+        // HBM 驱逐模式：mode 1 = decay（全部层启用衰减驱逐 + Budget5120 分层窗口），
+        // 其他值 = lru（默认，与原实现一致）。需在首个 set_tokens_map 之前调用。
+        .def("set_hbm_evict_mode", &ucmprefetch::GSAPrefetchEngineC::SetHbmEvictMode,
+             pybind11::arg("mode"))
+        .def("get_hbm_evict_mode", &ucmprefetch::GSAPrefetchEngineC::GetHbmEvictMode)
         .def("del_blocks_map", &ucmprefetch::GSAPrefetchEngineC::DelBlocksMap)
         .def("set_topk_indices", &ucmprefetch::GSAPrefetchEngineC::SetTopkIndices)
         .def("pre_swap_tokens", &ucmprefetch::GSAPrefetchEngineC::PreSwapTokens)

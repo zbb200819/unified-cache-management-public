@@ -187,7 +187,9 @@ class TestEngineBindingContract:
             engine_bindings
         )
         assert "set_last_indexer_block" in engine_bindings
-        assert {"store_init", "ucm_lookup", "ucm_load_ssd"} <= ucm_bindings
+        assert {"store_init", "ucm_lookup", "ucm_load_ssd", "ucm_check", "ucm_wait"} <= (
+            ucm_bindings
+        )
 
 
 class TestMergeBaselineDocs:

@@ -93,11 +93,18 @@ public:
             mLruPrev[i] = (i == 0) ? -1 : i - 1;
             mLruNext[i] = (i == mHbmCapacity - 1) ? -1 : i + 1;
         }
+        /* 最尾可驱逐节点缓存：fresh 链全为常规非 pinned 槽，尾即候选。
+         * 之后由 moveToHead / processTopkMisses 增量维护。 */
+        mEvictTail = mLruTail;
     }
 
-    /* miss 换入与回填：victim 自 LRU 尾部驱逐（跳过 pinned）。missGlobalIds 与
-     * missIndices 平行入栈（missIndices[j] 为第 j 个 miss 的去重后序号），回填
-     * 直接取 missGlobalIds[j]，无需 deduped 序列二次查表。 */
+    /* miss 换入与回填：victim 直接取 mEvictTail（最尾非 pinned 节点，与自
+     * mLruTail 走链跳过 pinned 的结果恒等）。逐 miss 重走 pinned 尾部聚簇
+     * 是 O(miss*pinned)，此处增量维护摊还 O(1)：victim 换入新 gid 后将被
+     * 钉到链头，新的最尾可驱逐节点从其原前驱回退查找（跳过的 pinned 节点
+     * 此后不再被重复扫描）。missGlobalIds 与 missIndices 平行入栈
+     *（missIndices[j] 为第 j 个 miss 的去重后序号），回填直接取
+     * missGlobalIds[j]，无需 deduped 序列二次查表。 */
     void processTopkMisses(std::vector<int>& topkSlotIds,
                            std::vector<int>& missGlobalIds, std::vector<int>& missSlots,
                            const std::vector<int>& missIndices, Logger& mLogger)
@@ -106,15 +113,12 @@ public:
         int loadedCount = 0;
         if (missCount > 0) {
             for (int i = 0; i < missCount; ++i) {
-                int victimSlot = mLruTail;
-                while (victimSlot != -1 && mIsPinned[victimSlot]) {
-                    victimSlot = mLruPrev[victimSlot];
-                }
+                int victimSlot = mEvictTail;
                 if (victimSlot == -1) {
                     mLogger.log(LogLevel::ERROR,
-                                "|HBM Manager| No evictable slot for miss gid: %d, "
-                                "remaining %d misses dropped\n",
-                                missGlobalIds[i], missCount - i);
+                                 "|HBM Manager| No evictable slot for miss gid: %d, "
+                                 "remaining %d misses dropped\n",
+                                 missGlobalIds[i], missCount - i);
                     continue;
                 }
                 int oldGid = mSlotToGlobal[victimSlot];
@@ -134,8 +138,14 @@ public:
                 mGlobalToSlot[newGid] = victimSlot;
                 missSlots.push_back(victimSlot);
                 loadedCount++;
+                const int victimOldPrev = mLruPrev[victimSlot];
                 removeFromList(victimSlot);
                 insertToHead(victimSlot);
+                /* victim 原前驱为 -1（victim 即链头，唯一常规槽场景）时，
+                 * 回退查找为空：victim 已重载并仍在链头，它自身就是新的
+                 * 最尾可驱逐节点。 */
+                mEvictTail =
+                    (victimOldPrev == -1) ? victimSlot : prevEvictable(victimOldPrev);
             }
             missGlobalIds.resize(loadedCount);
             for (int j = 0; j < loadedCount; ++j) {
@@ -365,6 +375,9 @@ private:
 
     int mLruHead;
     int mLruTail;
+    // 最尾可驱逐（非 pinned）节点缓存：miss 驱逐 O(1) 直取，免逐次自
+    // mLruTail 重扫 pinned 尾部聚簇（O(miss*pinned) -> 摊还 O(miss)）
+    int mEvictTail;
     int mAddedSlotGeneration;
     int mSeenGidGeneration;
     bool mInitialized;
@@ -395,8 +408,21 @@ private:
     inline void moveToHead(int slot)
     {
         if (slot == mLruHead) return;
+        /* 被移头的是最尾可驱逐节点时需刷新缓存：读取原前驱须在摘链前。 */
+        const bool wasEvictTail = (slot == mEvictTail);
+        const int oldPrev = mLruPrev[slot];
         removeFromList(slot);
         insertToHead(slot);
+        if (wasEvictTail) { mEvictTail = prevEvictable(oldPrev); }
+    }
+
+    /* 自 from 起向链头方向回退，跳过 pinned 节点，返回首个可驱逐节点。
+     * 摊还分析：每个 pinned 节点相对候选序单调后移，至多被跳过 O(1) 次。 */
+    inline int prevEvictable(int from) const
+    {
+        int c = from;
+        while (c != -1 && mIsPinned[c]) { c = mLruPrev[c]; }
+        return c;
     }
 };
 

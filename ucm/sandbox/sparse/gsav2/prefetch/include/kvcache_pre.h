@@ -28,6 +28,7 @@
 #include <unordered_set>
 #include <vector>
 #include "kvcache_hbm_manger.h"
+#include "kvcache_hbm_manger_adapt.h"
 #include "kvcache_pre_detail.h"
 #include "kvcache_task_manger.h"
 #include "ucmstore_v1.h"
@@ -171,6 +172,14 @@ public:
     // set output
     void SetTopkIndices(std::string reqID, torch::Tensor& topIndices);
 
+    /* 配置 HBM 驱逐模式（Python 入口）：mode 1 = Decay（衰减驱逐 + Budget5120
+     * 分层窗口：indexer layer<=18 → 4096，19..62 → 5120，>=63 → 4096，clamp 到
+     * [topkSize, mSpaTopkLen]）；其他值 = Lru（默认，与原版逐字节一致）。
+     * 引擎级开关：对调用后 set_tokens_map 重建的所有管理器生效。 */
+    void SetHbmEvictMode(int mode);
+
+    int GetHbmEvictMode() const { return mHbmEvictMode; }
+
     void PreSwapTokens(std::vector<uintptr_t>& useTokenPtrs, std::vector<int32_t>& seqLens,
                        std::vector<std::vector<int>>& swapIndex,
                        std::vector<uintptr_t>& spaTokensPtr, std::vector<std::string>& reqIDs,
@@ -237,7 +246,14 @@ public:
     std::map<std::string, std::vector<int>> mReqUseBlockTable;
     std::map<std::string, int> mPromptLen;
     std::map<std::string, int> mSparseSeqLen;
-    std::map<std::string, std::vector<std::unique_ptr<HBMManager>>> mHBMMangers;
+    std::map<std::string, std::vector<std::unique_ptr<HBMManagerLayered>>> mHBMMangers;
+
+    /* HBM 驱逐模式（Python 经 set_hbm_evict_mode 配置，引擎级生效于后续
+     * set_tokens_map 重建的所有 (req,layer) 管理器）：
+     *   0 = Lru + Uniform：与原 HBMManager 行为逐字节一致（默认）
+     *   1 = Decay + Budget5120 分层窗口表（decay λ0.85 / steps20 / 不去重） */
+    int mHbmEvictMode = 0;
+    int mHbmWindowPlan = 0;
 
     // kv_load_info
     std::map<std::string, std::vector<std::vector<int>>> mMissGlobalToken;
@@ -417,8 +433,9 @@ public:
     void SyncIndexerSubmitState(std::vector<std::string>& reqIDList, std::vector<int>& seqLens);
     void SwapOneBsTokens(size_t bs, std::vector<uintptr_t>& useTokenPtrs,
                          std::vector<int32_t>& seqLens, std::vector<std::vector<int>>& swapIndex,
-                         std::vector<uintptr_t>& spaTokensPtr, int sparseLen, int spaMaxBs,
-                         int mtpToken, uint64_t& maxTokensUs, uint64_t& cpuCopyUs);
+                         std::vector<uintptr_t>& spaTokensPtr, const std::string& reqID,
+                         int sparseLen, int spaMaxBs, int mtpToken, uint64_t& maxTokensUs,
+                         uint64_t& cpuCopyUs);
 
     // 0923 开始
     // UCMTensorMerge
@@ -517,7 +534,7 @@ public:
                                std::vector<int>& useBlockTableScratch);
 
     // ProcessPrefetchRequest 分解辅助
-    HBMManager* FindReqLayerManager(const std::string& reqID, int layerID);
+    HBMManagerLayered* FindReqLayerManager(const std::string& reqID, int layerID);
     /* 校验单请求查找输入（topkLen/平坦读边界）。返回 1=就绪，0=topkLen 空
      *（软跳过，已清槽），-1=非法（已日志+清槽）。 */
     int AcquirePrefetchRequestState(const TaskInfo& taskInfo, const PrefetchTopkView& topkView,
@@ -557,9 +574,16 @@ public:
     void TransferAndScatterPrefetchLayer(ThreadInfo& threadInfo, int layerID, int streamIdx,
                                          PrefetchTiming& timing, PrefetchTimePoint syncEnd);
 
+    /* PreSwapTokens 分解辅助：逐层计算 swap 追加末尾边界。decay 模式取
+     * (req,layer) 管理器的分层窗口（如 sparseLen=5120、layer0 窗口 4096），
+     * Lru / 管理器未就绪时为整段 sparseLen（与原行为一致）。 */
+    void CollectLayerAppendEnds(const std::string& reqID, int sparseLen,
+                                std::vector<int>& appendEnds);
+
     void CopyPreSwapTokens(uintptr_t useTokenBase, uintptr_t spaTokenBase,
                            const std::vector<int>& swapRange, const std::vector<int>& needAppend,
-                           int sparseLen, int spaMaxBs, int mtpToken, int changeLen);
+                           int sparseLen, int spaMaxBs, int mtpToken, int changeLen,
+                           const std::vector<int>& appendEnds);
 
     bool SubmitIndexerInitLoadTask(UC::Detail::TaskDesc& task, const std::string& reqID,
                                    int layerID);
@@ -640,8 +664,8 @@ public:
                               int maxIdx, size_t sparseSeqLen);
 
     // ProcessTokensMapTopk 分解辅助
-    HBMManager* InitLayerManager(const std::string& reqID, int layerID, int maxIdx,
-                                 size_t sparseSeqLen, int topkSize);
+    HBMManagerLayered* InitLayerManager(const std::string& reqID, int layerID, int maxIdx,
+                                        size_t sparseSeqLen, int topkSize);
     int AcquireQTopkView(torch::Tensor& qTopkTensor, const std::string& reqID, int layerID,
                          PrefetchTopkView& topkView, int& qTopkNum, int& topkSize);
     int CopyUseBlockTableToIndicesTensor(const std::string& reqID, int layerID,

@@ -95,7 +95,7 @@ protected:
         const std::string reqID = "req1";
         engine->mHBMMangers[reqID].resize(engine->mTopkIndexerNum);
         for (int t = 0; t < engine->mTopkIndexerNum; ++t) {
-            engine->mHBMMangers[reqID][t] = std::make_unique<HBMManager>();
+            engine->mHBMMangers[reqID][t] = std::make_unique<HBMManagerLayered>();
             engine->mHBMMangers[reqID][t]->init(/*dramTensorCount=*/2,
                                                 /*hbmCapacity=*/32, /*hbmImmutableSize=*/32,
                                                 /*topkSize=*/2, engine->mLogger);

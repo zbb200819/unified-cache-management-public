@@ -62,6 +62,11 @@ public:
     bool lookupFails{false};
     bool waitFails{false};
     bool checkFails{false};
+    /* Check -> false (task still running) instead of true (finished). */
+    bool checkRunning{false};
+    /* Check / Wait -> NotFound (e.g. handle already consumed by Wait). */
+    bool checkNotFound{false};
+    bool waitNotFound{false};
     bool loadFails{false};
     bool loadOnTokenFails{false};
     bool dumpFails{false};
@@ -217,10 +222,15 @@ public:
         return UC::Detail::TaskHandle{r.handle};
     }
 
-    UC::Expected<bool> Check(UC::Detail::TaskHandle) override
+    UC::Expected<bool> Check(UC::Detail::TaskHandle handle) override
     {
+        std::lock_guard<std::mutex> lock(mu_);
+        CallRecord r{"Check"};
+        r.handle = handle;
+        calls.push_back(std::move(r));
+        if (checkNotFound) { return UC::Status::NotFound(); }
         if (checkFails) { return UC::Status::Error("check-failed-injected"); }
-        return true;
+        return !checkRunning;
     }
 
     UC::Status Wait(UC::Detail::TaskHandle handle) override
@@ -229,6 +239,7 @@ public:
         CallRecord r{"Wait"};
         r.handle = handle;
         calls.push_back(std::move(r));
+        if (waitNotFound) { return UC::Status::NotFound(); }
         if (waitFails) { return UC::Status::Error("wait-failed-injected"); }
         return UC::Status::OK();
     }

@@ -581,7 +581,7 @@ class TestStoreInjection:
         g.prefetch_engine.prefetch_engine_c.store_v1_ptr = 4096
         assert g._inject_store_v1(fakes.make_plain_connector(store_ptr=4096))
         assert g._store_injected is True
-        assert g.ucm_prefetch_engine.calls == [("store_init", 4096, g.layer_num)]
+        assert g.ucm_prefetch_engine.calls == [("store_init", 4096, g.layer_num, 4)]
 
     def test_inject_store_v1_verification_failure(self, gsa_worker):
         g = gsa_worker
@@ -2612,6 +2612,82 @@ class TestSchedulerSide:
         g.ucm_prefetch_engine.ucm_lookup = lambda ids: [False] * (len(ids) // 16)
         g._load_kv_dram("r1")  # 重试超限 → 记 error 并返回
         assert g.ucm_prefetch_engine.calls == []  # 未提交 ssd 加载
+
+    def test_load_kv_dram_stores_task_handle(self, gsa_worker, monkeypatch):
+        monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 64)
+        g = gsa_worker
+        md, stat = _prime_metadata(g)
+        stat.block_hashes = [b"a" * 16, b"b" * 16, b"c" * 16]
+        g.ucm_prefetch_engine.ucm_lookup = lambda ids: [True] * (len(ids) // 16)
+        g._load_kv_dram("r1")
+        assert g.ucm_task_id == {"r1": 1000}
+
+    def test_load_kv_dram_rejected_handle_not_stored(self, gsa_worker, monkeypatch):
+        """回归：ucm_load_ssd 返回负数错误码时不得入 ucm_task_id（否则
+        后续 ucm_check(负数) 在 uint64 绑定转换处抛 OverflowError）。"""
+        monkeypatch.setattr(gsa_mod, "SEG_PREFILL_THRESHOLD", 64)
+        g = gsa_worker
+        md, stat = _prime_metadata(g)
+        stat.block_hashes = [b"a" * 16, b"b" * 16, b"c" * 16]
+        g.ucm_prefetch_engine.ucm_lookup = lambda ids: [True] * (len(ids) // 16)
+        g.ucm_prefetch_engine.ucm_load_ssd = lambda ids: -50000
+        errors = []
+        monkeypatch.setattr(g.log, "error", lambda msg: errors.append(msg))
+        g._load_kv_dram("r1")
+        assert g.ucm_task_id == {}
+        assert errors and "ucm_load_ssd" in errors[0]
+
+
+# ===========================================================================
+# _check_and_wait：ucm SSD 任务轮询/收尾
+# ===========================================================================
+class TestCheckAndWait:
+    def test_finished_task_waited_and_removed(self, gsa_worker):
+        g = gsa_worker
+        g.ucm_task_id["r1"] = 1001
+        g._check_and_wait()
+        assert g.ucm_task_id == {}
+        assert ("ucm_check", 1001) in g.ucm_prefetch_engine.calls
+        assert ("ucm_wait", 1001) in g.ucm_prefetch_engine.calls
+
+    def test_running_task_kept(self, gsa_worker):
+        g = gsa_worker
+        g.ucm_prefetch_engine.check_results = [0]
+        g.ucm_task_id["r1"] = 1001
+        g._check_and_wait()
+        assert g.ucm_task_id == {"r1": 1001}
+        assert ("ucm_wait", 1001) not in g.ucm_prefetch_engine.calls
+
+    def test_check_error_removed_without_wait(self, gsa_worker, monkeypatch):
+        """回归：check 返回负数错误码是"真"但不是"完成"，不得走 wait。"""
+        g = gsa_worker
+        errors = []
+        monkeypatch.setattr(g.log, "error", lambda msg: errors.append(msg))
+        g.ucm_prefetch_engine.check_results = [-50005]
+        g.ucm_task_id["r1"] = 1001
+        g._check_and_wait()
+        assert g.ucm_task_id == {}
+        assert ("ucm_wait", 1001) not in g.ucm_prefetch_engine.calls
+        assert errors and "ucm_check" in errors[0]
+
+    def test_wait_failure_logged_and_removed(self, gsa_worker, monkeypatch):
+        """回归：wait 返回负数（加载失败）必须记日志，不能静默吞掉。"""
+        g = gsa_worker
+        errors = []
+        monkeypatch.setattr(g.log, "error", lambda msg: errors.append(msg))
+        g.ucm_prefetch_engine.wait_results = [-50003]
+        g.ucm_task_id["r1"] = 1001
+        g._check_and_wait()
+        assert g.ucm_task_id == {}
+        assert errors and "ucm_wait" in errors[0]
+
+    def test_multiple_finished_no_dict_mutation_error(self, gsa_worker):
+        """回归：修复前在 .items() 迭代中 del，首个任务完成即抛
+        RuntimeError: dictionary changed size during iteration。"""
+        g = gsa_worker
+        g.ucm_task_id = {"r1": 1001, "r2": 1002, "r3": 1003}
+        g._check_and_wait()
+        assert g.ucm_task_id == {}
 
 
 # ===========================================================================

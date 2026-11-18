@@ -509,7 +509,7 @@ int GSAPrefetchEngineC::AcquirePrefetchRequestState(const TaskInfo& taskInfo,
     return 1;
 }
 
-HBMManager* GSAPrefetchEngineC::FindReqLayerManager(const std::string& reqID, int layerID)
+HBMManagerLayered* GSAPrefetchEngineC::FindReqLayerManager(const std::string& reqID, int layerID)
 {
     /* find 判别：杜绝 map operator[] 在 OMP 失败路径上的并发插入竞态；
      * managers 与 miss/loadSlot 容器在 SetTokensMap 中同步扩容，命中即全部就绪。 */
@@ -529,7 +529,7 @@ bool GSAPrefetchEngineC::RunHbmTopkLookup(const std::string& oneReqID,
                                            std::vector<int>& missGlobalIds,
                                            std::vector<int>& loadSlots)
 {
-    HBMManager* manager = FindReqLayerManager(oneReqID, layerID);
+    HBMManagerLayered* manager = FindReqLayerManager(oneReqID, layerID);
     if (manager == nullptr) {
         mLogger.log(LogLevel::ERROR,
                     "Decode step: %u, |KVCache Prefetch| HBM manager is not initialized: "
@@ -1709,23 +1709,68 @@ void GSAPrefetchEngineC::SetTopkIndices(std::string reqID, torch::Tensor& topInd
                 reqID.c_str());
 }
 
+/* PreSwapTokens 分解辅助：逐层计算 swap 追加的末尾边界 appendEnds[layerID]。
+ * decay 模式取 (req,layer) 管理器的分层窗口（Budget5120 表 + clamp，如
+ * sparseLen=5120 时 layer0 → 4096）；Lru / 管理器未就绪 / 窗口越界时退化为
+ * 整段 sparseLen（与原行为一致）。find 判别与 FindReqLayerManager 同协议。 */
+void GSAPrefetchEngineC::CollectLayerAppendEnds(const std::string& reqID, int sparseLen,
+                                                std::vector<int>& appendEnds)
+{
+    appendEnds.assign(static_cast<size_t>(mTopkIndexerNum), sparseLen);
+    for (int layerID = 0; layerID < mTopkIndexerNum; ++layerID) {
+        HBMManagerLayered* manager = FindReqLayerManager(reqID, layerID);
+        if (manager == nullptr || !manager->isDecayMode()) { continue; }
+        int win = manager->getWindowSize();
+        win = std::min(std::max(win, 1), sparseLen);
+        appendEnds[static_cast<size_t>(layerID)] = win;
+    }
+}
+
+/* CopyPreSwapTokens 的追加边界（decay 分层窗口）：
+ *   Lru：appendEnd == sparseLen，整段拷贝 + 尾部追加，与原实现逐字节一致。
+ *   Decay：appendEnd == 该层窗口 W < sparseLen（如 sparseLen=5120、layer0
+ *     需要 4096 => W=4096）：
+ *     - 整段拷贝改为前对齐窗口拷贝 [0, W)，尾部 [W, sparseLen) 显式补 -1
+ *       padding（不依赖 use 缓冲区尾段内容，恒为 -1）；
+ *     - 最近 token 落在窗口末尾 [W-x, W)（x 为本次追加数），padding 不被
+ *       触碰；增量装不下时截尾保留最新 W 个 token。
+ * 追加计数 count = changeLen - mtpToken + 1 + index % mtpToken，写入偏移恒为
+ * appendEnd - count（与原公式 sparseLen - changeLen + mtpToken - 1 - index%mtpToken
+ * 代数等价，end 换成 appendEnd）。 */
 void GSAPrefetchEngineC::CopyPreSwapTokens(uintptr_t useTokenBase, uintptr_t spaTokenBase,
                                            const std::vector<int>& swapRange,
                                            const std::vector<int>& needAppend, int sparseLen,
-                                           int spaMaxBs, int mtpToken, int changeLen)
+                                           int spaMaxBs, int mtpToken, int changeLen,
+                                           const std::vector<int>& appendEnds)
 {
 #pragma omp parallel for num_threads(8) proc_bind(master)
     for (int layerID = 0; layerID < mTopkIndexerNum; layerID++) {
         void* usePtr =
             reinterpret_cast<void*>(useTokenBase + sparseLen * layerID * sizeof(int32_t));
+        const int appendEnd = (static_cast<size_t>(layerID) < appendEnds.size())
+                                  ? appendEnds[static_cast<size_t>(layerID)]
+                                  : sparseLen;
         for (int index = swapRange[0]; index < swapRange[1]; index++) {
-            void* spaCpuPtr = reinterpret_cast<void*>(
-                spaTokenBase + (size_t)(layerID * spaMaxBs + index) * sparseLen * sizeof(int32_t));
-            std::memcpy(spaCpuPtr, usePtr, sparseLen * sizeof(int32_t));
-            std::memcpy(reinterpret_cast<uint32_t*>(spaCpuPtr) + sparseLen - changeLen + mtpToken -
-                            1 - index % mtpToken,
-                        needAppend.data(),
-                        (changeLen - mtpToken + 1 + index % mtpToken) * sizeof(int));
+            int32_t* spaCpuPtr = reinterpret_cast<int32_t*>(spaTokenBase) +
+                                 (size_t)(layerID * spaMaxBs + index) * sparseLen;
+            if (appendEnd < sparseLen) {
+                std::memcpy(spaCpuPtr, usePtr, appendEnd * sizeof(int32_t));
+                std::fill(spaCpuPtr + appendEnd, spaCpuPtr + sparseLen, -1);
+            } else {
+                std::memcpy(spaCpuPtr, usePtr, sparseLen * sizeof(int32_t));
+            }
+            int count = changeLen - mtpToken + 1 + index % mtpToken;
+            const int32_t* src = needAppend.data();
+            if (count > appendEnd) {
+                mLogger.log(
+                    LogLevel::WARNING,
+                    "|KVCache Prefetch| PreSwapTokens append %d tokens exceeds layer %d "
+                    "window %d, keeping the newest %d\n",
+                    count, layerID, appendEnd, appendEnd);
+                src += count - appendEnd;
+                count = appendEnd;
+            }
+            std::memcpy(spaCpuPtr + appendEnd - count, src, count * sizeof(int));
         }
     }
 }
@@ -1752,8 +1797,8 @@ void GSAPrefetchEngineC::PreSwapTokens(std::vector<uintptr_t>& useTokenPtrs,
     uint64_t max_tokens_time = 0;
     uint64_t cpu_copy_time = 0;
     for (size_t bs = 0; bs < useTokenPtrs.size(); bs++) {
-        SwapOneBsTokens(bs, useTokenPtrs, seqLens, swapIndex, spaTokensPtr, sparseLen, spaMaxBs,
-                        mtpToken, max_tokens_time, cpu_copy_time);
+        SwapOneBsTokens(bs, useTokenPtrs, seqLens, swapIndex, spaTokensPtr, reqIDs[bs], sparseLen,
+                        spaMaxBs, mtpToken, max_tokens_time, cpu_copy_time);
     }
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -1767,9 +1812,9 @@ void GSAPrefetchEngineC::PreSwapTokens(std::vector<uintptr_t>& useTokenPtrs,
 void GSAPrefetchEngineC::SwapOneBsTokens(size_t bs, std::vector<uintptr_t>& useTokenPtrs,
                                          std::vector<int32_t>& seqLens,
                                          std::vector<std::vector<int>>& swapIndex,
-                                         std::vector<uintptr_t>& spaTokensPtr, int sparseLen,
-                                         int spaMaxBs, int mtpToken, uint64_t& maxTokensUs,
-                                         uint64_t& cpuCopyUs)
+                                         std::vector<uintptr_t>& spaTokensPtr,
+                                         const std::string& reqID, int sparseLen, int spaMaxBs,
+                                         int mtpToken, uint64_t& maxTokensUs, uint64_t& cpuCopyUs)
 {
     auto start_max = std::chrono::high_resolution_clock::now();
     const int32_t* data = reinterpret_cast<const int32_t*>(useTokenPtrs[bs]);
@@ -1793,8 +1838,11 @@ void GSAPrefetchEngineC::SwapOneBsTokens(size_t bs, std::vector<uintptr_t>& useT
     auto max_end = std::chrono::high_resolution_clock::now();
     maxTokensUs +=
         std::chrono::duration_cast<std::chrono::microseconds>(max_end - start_max).count();
+    /* decay 分层窗口：逐层追加边界（Lru 时全为 sparseLen，行为与原实现一致） */
+    std::vector<int> appendEnds;
+    CollectLayerAppendEnds(reqID, sparseLen, appendEnds);
     CopyPreSwapTokens(useTokenPtrs[bs], spaTokensPtr[0], swapIndex[bs], needAppend, sparseLen,
-                      spaMaxBs, mtpToken, change_len);
+                      spaMaxBs, mtpToken, change_len, appendEnds);
     auto cpu_end = std::chrono::high_resolution_clock::now();
     cpuCopyUs +=
         std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - max_end).count();

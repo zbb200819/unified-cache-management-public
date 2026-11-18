@@ -548,6 +548,7 @@ class GSA(UcmSparseBase):
         self._store_inject_max_retries = 5
         self._block_hash_injected_reqs = set()
         self.step_cost = 0
+        self.ucm_task_id = {}
 
     def _init_speculative_config(self, vllm_config: VllmConfig):
         self.num_spec_tokens = 1
@@ -901,6 +902,7 @@ class GSA(UcmSparseBase):
             return False
         self.prefetch_engine.prefetch_engine_c.set_store_v1(store_ptr)
         layout = getattr(connector, "kv_cache_layout", None)
+        tensor_count = (3 if self.enable_sparse_sfa_c8 else 4)
         if layout is not None:
             tensor_count = len(layout.tensor_size_list)
             if tensor_count > 0:
@@ -912,7 +914,7 @@ class GSA(UcmSparseBase):
                 )
         actual_store_ptr = self.prefetch_engine.prefetch_engine_c.get_store_v1_ptr()
         cpp_self_ptr = self.prefetch_engine.prefetch_engine_c.get_self_ptr()
-        self.ucm_prefetch_engine.store_init(store_ptr, self.layer_num)
+        self.ucm_prefetch_engine.store_init(store_ptr, self.layer_num, tensor_count)
         logger.info(
             "[GSA Store Inject] C++ verify cpp_self=%s, expected_store=%s, actual_store=%s",
             hex(cpp_self_ptr),
@@ -2483,6 +2485,8 @@ class GSA(UcmSparseBase):
             self._load_kv_dram(req_id)
         for new_req in scheduler_output.scheduled_new_reqs:
             self._load_kv_dram(new_req.req_id)
+        if not self.is_pd_mix:
+            self._check_and_wait()
         self.is_all_gsa = len(self.gsa_index) == len(req_ids)
         if len(self.decode_index) == len(req_ids):
             self.has_prefill = False
@@ -2677,6 +2681,26 @@ class GSA(UcmSparseBase):
         end = min(num_per_rank * (self.rank + 1), len(block_hashes))
         return block_hashes[start:end]
 
+    def _check_and_wait(self):
+        for req_id, task_id in list(self.ucm_task_id.items()):
+            status = self.ucm_prefetch_engine.ucm_check(task_id)
+            if status < 0:
+                self.log.error(
+                    f"[GSA] ERROR ucm_check for req_id {req_id}, "
+                    f"task {task_id}: {status}\n"
+                )
+                del self.ucm_task_id[req_id]
+                continue
+            if status != 1:
+                continue
+            ret = self.ucm_prefetch_engine.ucm_wait(task_id)
+            if ret != 0:
+                self.log.error(
+                    f"[GSA] ERROR ucm_wait for req_id {req_id}, "
+                    f"task {task_id}: {ret}\n"
+                )
+            del self.ucm_task_id[req_id]
+
     def _load_kv_dram(self, req_id):
         # PD 分离模式下，decode 节点在请求到达时按 rank 分片做 UCM lookup，
         # 命中部分提交 DRAM 加载任务；PD 混合模式无需此路径。
@@ -2713,7 +2737,13 @@ class GSA(UcmSparseBase):
                 f"{(time.perf_counter() - start) * 1_000_000}\n"
             )
             start = time.perf_counter()
-        _ = self.ucm_prefetch_engine.ucm_load_ssd(ids)
+        task_id = self.ucm_prefetch_engine.ucm_load_ssd(ids)
+        if task_id <= 0:
+            self.log.error(
+                f"[GSA] ERROR ucm_load_ssd rejected for req_id {req_id}: {task_id}\n"
+            )
+            return
+        self.ucm_task_id[req_id] = task_id
         if IS_PERFORMANCE_LOG:
             self.log.info(
                 f"[GSA] submit load task for req_id {req_id}: "
