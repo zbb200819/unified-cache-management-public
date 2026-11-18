@@ -43,27 +43,11 @@ ENABLE_SPARSE = os.getenv("ENABLE_SPARSE", "0").lower() in (
 ENABLE_UCM_PATCH = os.environ.get("ENABLE_UCM_PATCH", "").lower() in ("1", "true")
 # B-5 整改：GSA 补丁全部嵌套在 apply_all_patches 的 UCM 补丁流程内，依赖 UCM
 # 底座；ENABLE_UCM_PATCH=0 时强制不开启 GSA_PATCH（原先该组合静默无补丁无日志）。
-GSA_PATCH_REQUESTED = os.environ.get("ENABLE_GSA_PATCH", "").lower() in ("1", "true")
-ENABLE_GSA_PATCH = ENABLE_UCM_PATCH and GSA_PATCH_REQUESTED
+ENABLE_GSA_PATCH = os.environ.get("ENABLE_GSA_PATCH", "").lower() in ("1", "true")
 
 
 def _preflight_gsa_cust_opapi() -> bool:
     """预检 libcust_opapi.so 提供 GSA aclnn 符号（部署问题前移到启动期）。
-
-    ``torch.ops._C_gsa.npu_kv_quant_sparse_flash_attention_gsa`` 的
-    EXEC_NPU_CMD 用 static 惰性初始化，在首次调用算子时才
-    dlopen("libcust_opapi.so")，找不到符号时回退内置 libopapi.so 后报
-    "aclnnKvQuantSparseFlashAttentionGsa ... not in libopapi.so"——晚到
-    第一个 decode step 才爆，且信息误导：真正缺的是 GSA-custom_ops 安装到
-    opp/vendors/gsa/op_api/lib 的 libcust_opapi.so（或被 LD_LIBRARY_PATH
-    靠前的其他 vendor 同名库遮蔽）。
-
-    参照 gsa_on_device（import ucm_custom_ops 早期显式化、失败即报）的模式，
-    此处用 ctypes 复现 C++ 侧同一 dlopen 搜索路径并检查符号，把失败提前到
-    补丁应用期并给出可执行的修复指引。
-
-    注意：进程内修改 os.environ["LD_LIBRARY_PATH"] 不影响 dlopen（ld.so 在
-    进程启动时已缓存搜索路径），故只能报错指引、无法自愈；修复后必须重启服务。
     """
     import ctypes
 
@@ -104,18 +88,6 @@ def _preflight_gsa_cust_opapi() -> bool:
 
 def _ensure_gsa_ops_loaded() -> None:
     """加载 gsa_ops C++ 扩展，注册 torch.ops._C_gsa 命名空间。
-
-    GSA 运行时算子（gsa_gather_copy / gsa_scatter_copy / indexer_gather_qw /
-    gsa_topk_expand_tmp / npu_kv_quant_sparse_flash_attention_gsa）由
-    ``ucm/sandbox/sparse/gsav2/ops/torch_binding.cpp`` 通过
-    ``TORCH_LIBRARY_EXPAND(CONCAT(_C, _gsa), ops)`` 注册到 ``torch.ops._C_gsa``。
-    该注册由 ``import gsa_ops`` 触发的 ``PyInit_gsa_ops`` 静态初始化器完成
-    （见 torch_binding.cpp:241 ``REGISTER_EXTENSION(gsa_ops)``）。
-
-    与旧方案（build-time patch 编译进 vllm-ascend csrc、随 vllm-ascend 启动
-    自动注册到 ``torch.ops._C_ascend``）不同，新方案是独立 wheel，必须在
-    GSA patch 应用前显式 import。此处仅当 ENABLE_GSA_PATCH 时调用，避免无
-    NPU/C++ 扩展的环境（UT、CPU CI）因 import 失败而阻塞。
     """
     if not ENABLE_GSA_PATCH:
         return
@@ -243,17 +215,6 @@ def apply_all_patches() -> None:
         from ucm.integration.vllm.patch.logger_patch import patch_logger
 
         if not ENABLE_UCM_PATCH:
-            if GSA_PATCH_REQUESTED:
-                logger.warning(
-                    "ENABLE_UCM_PATCH is not set: no vLLM/vllm-ascend patches "
-                    "will be applied; ENABLE_GSA_PATCH=1 is ignored because "
-                    "GSA patches are nested inside the UCM patch flow."
-                )
-            else:
-                logger.info(
-                    "ENABLE_UCM_PATCH is not set: no vLLM/vllm-ascend patches "
-                    "will be applied."
-                )
             return
 
         version = get_vllm_version()
@@ -324,14 +285,14 @@ def apply_all_patches() -> None:
                     _ensure_gsa_ops_loaded()
                     logger.info("UCM patching vllm 0.23.0 for GSA sparse attention...")
 
-                    import ucm.sandbox.sparse.gsav2.patch.vllm.block_table_patch
-                    import ucm.sandbox.sparse.gsav2.patch.vllm.engine_core_patch
-                    import ucm.sandbox.sparse.gsav2.patch.vllm.gpu_model_runner_patch
-                    import ucm.sandbox.sparse.gsav2.patch.vllm.gpu_worker_patch
-                    import ucm.sandbox.sparse.gsav2.patch.vllm.kv_cache_manager_patch
-                    import ucm.sandbox.sparse.gsav2.patch.vllm.mla_attention_patch
-                    import ucm.sandbox.sparse.gsav2.patch.vllm.sched_output_patch
-                    import ucm.sandbox.sparse.gsav2.patch.vllm.scheduler_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.block_table_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.engine_core_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.gpu_model_runner_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.gpu_worker_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.kv_cache_manager_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.mla_attention_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.sched_output_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm.scheduler_patch
                 else:
                     logger.info(
                         "UCM GSA vllm patches skipped (ENABLE_GSA_PATCH is not set)."
@@ -428,12 +389,12 @@ def apply_all_patches() -> None:
                     # gsa_ops wheel (ucm/sandbox/sparse/gsav2/ops) and loaded
                     # by _ensure_gsa_ops_loaded() above into torch.ops._C_gsa;
                     # no build-time patch is required anymore.
-                    import ucm.sandbox.sparse.gsav2.patch.vllm_ascend.block_table_patch
-                    import ucm.sandbox.sparse.gsav2.patch.vllm_ascend.device_op_patch
-                    import ucm.sandbox.sparse.gsav2.patch.vllm_ascend.model_runner_v1_patch
-                    import ucm.sandbox.sparse.gsav2.patch.vllm_ascend.sfa_kv_transfer_patch
-                    import ucm.sandbox.sparse.gsav2.patch.vllm_ascend.sfa_v1_patch
-                    import ucm.sandbox.sparse.gsav2.patch.vllm_ascend.worker_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.block_table_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.device_op_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.model_runner_v1_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.sfa_kv_transfer_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.sfa_v1_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.worker_patch
                 else:
                     # Plain SFA KV-transfer forward (no GSA hooks).
                     logger.info(
