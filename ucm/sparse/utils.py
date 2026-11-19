@@ -1,7 +1,9 @@
 import ctypes
 import math
 import os
+import re
 import sys
+import time
 from multiprocessing import shared_memory
 
 import torch
@@ -225,14 +227,127 @@ def align_to_256bytes(extent: int, dtype: torch.dtype) -> int:
     return round_up(extent, eles_per_256bytes)
 
 
-def rm_shared_memory(dp_rank):
-    """Clean up the shared memory segments created by GSA for a given DP rank."""
+GSA_SHM_UNIQUE_ID_MAX_LEN = 64
+
+GSA_SHM_BASE_NAMES = (
+    "gsa_glm52_slots_num",
+    "gsa_glm52_slot",
+    "indexer_glm52_slot",
+    "prefetch_glm52_status",
+    "gsa_kv_pack_control",
+    "gsa_prefetch_result",
+)
+
+# name：[ucm_gsa_<engine_id>_]<base>_dp<dp_rank>
+_GSA_SHM_NAME_RE = re.compile(
+    r"^(ucm_gsa_[A-Za-z0-9_.\-]+_)?(" + "|".join(GSA_SHM_BASE_NAMES) + r")_dp(\d+)$"
+)
+
+GSA_SHM_STALE_RACE_GUARD_S = 60.0
+
+
+def get_shm_prefix(engine_id) -> str:
+    """Return the 'ucm_gsa_<engine_id>_' prefix for GSA shared-memory names.
+
+    ``engine_id`` comes from ``vllm_config.kv_transfer_config.engine_id`` — the
+    same identifier UCM stores use as their ``unique_id``. Returns '' when it
+    is missing so single-service deployments keep the legacy names.
+    """
+    if not engine_id:
+        return ""
+    unique_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(engine_id))
+    unique_id = unique_id[:GSA_SHM_UNIQUE_ID_MAX_LEN]
+    return f"ucm_gsa_{unique_id}_"
+
+
+def _collect_live_shm_names(proc_dir: str = "/proc") -> set:
+    names = set()
+    try:
+        pids = os.listdir(proc_dir)
+    except OSError:
+        return names
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc_dir, pid, "maps")) as maps_file:
+                for line in maps_file:
+                    parts = line.split(None, 5)
+                    if len(parts) != 6 or not parts[5].startswith("/dev/shm/"):
+                        continue
+                    name = parts[5][len("/dev/shm/") :]
+                    if name.endswith(" (deleted)"):
+                        name = name[: -len(" (deleted)")]
+                    names.add(name)
+        except OSError:
+            continue
+    return names
+
+
+def _cleanup_stale_gsa_shm(
+    current_prefix: str,
+    *,
+    shm_dir: str = "/dev/shm",
+    proc_dir: str = "/proc",
+    live_names=None,
+    now=None,
+    euid=None,
+    _listdir=os.listdir,
+    _stat=os.stat,
+    _remove=os.remove,
+) -> None:
+    if not os.path.isdir(shm_dir):
+        return
+    if live_names is None:
+        if not os.path.isdir(proc_dir):
+            return
+        live_names = _collect_live_shm_names(proc_dir)
+    if now is None:
+        now = time.time()
+    if euid is None:
+        geteuid = getattr(os, "geteuid", None)
+        euid = geteuid() if geteuid is not None else -1
+    try:
+        entries = _listdir(shm_dir)
+    except OSError as e:
+        logger.warning("Failed to list %s for stale GSA shm cleanup: %s", shm_dir, e)
+        return
+    for name in entries:
+        match = _GSA_SHM_NAME_RE.match(name)
+        if match is None:
+            continue
+        prefix = match.group(1) or ""
+        if prefix == current_prefix:
+            continue
+        path = os.path.join(shm_dir, name)
+        try:
+            stat_result = _stat(path)
+        except OSError:
+            continue
+        if stat_result.st_uid != euid:
+            continue
+        if now - stat_result.st_mtime <= GSA_SHM_STALE_RACE_GUARD_S:
+            continue
+        if name in live_names:
+            continue
+        try:
+            _remove(path)
+            logger.info("Cleaned stale GSA shared memory: %s", name)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning("Failed to clean stale GSA shared memory '%s': %s", name, e)
+
+
+def rm_shared_memory(dp_rank, engine_id=None):
+    prefix = get_shm_prefix(engine_id)
     shm_names = [
-        f"gsa_glm52_slot_dp{dp_rank}",
-        f"indexer_glm52_slot_dp{dp_rank}",
-        f"gsa_glm52_slots_num_dp{dp_rank}",
-        f"prefetch_glm52_status_dp{dp_rank}",
-        f"gsa_kv_pack_control_dp{dp_rank}",
+        f"{prefix}gsa_glm52_slot_dp{dp_rank}",
+        f"{prefix}indexer_glm52_slot_dp{dp_rank}",
+        f"{prefix}gsa_glm52_slots_num_dp{dp_rank}",
+        f"{prefix}prefetch_glm52_status_dp{dp_rank}",
+        f"{prefix}gsa_kv_pack_control_dp{dp_rank}",
+        f"{prefix}gsa_prefetch_result_dp{dp_rank}",
     ]
     for name in shm_names:
         try:
@@ -253,9 +368,10 @@ def rm_shared_memory(dp_rank):
         except Exception as e:  # noqa: BLE001
             logger.error("Failed to clean shared memory '%s': %s", name, e)
 
+    _cleanup_stale_gsa_shm(prefix)
+
 
 def bind_thread_memory_policy(node_id: int):
-    """使用 libnuma 设置当前线程后续分配内存的 NUMA 策略"""
     libnuma = ctypes.CDLL("libnuma.so.1")
 
     libnuma.numa_allocate_nodemask.restype = ctypes.c_void_p
@@ -268,4 +384,4 @@ def bind_thread_memory_policy(node_id: int):
     libnuma.numa_set_membind(mask)
     libnuma.numa_bitmask_free(mask)
 
-    print(f"✅ 当前线程内存分配策略已成功绑定至 NUMA Node {node_id}")
+    print(f"✅ Success bind to NUMA Node {node_id}")

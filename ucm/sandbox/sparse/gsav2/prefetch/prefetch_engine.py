@@ -22,6 +22,7 @@ from ucm.sparse.utils import (
     SPA_TOKENS_LEN,
     STREAM_NUM,
     align_to_256bytes,
+    get_shm_prefix,
 )
 
 
@@ -66,6 +67,13 @@ class GSAPrefetchBase:
         self.head_size = vllm_config.model_config.get_head_size()
         self.num_head = vllm_config.model_config.get_num_kv_heads(
             vllm_config.parallel_config
+        )
+        # 服务级共享内存前缀
+        kv_transfer_config = vllm_config.kv_transfer_config
+        self.shm_prefix = get_shm_prefix(
+            getattr(kv_transfer_config, "engine_id", None)
+            if kv_transfer_config is not None
+            else None
         )
         self.step_time = 0
         self.select_bs_index = None
@@ -116,6 +124,7 @@ class GSAPrefetchBase:
                 "./gsa_log/GLM/KVpre",
                 f"kvcache_pre_log_dp{self.dp_rank}_tp{self.rank}.log",
             ),
+            self.shm_prefix,
         )
         self._slab_host_k_ptr = []
         self._slab_host_v_ptr = []

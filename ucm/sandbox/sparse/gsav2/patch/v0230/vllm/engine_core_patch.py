@@ -34,7 +34,15 @@ def __init__(
         )
 
     if IS_OPEN_GSA:
-        rm_shared_memory(vllm_config.parallel_config.data_parallel_rank)
+        kv_transfer_config = vllm_config.kv_transfer_config
+        rm_shared_memory(
+            vllm_config.parallel_config.data_parallel_rank,
+            (
+                getattr(kv_transfer_config, "engine_id", None)
+                if kv_transfer_config is not None
+                else None
+            ),
+        )
 
     self.log_stats = log_stats
 

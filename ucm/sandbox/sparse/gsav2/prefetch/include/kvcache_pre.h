@@ -101,7 +101,8 @@ public:
 
     GSAPrefetchEngineC(std::vector<int>& modelInfo, std::vector<int>& sizeinfo, bool isLog,
                        int rank, int threadNum, std::vector<int> cpuToBind,
-                       std::vector<int> topkLayerMap, std::string logFileName);
+                       std::vector<int> topkLayerMap, std::string logFileName,
+                       const std::string& shmPrefix = "");
 
     // Initialize/Update HBM manager mapping
     // Hash map setup
@@ -265,6 +266,8 @@ public:
     std::atomic<uint32_t> mPrefetchResultVersion;
     bool mIsPrefetchResultShmCreator;
     std::string mPrefetchResultShmName;
+    // 服务级共享内存名前缀（源自 kv_transfer_config.engine_id
+    std::string mShmPrefix;
     SharedKVPackHeader* mKVPackControl{nullptr};
     size_t mKVPackControlSize{0};
     std::string mKVPackControlName;

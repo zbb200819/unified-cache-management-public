@@ -122,7 +122,11 @@ void registerPrefetchEngine(pybind11::module_& m)
 {
     pybind11::class_<ucmprefetch::GSAPrefetchEngineC>(m, "GSAPrefetchEngineC")
         .def(pybind11::init<std::vector<int>&, std::vector<int>&, bool, int, int, std::vector<int>,
-                            std::vector<int>, std::string>())
+                            std::vector<int>, std::string, const std::string&>(),
+             pybind11::arg("model_info"), pybind11::arg("size_info"), pybind11::arg("is_log"),
+             pybind11::arg("rank"), pybind11::arg("thread_num"),
+             pybind11::arg("cpu_to_bind"), pybind11::arg("topk_layer_map"),
+             pybind11::arg("log_file"), pybind11::arg("shm_prefix") = "")
         // NOTE: get_self_ptr / set_store_v1 pass raw pointers across the Python
         // boundary as uintptr_t: the engine and the UCM store MUST outlive every
         // Python-side use (else use-after-free); owning wrapper is the long-term fix.

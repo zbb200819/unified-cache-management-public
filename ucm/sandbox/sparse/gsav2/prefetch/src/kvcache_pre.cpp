@@ -99,7 +99,7 @@ int GSAPrefetchEngineC::InitKVPackControl(int dpRank)
     const size_t controlBytes = sizeof(SharedKVPackHeader) + stateCount * sizeof(KVPackRankState);
     const size_t bytes = controlBytes + streamCount * (kBytes + vBytes);
 
-    mKVPackControlName = "/gsa_kv_pack_control_dp" + std::to_string(dpRank);
+    mKVPackControlName = "/" + mShmPrefix + "gsa_kv_pack_control_dp" + std::to_string(dpRank);
     mKVPackPreviousEpoch.assign(streamCount, 0);
     mSharedKBufferHostPtr.resize(streamCount);
     if (!mISSPAC8) { mSharedVBufferHostPtr.resize(streamCount); }
@@ -344,8 +344,8 @@ constexpr size_t ToIndex(T value)
 GSAPrefetchEngineC::GSAPrefetchEngineC(std::vector<int>& modelInfo, std::vector<int>& sizeinfo,
                                        bool isLog, int rank, int threadNum,
                                        std::vector<int> cpuToBind, std::vector<int> topkLayerMap,
-                                       std::string logFileName)
-    : mLogger(logFileName, LogLevel::INFO, isLog)
+                                       std::string logFileName, const std::string& shmPrefix)
+    : mLogger(logFileName, LogLevel::INFO, isLog), mShmPrefix(shmPrefix)
 {
     /* UReqLock 埋点 dump 门控：UCM_PREFETCH_LOCK_PROFILE 未设/0=关；
      * 1=每 100 步 dump；N(>1)=每 N 步 dump。计数本身常开（见
@@ -581,7 +581,8 @@ void GSAPrefetchEngineC::InitPrefetchResultShm(std::vector<int>& modelInfo)
     mPrefetchResultShmSize = 0;
     mPrefetchResultVersion = 0;
     mPrefetchResultShmName =
-        "gsa_prefetch_result_dp" + std::to_string(modelInfo[ToIndex(ModelInfoIndex::DpRank)]);
+        mShmPrefix + "gsa_prefetch_result_dp" +
+        std::to_string(modelInfo[ToIndex(ModelInfoIndex::DpRank)]);
 
     const uint32_t versionSize = 4;
     const uint32_t countSize = 4;

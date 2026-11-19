@@ -88,6 +88,7 @@ from ucm.sparse.utils import (
     DSAInputStruct,
     TopkIndices,
     bind_thread_memory_policy,
+    get_shm_prefix,
     init_indexer_layer_map,
 )
 
@@ -494,6 +495,12 @@ class GSAV2(UcmSparseBase):
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.is_decode_node = vllm_config.kv_transfer_config.is_kv_consumer
+        # 服务级共享内存前缀
+        self.shm_prefix = get_shm_prefix(
+            getattr(vllm_config.kv_transfer_config, "engine_id", None)
+        )
+        if self.shm_prefix:
+            logger.info("GSA shared memory prefix: %s", self.shm_prefix)
 
     def _init_sparse_c8_config(self, vllm_config: VllmConfig):
         additional_config = (
@@ -558,11 +565,11 @@ class GSAV2(UcmSparseBase):
     def _init_slots_num_manager(self, role: UcmSparseRole):
         if role == UcmSparseRole.SCHEDULER and IS_OPEN_GSA and self.is_decode_node:
             self.slots_num_manager = SharedTensorManager(
-                "gsa_glm52_slots_num_dp" + str(self.dp_rank), False
+                self.shm_prefix + "gsa_glm52_slots_num_dp" + str(self.dp_rank), False
             )
         elif self.rank == 0 and self.is_decode_node:
             self.slots_num_manager = SharedTensorManager(
-                "gsa_glm52_slots_num_dp" + str(self.dp_rank),
+                self.shm_prefix + "gsa_glm52_slots_num_dp" + str(self.dp_rank),
                 True,
                 self.indexer_sparse_num_all,
                 self.num_slots,
@@ -572,13 +579,13 @@ class GSAV2(UcmSparseBase):
         if self.rank == 0:
             if IS_INDEXER_OFFLOAD:
                 self.block_table_sm = SharedBlockTable(
-                    "gsa_glm52_slot_dp" + str(self.dp_rank), True
+                    self.shm_prefix + "gsa_glm52_slot_dp" + str(self.dp_rank), True
                 )
             self.indexer_block_table_sm = SharedBlockTable(
-                "indexer_glm52_slot_dp" + str(self.dp_rank), True
+                self.shm_prefix + "indexer_glm52_slot_dp" + str(self.dp_rank), True
             )
             self.prefetch_status_sm = SharedTensorVersion(
-                "prefetch_glm52_status_dp" + str(self.dp_rank),
+                self.shm_prefix + "prefetch_glm52_status_dp" + str(self.dp_rank),
                 self.rank,
                 self.tp_size,
                 True,
@@ -586,13 +593,13 @@ class GSAV2(UcmSparseBase):
         else:
             if IS_INDEXER_OFFLOAD:
                 self.block_table_sm = SharedBlockTable(
-                    "gsa_glm52_slot_dp" + str(self.dp_rank), False
+                    self.shm_prefix + "gsa_glm52_slot_dp" + str(self.dp_rank), False
                 )
             self.indexer_block_table_sm = SharedBlockTable(
-                "indexer_glm52_slot_dp" + str(self.dp_rank), False
+                self.shm_prefix + "indexer_glm52_slot_dp" + str(self.dp_rank), False
             )
             self.prefetch_status_sm = SharedTensorVersion(
-                "prefetch_glm52_status_dp" + str(self.dp_rank),
+                self.shm_prefix + "prefetch_glm52_status_dp" + str(self.dp_rank),
                 self.rank,
                 self.tp_size,
                 False,

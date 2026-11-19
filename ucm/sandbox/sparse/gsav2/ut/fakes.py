@@ -72,9 +72,10 @@ class FakeDeviceConfig:
 class FakeKVTransferConfig:
     """默认为 PD 分离 decode 节点：仅 consumer"""
 
-    def __init__(self, consumer=True, producer=False):
+    def __init__(self, consumer=True, producer=False, engine_id="ut-engine"):
         self.is_kv_consumer = consumer
         self.is_kv_producer = producer
+        self.engine_id = engine_id
 
 
 class FakeSpeculativeConfig:
