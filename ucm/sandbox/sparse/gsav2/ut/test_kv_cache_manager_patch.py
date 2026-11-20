@@ -32,8 +32,8 @@ sys.modules.setdefault("ucm.integration.vllm.patch.utils", _UTILS)
 _MOD_PATH = (
     Path(__file__).resolve().parents[1]
     / "patch"
-    / "vllm"
     / "v0230"
+    / "vllm"
     / "kv_cache_manager_patch.py"
 )
 

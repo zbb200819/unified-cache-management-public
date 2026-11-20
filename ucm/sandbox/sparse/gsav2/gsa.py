@@ -514,14 +514,29 @@ class GSAV2(UcmSparseBase):
         self.enable_sparse_sfa_c8 = bool(
             additional_config.get("enable_sparse_sfa_c8", False)
         )
+        is_a5 = get_ascend_device_type() == AscendDeviceType.A5
         if not self.enable_sparse_sfa_c8:
             self.dtype = vllm_config.model_config.dtype
-        elif get_ascend_device_type() == AscendDeviceType.A5:
+        elif is_a5:
             self.dtype = torch.float8_e4m3fn
             self.c8_k_scale_cache_dtype = torch.float32
         else:
             self.dtype = torch.int8
             self.c8_k_scale_cache_dtype = torch.float16
+        # indexer(li) c8 cache dtype：与 vllm-ascend sfa_impl.c8_k_cache_dtype
+        # 对齐（A5=fp8+fp32 scale，A2/A3=int8+fp16 scale）。独立于 sfa_c8 开关：
+        # li_c8 开而 sfa_c8 关时 self.dtype 仍是模型 dtype，而 indexer cache /
+        # q_li 已是量化 dtype。li_c8 关闭时回落模型 dtype。
+        if self.enable_sparse_li_c8:
+            if is_a5:
+                self.li_c8_k_dtype = torch.float8_e4m3fn
+                self.li_c8_scale_dtype = torch.float32
+            else:
+                self.li_c8_k_dtype = torch.int8
+                self.li_c8_scale_dtype = torch.float16
+        else:
+            self.li_c8_k_dtype = self.indexer_dtype
+            self.li_c8_scale_dtype = None
 
     def _init_runtime_state(self):
         self.gsa_metadata = None
@@ -692,15 +707,16 @@ class GSAV2(UcmSparseBase):
 
     def _init_c8_dump_tmps(self):
         block_num = math.ceil(self.max_model_len / self.block_size)
+        # dtype 跟随 indexer(li) c8 cache：A5=fp8+fp32 scale，A2/A3=int8+fp16
         self.indexer_pc_dump_tmp_c8 = torch.empty(
             (block_num, self.block_size, 1, 128),
-            dtype=torch.int8,
+            dtype=self.li_c8_k_dtype,
             device=self.device,
             pin_memory=False,
         )
         self.indexer_pc_dump_scale_tmp = torch.empty(
             (block_num, self.block_size, 1, 1),
-            dtype=torch.float16,
+            dtype=self.li_c8_scale_dtype,
             device=self.device,
             pin_memory=False,
         )
@@ -826,11 +842,14 @@ class GSAV2(UcmSparseBase):
         self.gsa_swap_topk_bs = self.gsa_swap_topk.cpu.shape[1]
 
     def _init_gsa_indexer_buffers(self, max_graph_bs: int):
+        # indexer_last_query 存 li_c8 量化后的 q_li（aclnnGather 要求 src/dst
+        # 同 dtype）；indexer_last_weight 存模型 dtype 的 weights（sfa_v1_patch
+        # 中 weights = kw[:, head_dim:] 恒为模型 dtype，不随 li_c8 量化）。
         self.indexer_last_query = TopkIndices(  # 78 * bs * 32 * 128 * 2
-            (self.layer_num, max_graph_bs, 32, 128), self.device, self.dtype
+            (self.layer_num, max_graph_bs, 32, 128), self.device, self.li_c8_k_dtype
         )
         self.indexer_last_weight = TopkIndices(  # 78 * bs * 32 * 2
-            (self.layer_num, max_graph_bs, 32), self.device, self.dtype
+            (self.layer_num, max_graph_bs, 32), self.device, self.indexer_dtype
         )
         self.indexer_last_q_index = DSAInputStruct(
             (max_graph_bs), self.device, torch.int64
@@ -2036,11 +2055,15 @@ class GSAV2(UcmSparseBase):
         if not req_meta.is_last_chunk():
             return
         for layer_id in range(self.layer_num):
+            # fp8 输入上 torch.mean 不可用（A5 li_c8 cache 为 fp8），先 cast
+            # fp32 再求均值；结果回落 cache dtype 存储。对 int8/bf16 无损。
             self.indexer_k_repr[layer_id][req_meta.slab_host_slot] = torch.mean(
-                self.indexer_k_cache_sparse[layer_id][req_meta.indexer_slab_host_slot],
+                self.indexer_k_cache_sparse[layer_id][
+                    req_meta.indexer_slab_host_slot
+                ].to(torch.float32),
                 dim=1,
                 keepdim=True,
-            )
+            ).to(self.li_c8_k_dtype)
         if self.rank == 0:
             self.indexer_cpu_shared_pool.free(req_meta.indexer_slab_host_slot)
             req_meta.indexer_slab_host_slot = self.indexer_cpu_shared_pool.allocate(
@@ -2122,10 +2145,16 @@ class GSAV2(UcmSparseBase):
             index_list = list(range(len(self.need_indexer_sparse_bs)))
 
         indexer_key_repr = self.indexer_k_repr  # layer, t_b_n, 1, 1, 128
-        indexer_q = self.indexer_last_query.npu[:, index_list]  # layer, bs, 64, 128
-        indexer_w = self.indexer_last_weight.npu[:, index_list]  # layer, bs, 64
-        curr_key_repr = indexer_key_repr[:, self.repre_slot_mappings.flatten()].view(
-            self.layer_num, bs, -1, hidden_size
+        # fp8 上 einsum/relu/topk 均不可用（A5 li_c8 buffer 为 fp8），打分路径
+        # 统一 cast fp32；int8/bf16 数值无损（int8 点积和 < 2^24，fp32 精确）。
+        indexer_q = self.indexer_last_query.npu[:, index_list].to(torch.float32)
+        # layer, bs, 64, 128
+        indexer_w = self.indexer_last_weight.npu[:, index_list].to(torch.float32)
+        # layer, bs, 64
+        curr_key_repr = (
+            indexer_key_repr[:, self.repre_slot_mappings.flatten()]
+            .view(self.layer_num, bs, -1, hidden_size)
+            .to(torch.float32)
         )  # layer, bs, max_blk_num, 128
         indexer_q_k = torch.einsum(
             "lbik,lbjk->lbij", indexer_q, curr_key_repr
@@ -2804,9 +2833,11 @@ class GSAV2(UcmSparseBase):
                 1,
                 128,
             )
+            # dtype 跟随 indexer(li) c8 cache（_copy_preempt_kv_blocks 直接
+            # copy_，要求与 indexer_k_cache_sparse 同 dtype）
             self.indexer_cache_preempt = torch.empty(
                 indexer_k_shape,
-                dtype=self.dtype,
+                dtype=self.li_c8_k_dtype,
                 device=torch.device("cpu"),
                 pin_memory=True,
             )
@@ -2822,7 +2853,7 @@ class GSAV2(UcmSparseBase):
             indexer_k_repr_shape = (self.layer_num, self.num_blocks, 1, 1, 128)
             self.indexer_k_repr = torch.empty(
                 indexer_k_repr_shape,
-                dtype=self.dtype,
+                dtype=self.li_c8_k_dtype,
                 device=self.device,
                 pin_memory=False,
             )

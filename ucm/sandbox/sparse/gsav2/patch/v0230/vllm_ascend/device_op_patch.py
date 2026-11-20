@@ -206,11 +206,14 @@ def execute_kv_quant_sparse_flash_attention(
     return_lse: bool = False,
     actual_sparse_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """A3 (BaseDeviceAdaptor) C8 sparse attention via torch.ops._C_gsa.
+    """C8 sparse attention via torch.ops._C_gsa (Base on A3, A5DeviceAdaptor on A5).
 
     Replaces ``BaseDeviceAdaptor.execute_kv_quant_sparse_flash_attention``
     (vllm-ascend device_op.py) which calls
-    ``torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention``. The GSA op
+    ``torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention``, and also
+    ``A5DeviceAdaptor.execute_kv_quant_sparse_flash_attention`` which calls
+    ``torch_npu.npu_kv_quant_sparse_flash_attention`` without
+    ``actual_sparse_lengths`` and raises on ``return_lse=True``. The GSA op
     (``torch.ops._C_gsa.npu_kv_quant_sparse_flash_attention_gsa``, registered
     in ops/torch_binding.cpp) is the same aclnn-backed kernel but lives in the
     standalone gsa_ops wheel so it no longer depends on the build-time
@@ -450,3 +453,33 @@ def _patch(mod):
         _patched.__kwdefaults__ = indexer_select_post_process_a5.__kwdefaults__
         patch_or_inject(mod.A5DeviceAdaptor, "indexer_select_post_process", _patched)
         logger.info("UCM GSA A5DeviceAdaptor.indexer_select_post_process patch applied")
+
+    if hasattr(mod.A5DeviceAdaptor, "execute_kv_quant_sparse_flash_attention"):
+        # A5 overrides the Base method with a torch_npu-based implementation
+        # that (a) has no ``actual_sparse_lengths`` kwarg (TypeError once the
+        # patched ``execute_sparse_flash_attention_process`` passes it) and
+        # (b) raises RuntimeError on ``return_lse=True``. Route it through the
+        # same torch.ops._C_gsa kernel as Base: the call surface is identical
+        # (scales live in the packed kv cache via quant_scale_repo_mode=1) and
+        # the fp8-e4m3 kv dtype is handled inside the C++ dispatch.
+        _patched = FunctionType(
+            execute_kv_quant_sparse_flash_attention.__code__,
+            vars(mod),
+            name=execute_kv_quant_sparse_flash_attention.__name__,
+            argdefs=execute_kv_quant_sparse_flash_attention.__defaults__,
+            closure=execute_kv_quant_sparse_flash_attention.__closure__,
+        )
+        _patched.__annotations__ = (
+            execute_kv_quant_sparse_flash_attention.__annotations__
+        )
+        _patched.__kwdefaults__ = (
+            execute_kv_quant_sparse_flash_attention.__kwdefaults__
+        )
+        patch_or_inject(
+            mod.A5DeviceAdaptor,
+            "execute_kv_quant_sparse_flash_attention",
+            classmethod(_patched),
+        )
+        logger.info(
+            "UCM GSA A5DeviceAdaptor.execute_kv_quant_sparse_flash_attention patch applied"
+        )

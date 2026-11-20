@@ -58,9 +58,9 @@ public:
                                 __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
                                 __gm__ uint8_t *sinks, __gm__ uint8_t *attentionOut,
                                 __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
-                                __gm__ uint8_t *workspace,
+                                __gm__ uint8_t *actualSparseLengths, __gm__ uint8_t *workspace,
                                 const KvQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
-				                TPipe *tPipe);
+                                TPipe *tPipe);
     __aicore__ inline void Process();
 
 private:
@@ -99,6 +99,8 @@ private:
     /* GM信息 */
     __gm__ int32_t *actualSeqKvlenAddr = nullptr;
     __gm__ int32_t *actualSeqQlenAddr = nullptr;
+    /* per-req 真实 topk 长度（kernel 按 boIdx=req 索引读取，null 表示全宽） */
+    __gm__ int32_t *actualSparseLenAddr = nullptr;
 
     GlobalTensor<int32_t> actualSeqLengthsQGm;
     uint32_t usedCoreNum = 0U;
@@ -129,7 +131,8 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<CubeBlockType, VecBlockTyp
     __gm__ uint8_t *sparseIndices, __gm__ uint8_t* keyScale,
     __gm__ uint8_t* valueScale, __gm__ uint8_t *blockTable, __gm__ uint8_t *actualSeqLengthsQ,
     __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *sinks, __gm__ uint8_t *attentionOut,
-    __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, __gm__ uint8_t *workspace,
+    __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
+    __gm__ uint8_t *actualSparseLengths, __gm__ uint8_t *workspace,
     const KvQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
     TPipe *tPipe)
 {
@@ -173,6 +176,11 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<CubeBlockType, VecBlockTyp
     this->ComputeConstexpr();
     this->InitGlobalBuffer(query, key, value, sparseIndices, blockTable, actualSeqLengthsQ, actualSeqLengths,
         workspace, tiling, tPipe); // gm设置
+    if (actualSparseLengths != nullptr) {
+        // 与 tiling 的 hasActualSparseLengths 等价（tiling.cpp 按 tensor 非空置位）；
+        // arch35 cube 侧不读 tiling，统一按指针判空保证 AIC/AIV 一致
+        actualSparseLenAddr = (__gm__ int32_t *)actualSparseLengths;
+    }
     this->InitCalcParamsEach();
     this->InitLocalBuffer();
 }
@@ -557,7 +565,7 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<CubeBlockType, VecBlockTyp
                 bool s1NoNeedCalc = ComputeParamS1<TEMPLATE_INTF_ARGS>(
                     runParam, this->constInfo, gS1Index, this->actualSeqQlenAddr);
                 bool s2NoNeedCalc =
-                    ComputeS2LoopInfo<TEMPLATE_INTF_ARGS>(runParam, this->constInfo);
+                    ComputeS2LoopInfo<TEMPLATE_INTF_ARGS>(runParam, this->constInfo, this->actualSparseLenAddr);
                 // s1和s2有任意一个不需要算, 则continue, 如果是当前核最后一次循环，则补充计算taskIdx+2的部分
                 if (s1NoNeedCalc || s2NoNeedCalc) {
                     continue;

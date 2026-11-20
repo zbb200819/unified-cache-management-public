@@ -215,7 +215,8 @@ __aicore__ inline int64_t ClipSInnerTokenCube(int64_t qsfaSInnerToken, int64_t m
 }
 
 TEMPLATE_INTF
-__aicore__ inline bool ComputeS2LoopInfo(RunParamStr& runParam, const ConstInfo &constInfo)
+__aicore__ inline bool ComputeS2LoopInfo(RunParamStr& runParam, const ConstInfo &constInfo,
+    __gm__ int32_t *actualSparseLenAddr)
 {
     if (runParam.actualS2Size == 0) {
         runParam.kvLoopEndIdx = 0;
@@ -224,15 +225,32 @@ __aicore__ inline bool ComputeS2LoopInfo(RunParamStr& runParam, const ConstInfo 
     }
     uint32_t qsfaS2BaseSize = constInfo.s2BaseSize;
 
+    // per-req 真实 topk 长度（对齐 root GetSparseActualSeqLen V_TEMPLATE 语义）：
+    // -1 padding 或 >= 全宽时保持全宽；0（padding req）→ 空区间跳过该 req
+    auto qsfaEffSparseCount = constInfo.sparseBlockCount;
+    if (actualSparseLenAddr != nullptr) {
+        int32_t qsfaPerBatch = actualSparseLenAddr[runParam.boIdx];
+        if (qsfaPerBatch >= 0 && qsfaPerBatch < qsfaEffSparseCount) {
+            qsfaEffSparseCount = qsfaPerBatch;
+        }
+    }
+
     if (constInfo.sparseMode == sparseModeZero) {
         runParam.s2LineStartIdx = 0;
-        runParam.s2LineEndIdx = Min(runParam.actualS2Size, constInfo.sparseBlockCount);
+        runParam.s2LineEndIdx = Min(runParam.actualS2Size, qsfaEffSparseCount);
     } else if (constInfo.sparseMode == sparseModeThree) {
         runParam.s2LineStartIdx = ClipSInnerTokenCube<TEMPLATE_INTF_ARGS>(runParam.cubeSOuterOffset - runParam.preTokensPerBatch,
             0, runParam.actualS2Size);
         runParam.s2LineEndIdx = ClipSInnerTokenCube<TEMPLATE_INTF_ARGS>(runParam.cubeSOuterOffset + runParam.nextTokensPerBatch +
             runParam.s1RealSize, 0, runParam.actualS2Size);
-        runParam.s2LineEndIdx = Min(runParam.s2LineEndIdx, constInfo.sparseBlockCount); // 当前LI输出的block size只可能是1
+        runParam.s2LineEndIdx = Min(runParam.s2LineEndIdx, qsfaEffSparseCount); // 当前LI输出的block size只可能是1
+    }
+    // 有效稀疏区间为空（如 per-req sparse len = 0）时跳过该 task：
+    // 否则 s2LoopEndIdx=0 会使 s2LoopLimit = s2LoopEndIdx - 1 (uint32_t) 下溢
+    if (runParam.s2LineEndIdx <= runParam.s2LineStartIdx) {
+        runParam.kvLoopEndIdx = 0;
+        runParam.s2LoopEndIdx = 0;
+        return true;
     }
 
     runParam.kvLoopEndIdx = (runParam.s2LineEndIdx + qsfaS2BaseSize - 1) / qsfaS2BaseSize;
