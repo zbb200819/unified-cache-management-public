@@ -385,9 +385,11 @@ def apply_all_patches() -> None:
                     # patch vllm-ascend-csrc-build-1020-c8.patch to be applied
                     # before `pip install -v -e .` so the gsa_* ops are
                     # compiled in.
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.balance_scheduler_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.block_table_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.device_op_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.model_runner_v1_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.recompute_scheduler_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.sfa_kv_transfer_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.sfa_v1_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0230.vllm_ascend.worker_patch
