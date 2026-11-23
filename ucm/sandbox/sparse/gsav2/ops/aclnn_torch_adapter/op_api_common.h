@@ -107,23 +107,23 @@ extern thread_local int g_hashOffset;
     _(at::ScalarType::Float8_e4m3fn, ACL_FLOAT8_E4M3FN)             \
     _(at::ScalarType::Float8_e5m2fnuz, ACL_DT_UNDEFINED)            \
     _(at::ScalarType::Float8_e4m3fnuz, ACL_DT_UNDEFINED)            \
-    _(at::ScalarType::UInit16, ACL_INT16)                           \
-    _(at::ScalarType::UInit32, ACL_INT32)                           \
-    _(at::ScalarType::UInit64, ACL_INT64)                           \
-    _(at::ScalarType::UInit1, ACL_DT_UNDEFINED)                     \
-    _(at::ScalarType::UInit2, ACL_DT_UNDEFINED)                     \
-    _(at::ScalarType::UInit3, ACL_DT_UNDEFINED)                     \
-    _(at::ScalarType::UInit4, ACL_DT_UNDEFINED)                     \
-    _(at::ScalarType::UInit5, ACL_DT_UNDEFINED)                     \
-    _(at::ScalarType::UInit6, ACL_DT_UNDEFINED)                     \
-    _(at::ScalarType::UInit7, ACL_DT_UNDEFINED)                     \
-    _(at::ScalarType::Init1, ACL_DT_UNDEFINED)                      \
-    _(at::ScalarType::Init2, ACL_DT_UNDEFINED)                      \
-    _(at::ScalarType::Init3, ACL_DT_UNDEFINED)                      \
-    _(at::ScalarType::Init4, ACL_DT_UNDEFINED)                      \
-    _(at::ScalarType::Init5, ACL_DT_UNDEFINED)                      \
-    _(at::ScalarType::Init6, ACL_DT_UNDEFINED)                      \
-    _(at::ScalarType::Init7, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::UInt16, ACL_UINT16)                           \
+    _(at::ScalarType::UInt32, ACL_UINT32)                           \
+    _(at::ScalarType::UInt64, ACL_UINT64)                           \
+    _(at::ScalarType::UInt1, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::UInt2, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::UInt3, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::UInt4, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::UInt5, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::UInt6, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::UInt7, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::Int1, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Int2, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Int3, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Int4, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Int5, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Int6, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Int7, ACL_DT_UNDEFINED)                      \
     _(at::ScalarType::Float8_e8m0fnu, ACL_FLOAT8_E8M0)              \
     _(at::ScalarType::Undefined, ACL_DT_UNDEFINED)                  \
     _(at::ScalarType::NumOptions, ACL_DT_UNDEFINED)
