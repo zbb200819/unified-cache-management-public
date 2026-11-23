@@ -374,6 +374,20 @@ def rm_shared_memory(dp_rank, engine_id=None):
 def bind_thread_memory_policy(node_id: int):
     libnuma = ctypes.CDLL("libnuma.so.1")
 
+    if libnuma.numa_available() < 0:
+        logger.warning("NUMA unavailable, skip interleave policy")
+        return
+
+    if _env_bool("GSA_NUMA_INTERLEAVE", False):
+        libnuma.numa_set_interleave_mask.argtypes = [ctypes.c_void_p]
+        mask = ctypes.c_void_p.in_dll(libnuma, "numa_all_nodes_ptr")
+        if not mask:
+            logger.warning("numa_all_nodes_ptr is NULL, skip interleave policy")
+            return
+        libnuma.numa_set_interleave_mask(mask)
+        logger.info("Thread memory policy set to interleave across all NUMA nodes")
+        return
+
     libnuma.numa_allocate_nodemask.restype = ctypes.c_void_p
     libnuma.numa_bitmask_setbit.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     libnuma.numa_set_membind.argtypes = [ctypes.c_void_p]

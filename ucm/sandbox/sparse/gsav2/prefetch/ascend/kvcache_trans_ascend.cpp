@@ -154,7 +154,9 @@ aclDataType GetAclDataType(at::ScalarType dtype)
         case at::kLong: return ACL_INT64;
         case at::kDouble: return ACL_DOUBLE;
         case at::kBool: return ACL_BOOL;
-        case at::kChar: return ACL_INT8;
+        case at::kByte: return ACL_UINT8;
+        case at::kFloat8_e4m3fn: return ACL_UINT8;
+        case at::kFloat8_e5m2: return ACL_UINT8;
         default: return ACL_DT_UNDEFINED;
     }
 }

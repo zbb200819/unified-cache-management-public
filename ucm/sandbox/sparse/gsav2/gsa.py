@@ -627,6 +627,17 @@ class GSAV2(UcmSparseBase):
         )
         self.local_rank = get_world_group().local_rank
         numa_node, cpu_to_bind = self.bind_cpus()
+
+        if cpu_to_bind:
+            try:
+                os.sched_setaffinity(0, set(cpu_to_bind))
+                print(
+                    f"主线程已绑定到 NUMA Node {numa_node} 的 CPU："
+                    f"{sorted(set(cpu_to_bind))[:4]}..."
+                )
+            except Exception as e:
+                print(f"主进程 NUMA CPU 绑定失败： {e}")
+
         log_type = os.getenv("GSA_LOG_TYPE", GSALogger.LOG_TYPE_NORMAL)
         self.log = GSALogger(
             log_dir="gsa_log/GLM/pyLog",

@@ -88,7 +88,7 @@ extern thread_local int g_hashOffset;
     _(at::ScalarType::Half, ACL_FLOAT16)             \
     _(at::ScalarType::Float, ACL_FLOAT)              \
     _(at::ScalarType::Double, ACL_DOUBLE)            \
-    _(at::ScalarType::ComplexHalf, ACL_DT_UNDEFINED) \
+    _(at::ScalarType::ComplexHalf, ACL_COMPLEX32)    \
     _(at::ScalarType::ComplexFloat, ACL_COMPLEX64)   \
     _(at::ScalarType::ComplexDouble, ACL_COMPLEX128) \
     _(at::ScalarType::Bool, ACL_BOOL)                \
@@ -98,7 +98,34 @@ extern thread_local int g_hashOffset;
     _(at::ScalarType::BFloat16, ACL_BF16)            \
     _(at::ScalarType::QUInt4x2, ACL_DT_UNDEFINED)    \
     _(at::ScalarType::QUInt2x4, ACL_DT_UNDEFINED)    \
-    _(at::ScalarType::Undefined, ACL_DT_UNDEFINED)   \
+    _(at::ScalarType::Bits1x8, ACL_DT_UNDEFINED)                    \
+    _(at::ScalarType::Bits2x4, ACL_DT_UNDEFINED)                    \
+    _(at::ScalarType::Bits4x2, ACL_DT_UNDEFINED)                    \
+    _(at::ScalarType::Bits8, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Bits16, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::Float8_e5m2, ACL_FLOAT8_E5M2)                 \
+    _(at::ScalarType::Float8_e4m3fn, ACL_FLOAT8_E4M3FN)             \
+    _(at::ScalarType::Float8_e5m2fnuz, ACL_DT_UNDEFINED)            \
+    _(at::ScalarType::Float8_e4m3fnuz, ACL_DT_UNDEFINED)            \
+    _(at::ScalarType::UInit16, ACL_INT16)                           \
+    _(at::ScalarType::UInit32, ACL_INT32)                           \
+    _(at::ScalarType::UInit64, ACL_INT64)                           \
+    _(at::ScalarType::UInit1, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::UInit2, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::UInit3, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::UInit4, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::UInit5, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::UInit6, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::UInit7, ACL_DT_UNDEFINED)                     \
+    _(at::ScalarType::Init1, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Init2, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Init3, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Init4, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Init5, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Init6, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Init7, ACL_DT_UNDEFINED)                      \
+    _(at::ScalarType::Float8_e8m0fnu, ACL_FLOAT8_E8M0)              \
+    _(at::ScalarType::Undefined, ACL_DT_UNDEFINED)                  \
     _(at::ScalarType::NumOptions, ACL_DT_UNDEFINED)
 
 constexpr aclDataType
