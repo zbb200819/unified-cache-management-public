@@ -55,14 +55,13 @@ done
 if [ ! -f "${CANN_SFA_UTIL}" ]; then
     echo "[GSA-A5] ERROR: 缺少 ${CANN_SFA_UTIL}"
     exit 1
-    fi
-done
+fi
 
 CMAKE_BAK=$(mktemp)
 cp -f "${CMAKE_FILE}" "${CMAKE_BAK}"
 
 cleanup() {
-    cp -r "${CMAKE_BAK}" "${CMAKE_FILE}" 2>/dev/null || true
+    cp -f "${CMAKE_BAK}" "${CMAKE_FILE}" 2>/dev/null || true
     rm -f "${CMAKE_BAK}"
     rm -rf "${DEPS_DIR}"
     rm -rf "${OP_COMMON_DST}"
