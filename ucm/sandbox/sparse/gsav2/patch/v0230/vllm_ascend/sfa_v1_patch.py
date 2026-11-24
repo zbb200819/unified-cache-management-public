@@ -559,6 +559,7 @@ def _execute_sparse_flash_attention_process(
     actual_seq_lengths_query,
     actual_seq_lengths_key,
     swap_len: torch.Tensor = None,
+    actual_sparse_lengths: torch.Tensor = None,
 ):
     return DeviceOperator.execute_sparse_flash_attention_process(
         self,
@@ -570,6 +571,7 @@ def _execute_sparse_flash_attention_process(
         actual_seq_lengths_query,
         actual_seq_lengths_key,
         swap_len,
+        actual_sparse_lengths,
     )
 
 

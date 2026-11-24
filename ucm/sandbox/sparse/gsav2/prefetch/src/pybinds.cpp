@@ -140,6 +140,8 @@ void registerPrefetchEngine(pybind11::module_& m)
         // 其他值 = lru（默认，与原实现一致）。需在首个 set_tokens_map 之前调用。
         .def("set_hbm_evict_mode", &ucmprefetch::GSAPrefetchEngineC::SetHbmEvictMode,
              pybind11::arg("mode"))
+        .def("get_layer_window", &ucmprefetch::GSAPrefetchEngineC::GetLayerWindow,
+             pybind11::arg("layer_id"))
         .def("get_hbm_evict_mode", &ucmprefetch::GSAPrefetchEngineC::GetHbmEvictMode)
         .def("del_blocks_map", &ucmprefetch::GSAPrefetchEngineC::DelBlocksMap)
         .def("set_topk_indices", &ucmprefetch::GSAPrefetchEngineC::SetTopkIndices)

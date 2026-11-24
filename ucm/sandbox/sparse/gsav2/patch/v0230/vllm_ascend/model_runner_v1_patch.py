@@ -2064,7 +2064,7 @@ def _build_attention_metadata(
             # （req 域），勿用 num_input_tokens（token 域）。最终下发值由
             # GSA._update_attn_gsa_lens 按 has_prefill 决定（prefill 步置 None）。
             attn_metadata_i.actual_sparse_lengths = self.actual_sparse_lengths.npu[
-                : common_attn_metadata.num_reqs
+                :, : common_attn_metadata.num_reqs
             ]
             attn_metadata_i.gsa_warmup_index = self.gsa_warmup_index.npu
             attn_metadata_i.gsa_prefetch_topk = self.gsa_prefetch_topk.npu[

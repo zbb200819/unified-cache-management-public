@@ -584,6 +584,8 @@ def forward(
                 attn_metadata,
                 actual_seq_lengths_query,
                 actual_seq_lengths_key,
+                None,
+                attn_metadata.actual_sparse_lengths[self.layer_id]
             )
     else:
         attn_output = self._execute_sparse_flash_attention_process(

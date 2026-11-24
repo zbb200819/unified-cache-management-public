@@ -218,6 +218,7 @@ class FakeEngineC:
         self.indexer_status = [False]
         self.store_v1_ptr = 0
         self.self_ptr = 0x1234
+        self.layer_window = 5120
 
     # -- 状态查询（脚本化） --
     @staticmethod
@@ -241,6 +242,10 @@ class FakeEngineC:
     def get_self_ptr(self):
         self.calls.append(("get_self_ptr", (), {}))
         return self.self_ptr
+
+    def get_layer_window(self, layer_id):
+        self.calls.append(("get_layer_window", (layer_id, ), {}))
+        return self.layer_window
 
     def called(self, name):
         return [c for c in self.calls if c[0] == name]

@@ -181,6 +181,8 @@ public:
 
     int GetHbmEvictMode() const { return mHbmEvictMode; }
 
+    int GetLayerWindow(int layerId) const;
+
     void PreSwapTokens(std::vector<uintptr_t>& useTokenPtrs, std::vector<int32_t>& seqLens,
                        std::vector<std::vector<int>>& swapIndex,
                        std::vector<uintptr_t>& spaTokensPtr, std::vector<std::string>& reqIDs,

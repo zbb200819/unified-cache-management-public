@@ -115,6 +115,7 @@ def execute_sparse_flash_attention_process(
     actual_seq_lengths_query: torch.Tensor,
     actual_seq_lengths_key: torch.Tensor,
     swap_len: torch.Tensor = None,
+    actual_sparse_lengths: torch.Tensor = None,
     *,
     block_table: torch.Tensor | None = None,
     sparse_mode: int = 3,
@@ -154,7 +155,7 @@ def execute_sparse_flash_attention_process(
             # 分支置 None——两次 SFA 的 topk 均全宽有效且 swap 子批是重排 batch，
             # 全量数组行号与其不对应），用于 kernel 跳过 topk_indices 尾部 -1
             # padding 的迭代与 padding req。
-            actual_sparse_lengths=getattr(attn_metadata, "actual_sparse_lengths", None),
+            actual_sparse_lengths=actual_sparse_lengths,
         )
 
     key_rope = kv_cache[1]

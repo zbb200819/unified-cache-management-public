@@ -654,6 +654,14 @@ class GSAV2(UcmSparseBase):
         self.prefetch_engine = GSAPrefetchBase(
             vllm_config, PREFETCH_THREAD_NUM, True, cpu_to_bind, self.topk_layer_map
         )
+        hbm_evict_mode = int(os.getenv("GSA_HBM_EVICT_MODE", "0"))
+        self.prefetch_engine.prefetch_engine_c.set_hbm_evict_mode(hbm_evict_mode)
+        self.sfa_layer_win = [self.prefetch_engine.prefetch_engine_c.get_layer_window(i)
+                              for i in range(self.layer_num)]
+        self.log.info(
+            f"[GSA] hbm evict mode={hbm_evict_mode}"
+            f"({'decay/budget4096' if hbm_evict_mode == 1 else 'lru/uniform'})"
+        )
         bind_thread_memory_policy(numa_node)
 
     def _init_worker_indexer_state(self, vllm_config: VllmConfig):
@@ -819,7 +827,7 @@ class GSAV2(UcmSparseBase):
         # 填 SPA_TOKENS_LEN、真实 req 填 DEFAULT_TOPK_LEN、padding req 填 0），
         # kernel 按 bIdx 逐 req 读取。容量 max_graph_bs + 2 仅为上界。
         self.actual_sparse_lengths = DSAInputStruct(
-            (max_graph_bs + 2), self.device, torch.int32
+            (self.layer_num, max_graph_bs + 2), self.device, torch.int32
         )
         self.gsa_swap_topk = TopkIndices(  # 78 * bs * 4096 * 4
             (self.topk_layer_num, (max_graph_bs + 2), 1, SPA_TOKENS_LEN),
@@ -1586,7 +1594,7 @@ class GSAV2(UcmSparseBase):
         # actual_sparse_lengths（per-req）：swap req 的稀疏窗口是完整的
         # SPA_TOKENS_LEN（上一步保存的 5120 宽表），按 index_in_batch 写 req 域位置。
         # kernel 按 bIdx=req 索引读取，与本写入语义一致。
-        self.actual_sparse_lengths.np[index_in_batch] = SPA_TOKENS_LEN
+        self.actual_sparse_lengths.np[:, index_in_batch] = self.sfa_layer_win
         req_cnt += 1
         for i in range(query_local[index_in_batch], query_local[index_in_batch + 1]):
             self.swap_index.append(i)
@@ -1632,8 +1640,8 @@ class GSAV2(UcmSparseBase):
         # req=DEFAULT_TOPK_LEN、padding req=0（kernel effCount=0 跳过）。req 域
         # 边界为 num_reqs_padded，勿用 token 域的 num_actual_tokens。
         num_reqs_actual = len(self.req_ids_bs)
-        self.actual_sparse_lengths.np[num_reqs_actual : self.num_reqs_padded] = 0
-        self.actual_sparse_lengths.copy_to_npu(self.num_reqs_padded)
+        self.actual_sparse_lengths.np[:, num_reqs_actual : self.num_reqs_padded] = 0
+        self.actual_sparse_lengths.copy_to_npu(-1)
         indexer_len = 0
         if IS_INDEXER_OFFLOAD:
             flattened = [
@@ -1669,7 +1677,7 @@ class GSAV2(UcmSparseBase):
                 attn.actual_sparse_lengths = None
             else:
                 attn.actual_sparse_lengths = self.actual_sparse_lengths.npu[
-                    : self.num_reqs_padded
+                    :, : self.num_reqs_padded
                 ]
         self.log.info(
             f"[GSA] gsa_prefetch_len {gsa_prefetch_len} gsa_swap_len {gsa_swap_len}"
@@ -1905,7 +1913,12 @@ class GSAV2(UcmSparseBase):
         """处理单个调度请求：GSA 初始化、索引登记、块长计算与共享内存分配"""
         req_meta = self.gsa_metadata.gsa_stats[req_id]
         if self.get_num_output_tokens(req_id) == 1 and req_meta.is_gsa():
+            if IS_PERFORMANCE_LOG:
+                start_total = time.perf_counter()
             self._apply_prefetch_to_req(req_id, req_meta)
+            if IS_PERFORMANCE_LOG:
+                time_total = (time.perf_counter() - start_total) * 1_000_000
+                self.log.info(f"[GSA Time] last chunk time {time_total}")
         req_in_batch = req_meta.index_in_batch
         req_ids[req_in_batch] = req_id
         block_len = self._calc_new_block_len(req_meta)
