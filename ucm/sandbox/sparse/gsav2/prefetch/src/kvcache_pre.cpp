@@ -898,7 +898,7 @@ void GSAPrefetchEngineC::SetHbmEvictMode(int mode)
     mLogger.log(LogLevel::INFO,
                 "GSAPrefetchEngineC set HBM evict mode: %d (%s), window plan: %d (%s)\n",
                 mHbmEvictMode, mHbmEvictMode == 1 ? "decay" : "lru", mHbmWindowPlan,
-                mHbmWindowPlan == 1 ? "budget4096" : "uniform");
+                mHbmWindowPlan == 2 ? "budget5120" : (mHbmWindowPlan == 1 ? "budget4096" : "uniform"));
 }
 
 int GSAPrefetchEngineC::GetLayerWindow(int layerId) const
@@ -907,7 +907,8 @@ int GSAPrefetchEngineC::GetLayerWindow(int layerId) const
         static_cast<HbmWindowPlan>(mHbmWindowPlan), layerId,
         static_cast<int>(mSpaTopkLen));
     if (win < 1) { win = 1; }
-    if (win > static_cast<int>(mSparseLen)) {return static_cast<int>(mSparseLen); }
+    if (win > static_cast<int>(mSpaTopkLen)) { win = static_cast<int>(mSpaTopkLen); }
+    return win;
 }
 
 int GSAPrefetchEngineC::AcquireQTopkView(torch::Tensor& qTopkTensor, const std::string& reqID,
