@@ -202,6 +202,7 @@ def get_supported_versions() -> list[str]:
         "0.27.1",
         "0.28.0",
         "0.30.0",
+        "0.32.0",
     ]
 
 
@@ -301,6 +302,22 @@ def apply_all_patches() -> None:
                     import ucm.sandbox.sparse.gsav2.patch.v0300.vllm.mla_attention_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0300.vllm.sched_output_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0300.vllm.scheduler_patch
+                else:
+                    logger.info(
+                        "UCM GSA vllm patches skipped (ENABLE_GSA_PATCH is not set)."
+                    )
+            case "0.32.0":
+                if ENABLE_GSA_PATCH:
+                    _ensure_gsa_ops_loaded()
+                    logger.info("UCM patching vllm 0.32.0 for GSA sparse attention...")
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm.block_table_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm.engine_core_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm.gpu_model_runner_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm.gpu_worker_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm.kv_cache_manager_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm.mla_attention_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm.sched_output_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm.scheduler_patch
                 else:
                     logger.info(
                         "UCM GSA vllm patches skipped (ENABLE_GSA_PATCH is not set)."
@@ -454,11 +471,52 @@ def apply_all_patches() -> None:
                     import ucm.sandbox.sparse.gsav2.patch.v0300.vllm_ascend.balance_scheduler_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0300.vllm_ascend.block_table_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0300.vllm_ascend.device_op_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0300.vllm_ascend.indexer_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0300.vllm_ascend.model_runner_v1_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0300.vllm_ascend.recompute_scheduler_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0300.vllm_ascend.sfa_kv_transfer_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0300.vllm_ascend.sfa_v1_patch
                     import ucm.sandbox.sparse.gsav2.patch.v0300.vllm_ascend.worker_patch
+                else:
+                    logger.info(
+                        "UCM GSA vllm-ascend patches skipped "
+                        "(ENABLE_GSA_PATCH is not set)."
+                    )
+            case "0.32.0":
+                # NOTE: the 0.30.0 mamba_block_aligned_split patch is not
+                # carried over: vllm-ascend 0.32.0 dropped
+                # patch_mamba_block_aligned_split (vLLM 0.32.0 provides the
+                # chunk-aligned prefill split natively on the Scheduler).
+                logger.info(
+                    "UCM patching vllm-ascend 0.32.0 for balance sync KV load..."
+                )
+                import ucm.integration.vllm.patch.v0300.vllm_ascend.balance_sync_kv_load_patch
+
+                if ENABLE_GSA_PATCH:
+                    # GSA-aware SFA forward (drives
+                    # maybe_execute_sparse_attention_begin/finished and the
+                    # gsa_prefetch/warmup/swap top-k bookkeeping), rebased
+                    # from the 0.23.0 patch layer (via the 0.30.0 port)
+                    # onto the 0.32.0 in-tree SFA (sequence-parallel forward
+                    # inputs removed, PCP-aware NoPE trim, unified
+                    # AscendIndexer.forward without gather handles). The
+                    # C++ ops registered in csrc/torch_binding*.cpp still
+                    # require the GSA custom op package
+                    # (libcust_opapi.so, see _ensure_gsa_ops_loaded) to be
+                    # installed.
+                    logger.info(
+                        "UCM patching vllm-ascend 0.32.0 SFA with the GSA "
+                        "forward (ENABLE_GSA_PATCH is set)..."
+                    )
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm_ascend.balance_scheduler_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm_ascend.block_table_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm_ascend.device_op_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm_ascend.indexer_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm_ascend.model_runner_v1_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm_ascend.recompute_scheduler_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm_ascend.sfa_kv_transfer_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm_ascend.sfa_v1_patch
+                    import ucm.sandbox.sparse.gsav2.patch.v0320.vllm_ascend.worker_patch
                 else:
                     logger.info(
                         "UCM GSA vllm-ascend patches skipped "

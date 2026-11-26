@@ -1,0 +1,625 @@
+diff --git a/vllm/model_executor/layers/attention/attention.py b/vllm/model_executor/layers/attention/attention.py
+index a001c8c..9a78f80 100644
+--- a/vllm/model_executor/layers/attention/attention.py
++++ b/vllm/model_executor/layers/attention/attention.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-
+-from typing import TYPE_CHECKING, Any, cast
++import os
++from typing import TYPE_CHECKING, Any, cast, Optional
+ 
+ import torch
+ import torch.nn as nn
+@@ -52,6 +52,8 @@ from vllm.v1.kv_cache_interface import (
+ if TYPE_CHECKING:
+     from vllm.model_executor.layers.attention import MLAAttention
+ 
++from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -292,6 +294,7 @@ class Attention(nn.Module, AttentionLayerBase):
+             kv_cache_scheme is not None
+             and kv_cache_scheme.get("strategy") == "attn_head"
+         )
++        self.use_mla = vllm_config.model_config.use_mla
+ 
+         # Skip quantization for specified layers
+         if cache_config is not None and cache_config.kv_cache_dtype_skip_layers:
+@@ -774,6 +777,17 @@ def unified_attention_with_output(
+     layer_name = _resolve_layer_name(layer_name)
+     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+ 
++    if not self.use_mla:
++        forward_context: ForwardContext = get_forward_context()
++        if attn_metadata is not None:
++            if os.getenv("VLLM_HASH_ATTENTION") == "1":
++                kv_cache, k_hash = kv_cache
++            else:
++                k_hash = None
++            query, _, _, _ = maybe_execute_sparse_attention_begin(
++                query, key, value, layer_name, forward_context, output, k_hash=k_hash
++            )
++
+     self.impl.forward(
+         self,
+         query,
+@@ -786,9 +800,64 @@ def unified_attention_with_output(
+         output_block_scale=output_block_scale,
+     )
+ 
++    if not self.use_mla:
++        maybe_execute_sparse_attention_finished(query, key, value, output, layer_name, forward_context)
+ 
+ direct_register_custom_op(
+     op_name="unified_attention_with_output",
+     op_func=unified_attention_with_output,
+     mutates_args=["output", "output_block_scale"],
+ )
++
++def maybe_execute_sparse_attention_begin(
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        layer_name: str,
++        forward_context: ForwardContext,
++        output: Optional[torch.Tensor] = None,
++        indexer_cache: Optional[torch.Tensor] = None,
++        indexer_scale: Optional[torch.Tensor] = None,
++        vllm_indexer_cache: Optional[torch.Tensor] = None,
++        vllm_indexer_scale: Optional[torch.Tensor] = None,
++        phase: Optional[str] = None,
++        k_hash: Optional[torch.Tensor] = None,
++        decode_ql_nope: Optional[torch.Tensor] = None,
++        decode_q_pe: Optional[torch.Tensor] = None,
++        has_indexer: Optional[bool] = True,
++        use_li_c8: Optional[bool] = False,
++):
++    if not has_ucm_sparse():
++        return query, key, value, output
++
++    ucm_sparse = get_ucm_sparse()
++
++    attn_metadata = forward_context.attn_metadata
++    if attn_metadata is None:
++        return query, key, value, output
++
++    return ucm_sparse.attention_begin(
++        query, key, value, layer_name, forward_context, indexer_cache, indexer_scale, vllm_indexer_cache, vllm_indexer_scale, output, phase, k_hash,decode_ql_nope, decode_q_pe, has_indexer, use_li_c8
++    )
++
++def maybe_execute_sparse_attention_finished(
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        attn_output: torch.Tensor,
++        layer_name: str,
++        forward_context: ForwardContext,
++        phase: Optional[str] = None,
++        has_indexer: Optional[bool] = True,
++        use_li_c8: Optional[bool] = False,
++):
++    if not has_ucm_sparse():
++        return
++
++    ucm_sparse = get_ucm_sparse()
++
++    attn_metadata = forward_context.attn_metadata
++    if attn_metadata is None:
++        return
++
++    ucm_sparse.attention_finished(query, key, value, attn_output, layer_name, forward_context, phase, has_indexer, use_li_c8)
+\ No newline at end of file
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index 1e673bd..1f507b3 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -562,7 +562,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+             kv_cache_dtype=self.kv_cache_dtype,
+             logits_soft_cap=None,
+             attn_type=AttentionType.DECODER,
+-            kv_sharing_target_layer_name=None,
++            kv_sharing_target_layer_name=prefix,
+             # MLA Args
+             q_lora_rank=self.q_lora_rank,
+             kv_lora_rank=self.kv_lora_rank,
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 226da3a..669a03f 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -28,6 +28,10 @@ from vllm.v1.kv_cache_interface import (
+ from vllm.v1.metrics.stats import PrefixCacheStats
+ from vllm.v1.request import Request, RequestStatus
+ 
++from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
++from ucm.sparse.base import INVALID_SLOT
++from ucm.sparse.utils import IS_OPEN_GSA, PTOPK_PREFETCH_ENABLE
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -380,6 +384,7 @@ class KVCacheManager:
+         full_sequence_must_fit: bool = False,
+         reserved_blocks: int = 0,
+         has_scheduled_reqs: bool = True,
++        num_slots_sparsed: Union[None, int] = None,
+     ) -> KVCacheBlocks | None:
+         """Add slots for a request with new tokens to append.
+ 
+@@ -471,6 +476,9 @@ class KVCacheManager:
+                 "external computed tokens"
+             )
+ 
++        if num_slots_sparsed != INVALID_SLOT and has_ucm_sparse():
++            return get_ucm_sparse().allocate_slots(self, request, num_slots_sparsed)
++
+         if new_computed_blocks is not None:
+             new_computed_block_list = new_computed_blocks.blocks
+             if self.retained_hit_group_ids:
+@@ -554,11 +562,16 @@ class KVCacheManager:
+             num_tokens_main_model=num_tokens_main_model,
+         )
+ 
++        gsa_preempted_flag = False
++        if has_ucm_sparse() and PTOPK_PREFETCH_ENABLE:
++            gsa_preempted_flag = get_ucm_sparse().estimate_free_slots_sparse(
++                request, num_blocks_to_allocate, num_new_computed_tokens)
++
+         # Keep `reserved_blocks` free for other in-flight sequences, and an
+         # additional watermark of headroom for waiting/preempted admissions.
+         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+         required_blocks = num_blocks_to_allocate + watermark_blocks
+-        if required_blocks > available_blocks:
++        if required_blocks > available_blocks or gsa_preempted_flag:
+             # Cannot allocate new blocks
+             return None
+ 
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 3a46fa4..caaac54 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -304,6 +304,9 @@ class SchedulerOutput:
+     # Number of spec tokens to schedule for the next step.
+     num_spec_tokens_to_schedule: int = 0
+ 
++    # modified slots by sparse algorithm
++    req_sparsed_slots: dict[str, int] = None
++
+     @classmethod
+     def make_empty(cls) -> "SchedulerOutput":
+         return cls(
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index daf2b31..49968cf 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -75,6 +75,11 @@ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ logger = init_logger(__name__)
+ 
++from ucm.sparse.state import ensure_ucm_sparse_initialized, get_ucm_sparse, has_ucm_sparse
++from ucm.sparse.base import  UcmSparseRole, INVALID_SLOT
++from ucm.sparse.utils import  IS_OPEN_GSA, PTOPK_PREFETCH_ENABLE
++import os
++import numpy as np
+ 
+ class Scheduler(SchedulerInterface):
+     def __init__(
+@@ -141,6 +146,14 @@ class Scheduler(SchedulerInterface):
+         # will have a corresponding KVConnector with Role=WORKER.
+         # KV Connector pushes/pull of remote KVs for P/D and offloading.
+         self.connector = None
++
++        self.ucm_sparse = None
++        if IS_OPEN_GSA:
++            ensure_ucm_sparse_initialized(vllm_config, role=UcmSparseRole.SCHEDULER)
++            if has_ucm_sparse():
++                self.ucm_sparse = get_ucm_sparse()
++                logger.info("UCM Sparse initialized successfully: {}".format(self.ucm_sparse))
++       
+         self.connector_prefix_cache_stats: PrefixCacheStats | None = None
+         self.recompute_kv_load_failures = True
+         self.defer_block_free = False
+@@ -586,6 +599,9 @@ class Scheduler(SchedulerInterface):
+             # Do not schedule any requests when paused.
+             token_budget = 0
+ 
++        if has_ucm_sparse() and PTOPK_PREFETCH_ENABLE:
++            get_ucm_sparse().update_scheduler_free_slot(0)
++
+         # Encoder-related.
+         scheduled_encoder_inputs: dict[str, list[int]] = {}
+         encoder_compute_budget = self.max_num_encoder_input_tokens
+@@ -609,8 +625,15 @@ class Scheduler(SchedulerInterface):
+ 
+         # First, schedule the RUNNING requests.
+         req_index = 0
++        req_sparsed_slots: dict[str, int] = {}
+         while req_index < len(self.running) and token_budget > 0:
+             request = self.running[req_index]
++
++            num_slots_sparsed = INVALID_SLOT
++            if self.ucm_sparse:
++                num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(request, self.num_lookahead_tokens)
++            req_sparsed_slots.update({request.request_id: num_slots_sparsed})
++
+             if input_budget <= draft_slots:
+                 break
+ 
+@@ -730,6 +753,7 @@ class Scheduler(SchedulerInterface):
+                         request,
+                         num_new_tokens,
+                         num_lookahead_tokens=self.num_lookahead_tokens,
++                        num_slots_sparsed=num_slots_sparsed,
+                     )
+ 
+                     if new_blocks is not None:
+@@ -868,6 +892,12 @@ class Scheduler(SchedulerInterface):
+                 assert request_queue is not None
+ 
+                 request = request_queue.peek_request()
++
++                num_slots_sparsed = INVALID_SLOT   ####  suit for skipped
++                if self.ucm_sparse:
++                    num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(request, self.num_lookahead_tokens)
++                req_sparsed_slots.update({request.request_id: num_slots_sparsed})
++
+                 request_id = request.request_id
+ 
+                 # try to promote blocked statuses while traversing skipped queue.
+@@ -1166,6 +1196,7 @@ class Scheduler(SchedulerInterface):
+                     delay_cache_blocks=load_kv_async,
+                     num_encoder_tokens=num_encoder_tokens,
+                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
++                    num_slots_sparsed=num_slots_sparsed,
+                     reserved_blocks=reserved_blocks,
+                     has_scheduled_reqs=bool(self.running),
+                 )
+@@ -1414,6 +1445,7 @@ class Scheduler(SchedulerInterface):
+             scheduled_encoder_input_stats=scheduled_encoder_input_stats,
+             num_common_prefix_blocks=num_common_prefix_blocks,
+             preempted_req_ids=self.reset_preempted_req_ids,
++            req_sparsed_slots=req_sparsed_slots,
+             # finished_req_ids is an existing state in the scheduler,
+             # instead of being newly scheduled in this step.
+             # It contains the request IDs that are finished in between
+@@ -1490,6 +1522,10 @@ class Scheduler(SchedulerInterface):
+         assert request.status == RequestStatus.RUNNING, (
+             "Only running requests can be preempted"
+         )
++
++        if has_ucm_sparse() and PTOPK_PREFETCH_ENABLE:
++            get_ucm_sparse().update_scheduler_free_slot(-1 * len(request._all_token_ids) // self.cache_config.block_size)
++
+         self._free_request_blocks(request)
+         self.encoder_cache_manager.free(request)
+         self._inflight_prefills.discard(request)
+@@ -2469,6 +2505,10 @@ class Scheduler(SchedulerInterface):
+ 
+     def add_request(self, request: Request) -> None:
+         existing = self.requests.get(request.request_id)
++
++        if self.ucm_sparse:
++            self.ucm_sparse.request_begin(request.request_id, request.prompt_token_ids)
++
+         if existing is not None:
+             update = StreamingUpdate.from_request(request)
+             if existing.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+@@ -2563,6 +2603,9 @@ class Scheduler(SchedulerInterface):
+     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+         assert request.is_finished()
+ 
++        if self.ucm_sparse:
++            self.ucm_sparse.request_finished_in_scheduler(request.request_id)
++
+         self._inflight_prefills.discard(request)
+         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+ 
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index ffc9a5d..e3e631b 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -93,6 +93,7 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
+ from vllm.v1.structured_output import StructuredOutputManager
+ from vllm.v1.utils import compute_iteration_details
+ from vllm.version import __version__ as VLLM_VERSION
++from ucm.sparse.utils import  IS_OPEN_GSA, rm_shared_memory, IS_SHARED_MEMCPY
+ 
+ logger = init_logger(__name__)
+ 
+@@ -126,6 +127,9 @@ class EngineCore:
+                 vllm_config,
+             )
+ 
++        if IS_OPEN_GSA:
++            rm_shared_memory(vllm_config.parallel_config.data_parallel_rank)
++
+         self.log_stats = log_stats
+         # Opaque weight version supplied by the caller.
+         self._weight_version = "default"
+diff --git a/vllm/v1/worker/block_table.py b/vllm/v1/worker/block_table.py
+index 33b5265..b3d3256 100644
+--- a/vllm/v1/worker/block_table.py
++++ b/vllm/v1/worker/block_table.py
+@@ -172,6 +172,15 @@ class BlockTable:
+         self.num_blocks_per_row[row_idx] += num_blocks
+         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
+ 
++    def reset_row(
++            self,
++            row_idx: int,
++    ) -> None:
++        self.num_blocks_per_row[row_idx] = 0
++        self.block_table.gpu[row_idx].fill_(0)
++        self.block_table.cpu[row_idx].fill_(0)
++        self.block_table.np[row_idx].fill(0)
++
+     def add_row(self, block_ids: list[int], row_idx: int) -> None:
+         self.num_blocks_per_row[row_idx] = 0
+         self.append_row(block_ids, row_idx)
+@@ -352,6 +361,10 @@ class MultiGroupBlockTable:
+             )
+         ]
+ 
++    def reset_row(self, row_idx: int) -> None:
++        for i, block_table in enumerate(self.block_tables):
++            block_table.reset_row(row_idx)
++
+     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
+         for i, block_table in enumerate(self.block_tables):
+             block_table.append_row(block_ids[i], row_idx)
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 97a59bd..f9d087e 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1,6 +1,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
++import math
++import yaml
++import pathlib
+ import functools
+ import gc
+ import itertools
+@@ -246,6 +250,18 @@ from .utils import (
+     sanity_check_mm_encoder_outputs,
+ )
+ 
++from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
++from ucm.sparse.base import INVALID_SLOT
++from ucm.sparse.utils import (
++    WARMUP_TOPK_LEN,
++    SPA_TOKENS_LEN,
++    DSAInputStruct,
++    TopkIndices,
++    PTOPK_PREFETCH_ENABLE,
++    SEG_PREFILL_THRESHOLD,
++    IS_OPEN_GSA,
++    IS_INDEXER_OFFLOAD)
++
+ if TYPE_CHECKING:
+     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+@@ -812,6 +828,11 @@ class GPUModelRunner(
+ 
+         # Persistent buffers for CUDA graphs.
+         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
++
++        self.sparse_positions = torch.zeros(
++            self.max_num_tokens, dtype=torch.int64, device=self.device
++        )
++
+         # [max_num_reqs, depth] prompt token ids preceding each request's chunk
+         # start, for models exposing `token_lookback_depth`. Sized after load.
+         self.lookback_token_ids: CpuGpuBuffer | None = None
+@@ -862,6 +883,27 @@ class GPUModelRunner(
+             self.max_num_reqs, dtype=torch.int32
+         )
+ 
++        ######[GSA] add attention metadata info
++        if PTOPK_PREFETCH_ENABLE and IS_OPEN_GSA:
++            self.dsa_block_table = None
++            self.dsa_seq_len = None
++            self.dsa_slot_mapping = None
++
++            self.gsa_prefetch_index = None
++            self.gsa_prefetch_topk = None
++            self.gsa_swap_index = None
++            self.gsa_swap_topk = None
++            self.gsa_warmup_index = None
++            self.gsa_warmup_topk = None
++            self.gsa_prefill_query = None
++            self.gsa_topk_win_tmp = None
++
++            #### indexer
++            if IS_INDEXER_OFFLOAD:
++                self.indexer_last_query = None
++                self.indexer_last_weight = None
++                self.indexer_last_q_index = None
++
+         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+         if self.uses_mrope:
+             # NOTE: `mrope_positions` is implemented with one additional dummy
+@@ -885,6 +927,9 @@ class GPUModelRunner(
+         # - query_pos: CpuGpuBuffer for the computed batched arange result
+         arange_size = max(self.max_num_reqs + 1, self.max_num_tokens)
+         self.arange_np = np.arange(arange_size, dtype=np.int64)
++
++        self.sparse_query_pos = self._make_buffer(arange_size, dtype=torch.int64)
++
+         self.query_pos = self._make_buffer(arange_size, dtype=torch.int64)
+         self._arange_scratch = np.empty(arange_size, dtype=np.int64)
+ 
+@@ -1224,6 +1269,7 @@ class GPUModelRunner(
+         """
+         # Remove finished requests from the cached states.
+         for req_id in scheduler_output.finished_req_ids:
++            self.ucm_sparse_request_finished_in_worker(req_id)
+             req_state = self.requests.pop(req_id, None)
+             self._on_request_state_removed(req_id, req_state)
+             self.num_prompt_logprobs.pop(req_id, None)
+@@ -1371,6 +1417,7 @@ class GPUModelRunner(
+         if self.use_async_spec_decode:
+             self.prev_num_draft_tokens.np.fill(0)
+ 
++        req_sparsed_slots = scheduler_output.req_sparsed_slots
+         for i, req_id in enumerate(req_data.req_ids):
+             req_state = self.requests[req_id]
+             num_computed_tokens = req_data.num_computed_tokens[i]
+@@ -1378,6 +1425,7 @@ class GPUModelRunner(
+             resumed_from_preemption = req_id in req_data.resumed_req_ids
+             num_output_tokens = req_data.num_output_tokens[i]
+             req_index = self.input_batch.req_id_to_index.get(req_id)
++            is_sparsed_request = req_sparsed_slots[req_id] != INVALID_SLOT
+ 
+             if req_state.prev_num_draft_len and self.use_async_scheduling:
+                 # prev_num_draft_len is used in async scheduling mode with
+@@ -1458,17 +1506,18 @@ class GPUModelRunner(
+                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
+ 
+             # Update the block IDs.
+-            if not resumed_from_preemption:
++            if resumed_from_preemption or is_sparsed_request:
++                if resumed_from_preemption:
++                    assert req_index is None
++                    assert new_block_ids is not None
++                # The request is resumed from preemption.
++                # Replace the existing block IDs with the new ones.
++                req_state.block_ids = new_block_ids
++            else:
+                 if new_block_ids is not None:
+                     # Append the new blocks to the existing block IDs.
+                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
+                         block_ids.extend(new_ids)
+-            else:
+-                assert req_index is None
+-                assert new_block_ids is not None
+-                # The request is resumed from preemption.
+-                # Replace the existing block IDs with the new ones.
+-                req_state.block_ids = new_block_ids
+ 
+             if req_index is None:
+                 # The request is not in the persistent batch.
+@@ -1489,6 +1538,8 @@ class GPUModelRunner(
+ 
+             # Update the persistent batch.
+             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
++            if is_sparsed_request:
++                self.input_batch.block_table.reset_row(req_index)
+             if new_block_ids is not None:
+                 self.input_batch.block_table.append_row(new_block_ids, req_index)
+ 
+@@ -2188,7 +2239,18 @@ class GPUModelRunner(
+         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
+         req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
+ 
++        self.sparse_query_pos.np[:] = self.query_pos.np.copy()
++        req_sparsed_slots = scheduler_output.req_sparsed_slots
++        for req_id in self.input_batch.req_id_to_index:
++            is_sparsed_request = req_sparsed_slots[req_id] != INVALID_SLOT
++            req_index = self.input_batch.req_id_to_index[req_id]
++            offset = 0 if req_index == 0 else cu_num_tokens[req_index - 1] # TODO: support MTP
++            end = cu_num_tokens[req_index]
++            if is_sparsed_request:
++                self.sparse_query_pos.np[offset:end] = list(range(req_sparsed_slots[req_id] - end + offset, req_sparsed_slots[req_id]))
++
+         self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
++        self.sparse_query_pos.copy_to_gpu(total_num_scheduled_tokens)
+         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
+         self.num_scheduled_tokens.copy_to_gpu(num_reqs)
+         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
+@@ -2199,12 +2261,21 @@ class GPUModelRunner(
+         self.seq_lens[:num_reqs] = (
+             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+         )
++
++        is_sparsed_np = np.zeros((num_reqs,), dtype=np.bool_)
++        for req_id in self.input_batch.req_id_to_index:
++            is_sparsed_request = scheduler_output.req_sparsed_slots[req_id] != INVALID_SLOT
++            req_index = self.input_batch.req_id_to_index[req_id]
++            if is_sparsed_request:
++                self.seq_lens.np[req_index] = req_sparsed_slots[req_id]
++                is_sparsed_np[req_index] = True
++
+         self.seq_lens[num_reqs:].fill_(0)
+ 
+         self.input_batch.block_table.compute_slot_mapping(
+             num_reqs,
+             self.query_start_loc.gpu[: num_reqs + 1],
+-            self.positions[:total_num_scheduled_tokens],
++            self.sparse_query_pos[:total_num_scheduled_tokens],
+         )
+ 
+         # Copy the tensors to the GPU.
+@@ -4460,6 +4531,9 @@ class GPUModelRunner(
+                 defer_finalize=defer_kv_connector_finalize,
+             ) as kv_connector_output,
+         ):
++
++            self.maybe_execute_ucm_sparse_begin(scheduler_output, attn_metadata)
++
+             model_output = self._model_forward(
+                 input_ids=input_ids,
+                 positions=positions,
+@@ -4468,6 +4542,8 @@ class GPUModelRunner(
+                 **model_kwargs,
+             )
+ 
++            self.maybe_execute_ucm_sparse_finished()
++
+         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+             if self.use_aux_hidden_state_outputs:
+                 # True when EAGLE 3 is used.
+@@ -5295,6 +5371,30 @@ class GPUModelRunner(
+ 
+         return draft_token_ids
+ 
++    def maybe_execute_ucm_sparse_begin(self, scheduler_output: "SchedulerOutput", attn_metadata: CommonAttentionMetadata):
++        if not has_ucm_sparse():
++            return
++        if has_kv_transfer_group():
++            uc_connector = get_kv_transfer_group()
++            uc_setup_model = getattr(uc_connector, "setup_model", None)
++            if callable(uc_setup_model):
++                uc_setup_model(self.model)
++        ucm_sparse = get_ucm_sparse()
++        ucm_sparse.build_sparse_meta(scheduler_output, self.requests, self.input_batch, attn_metadata)
++        ucm_sparse.execute_begin(scheduler_output, attn_metadata)
++
++    def maybe_execute_ucm_sparse_finished(self):
++        if not has_ucm_sparse():
++            return
++        ucm_sparse = get_ucm_sparse()
++        ucm_sparse.execute_finished()
++
++    def ucm_sparse_request_finished_in_worker(self, request_id: str | int):
++        if not has_ucm_sparse():
++            return
++        ucm_sparse = get_ucm_sparse()
++        ucm_sparse.request_finished_in_worker(request_id)
++
+     def update_config(self, overrides: dict[str, Any]) -> None:
+         allowed_config_names = {"load_config", "model_config"}
+         for config_name, config_overrides in overrides.items():
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 2a3531b..8a13dce 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -146,6 +146,7 @@ if TYPE_CHECKING:
+     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
+     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+ 
++from ucm.sparse.state import ensure_ucm_sparse_initialized
+ 
+ class AsyncIntermediateTensors(IntermediateTensors):
+     """IntermediateTensors with lazy comm synchronization"""
+@@ -1555,3 +1556,4 @@ def init_worker_distributed_environment(
+     # Init ec connector here before KV caches init
+     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
+     ensure_ec_transfer_initialized(vllm_config)
++    ensure_ucm_sparse_initialized(vllm_config)
+\ No newline at end of file

@@ -1,0 +1,1910 @@
+diff --git a/csrc/torch_binding.cpp b/csrc/torch_binding.cpp
+index ca8b3965d..ffbd2d4c9 100644
+--- a/csrc/torch_binding.cpp
++++ b/csrc/torch_binding.cpp
+@@ -578,6 +578,375 @@ at::Tensor npu_sign_bits_pack(const at::Tensor& input,
+     return out;
+ }
+ 
++
++void gsa_scatter_copy(
++    at::Tensor& dst, const at::Tensor& src, const at::Tensor& index)
++{
++    // 如果 index 为空（无数据拷贝），直接返回
++    if (index.numel() == 0) {
++        return;
++    }
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++    TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1, "src must be on NPU");
++    TORCH_CHECK(index.device().type() == c10::DeviceType::PrivateUse1, "index must be on NPU");
++
++    // TORCH_CHECK(index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(dst.dim() == 2, "dst must be 2D");
++    TORCH_CHECK(src.dim() == 2, "src must be 2D");
++    TORCH_CHECK(index.dim() == 2, "index must be 2D");
++
++    TORCH_CHECK(dst.size(1) == src.size(1), "the second dimension of dst and src must be equal");
++
++    int64_t dim = 0;
++    int64_t reduce = 0;
++    EXEC_NPU_CMD(
++        aclnnInplaceScatter,
++        dst,
++        dim,
++        index,
++        src,
++        reduce);
++}
++
++void gsa_inplace_copy(at::Tensor& dst, const at::Tensor& src)
++{
++    TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++    TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1, "src must be on NPU");
++    EXEC_NPU_CMD(
++        aclnnInplaceCopy,
++        dst,
++        src);
++}
++
++void gsa_fill(at::Tensor& dst, const at::Scalar padValue)
++{
++    TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++    EXEC_NPU_CMD(
++        aclnnInplaceFillScalar,
++        dst,
++        padValue);
++}
++
++void gsa_gather_copy(
++    at::Tensor& dst, const at::Tensor& src, const at::Tensor& index)
++{
++    // 如果 index 为空（无数据拷贝），直接返回
++    if (index.numel() == 0) {
++        return;
++    }
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++    TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1, "src must be on NPU");
++    TORCH_CHECK(index.device().type() == c10::DeviceType::PrivateUse1, "index must be on NPU");
++
++    // TORCH_CHECK(index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(dst.dim() == 2, "dst must be 2D");
++    TORCH_CHECK(src.dim() == 2, "src must be 2D");
++    TORCH_CHECK(index.dim() == 2, "index must be 2D");
++
++    TORCH_CHECK(dst.size(1) == src.size(1), "the second dimension of dst and src must be equal");
++
++    int64_t dim = 0;
++    EXEC_NPU_CMD(
++        aclnnGather,
++        src,
++        dim,
++        index,
++        dst);
++}
++
++void indexer_gather_qw(
++    const at::Tensor& q_src, const at::Tensor& w_src, at::Tensor& q_dst, at::Tensor& w_dst, const at::Tensor& q_index, const at::Tensor& w_index)
++{
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(q_src.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++    TORCH_CHECK(w_src.device().type() == c10::DeviceType::PrivateUse1, "src must be on NPU");
++    TORCH_CHECK(q_dst.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++    TORCH_CHECK(w_dst.device().type() == c10::DeviceType::PrivateUse1, "src must be on NPU");
++    TORCH_CHECK(q_index.device().type() == c10::DeviceType::PrivateUse1, "index must be on NPU");
++    TORCH_CHECK(w_index.device().type() == c10::DeviceType::PrivateUse1, "index must be on NPU");
++
++    // TORCH_CHECK(q_index.dtype() == torch::kInt64, "index must be torch.int64");
++    // TORCH_CHECK(w_index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(q_src.dim() == 2, "dst must be 2D");
++    TORCH_CHECK(w_src.dim() == 2, "src must be 2D");
++    TORCH_CHECK(q_dst.dim() == 2, "dst must be 2D");
++    TORCH_CHECK(w_dst.dim() == 2, "src must be 2D");
++    TORCH_CHECK(q_index.dim() == 2, "index must be 2D");
++    TORCH_CHECK(w_index.dim() == 2, "index must be 2D");
++
++    TORCH_CHECK(q_src.size(1) == q_dst.size(1), "the second dimension of dst and src must be equal");
++    TORCH_CHECK(w_src.size(1) == w_dst.size(1), "the second dimension of dst and src must be equal");
++
++    int64_t dim = 0;
++    EXEC_NPU_CMD(
++        aclnnGather,
++        q_src,
++        dim,
++        q_index,
++        q_dst);
++    EXEC_NPU_CMD(
++        aclnnGather,
++        w_src,
++        dim,
++        w_index,
++        w_dst);
++}
++
++void gsa_gather_scatter_copy(
++    at::Tensor& dst, at::Tensor &tmp, const at::Tensor& dst_index, const at::Tensor& src_index)
++{
++    if (dst_index.numel() == 0) {
++        return;
++    }
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++    TORCH_CHECK(tmp.device().type() == c10::DeviceType::PrivateUse1, "src must be on NPU");
++    TORCH_CHECK(dst_index.device().type() == c10::DeviceType::PrivateUse1, "index must be on NPU");
++    TORCH_CHECK(src_index.device().type() == c10::DeviceType::PrivateUse1, "index must be on NPU");
++
++    TORCH_CHECK(dst_index.dtype() == torch::kInt64, "index must be torch.int64");
++    TORCH_CHECK(src_index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(dst.dim() == 2, "dst must be 3D");
++    TORCH_CHECK(tmp.dim() == 2, "src must be 3D");
++    TORCH_CHECK(dst_index.dim() == 2, "index must be 1D");
++    TORCH_CHECK(src_index.dim() == 2, "index must be 1D");
++
++    TORCH_CHECK(dst.size(1) == tmp.size(1), "the second dimension of dst and src must be equal");
++
++    int64_t dim = 0;
++    int64_t reduce = 0;
++
++    EXEC_NPU_CMD(
++        aclnnGather,
++        dst,
++        dim,
++        src_index,
++        tmp);
++
++    EXEC_NPU_CMD(
++        aclnnInplaceScatter,
++        dst,
++        dim,
++        dst_index,
++        tmp,
++        reduce);
++}
++
++at::Tensor gsa_indices_scatter_and_expand(
++    at::Tensor& topk_indices, at::Tensor &prefetch_topk, at::Tensor& swap_topk,
++    at::Tensor& prefetch_index, at::Tensor& swap_index, const at::IntArrayRef &pad,
++    const at::Scalar padValue, int64_t expand_len)
++{
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(topk_indices.device().type() == c10::DeviceType::PrivateUse1, "topk_indices must be on NPU");
++    TORCH_CHECK(prefetch_topk.device().type() == c10::DeviceType::PrivateUse1, "prefetch_topk must be on NPU");
++    TORCH_CHECK(swap_topk.device().type() == c10::DeviceType::PrivateUse1, "swap_topk must be on NPU");
++    TORCH_CHECK(prefetch_index.device().type() == c10::DeviceType::PrivateUse1, "prefetch_index must be on NPU");
++    TORCH_CHECK(swap_index.device().type() == c10::DeviceType::PrivateUse1, "swap_index must be on NPU");
++
++    TORCH_CHECK(prefetch_index.dtype() == torch::kInt64, "index must be torch.int64");
++    TORCH_CHECK(swap_index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be 2D");
++    TORCH_CHECK(prefetch_topk.dim() == 2, "prefetch_topk must be 2D");
++    TORCH_CHECK(swap_topk.dim() == 2, "swap_topk must be 2D");
++    TORCH_CHECK(prefetch_index.dim() == 2, "prefetch_index must be 2D");
++    TORCH_CHECK(swap_index.dim() == 2, "swap_index must be 2D");
++
++    TORCH_CHECK(topk_indices.size(1) == prefetch_topk.size(1), "the second dimension of topk_indices and prefetch_topk must be equal");
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    constexpr int32_t SIZE = 8;
++    constexpr int32_t DIM_0 = 0;
++    constexpr int32_t DIM_1 = 1;
++
++    at::SmallVector<int64_t, SIZE> output_size = {topk_indices.size(DIM_0) + 2, expand_len};
++    at::Tensor gsa_indices_output = at::empty(output_size, topk_indices.options());
++
++    int64_t dim = 0;
++    int64_t reduce = 0;
++
++    EXEC_NPU_CMD(
++        aclnnGather,
++        topk_indices,
++        dim,
++        prefetch_index,
++        prefetch_topk);
++
++    at::Tensor padTensor = gsa_indices_output.slice(0, 0, topk_indices.size(DIM_0));
++    EXEC_NPU_CMD(
++        aclnnConstantPadNd,
++        topk_indices,
++        pad,
++        padValue,
++        padTensor);
++
++    EXEC_NPU_CMD(
++        aclnnInplaceScatter,
++        gsa_indices_output,
++        dim,
++        swap_index,
++        swap_topk,
++        reduce);
++    return gsa_indices_output.view({topk_indices.size(DIM_0) + 2, 1, expand_len}).slice(0, 0, topk_indices.size(DIM_0));
++}
++
++at::Tensor gsa_indices_scatter_and_expand_new(
++    at::Tensor& topk_indices, at::Tensor &prefetch_topk, at::Tensor& swap_topk,
++    at::Tensor& prefetch_index, at::Tensor& swap_index, at::Tensor& tmp_tensor,
++    const at::IntArrayRef &pad, const at::Scalar padValue, int64_t expand_len)
++{
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(topk_indices.device().type() == c10::DeviceType::PrivateUse1, "topk_indices must be on NPU");
++    TORCH_CHECK(prefetch_topk.device().type() == c10::DeviceType::PrivateUse1, "prefetch_topk must be on NPU");
++    TORCH_CHECK(swap_topk.device().type() == c10::DeviceType::PrivateUse1, "swap_topk must be on NPU");
++    TORCH_CHECK(prefetch_index.device().type() == c10::DeviceType::PrivateUse1, "prefetch_index must be on NPU");
++    TORCH_CHECK(swap_index.device().type() == c10::DeviceType::PrivateUse1, "swap_index must be on NPU");
++    TORCH_CHECK(tmp_tensor.device().type() == c10::DeviceType::PrivateUse1, "swap_index must be on NPU");
++
++    TORCH_CHECK(prefetch_index.dtype() == torch::kInt64, "index must be torch.int64");
++    TORCH_CHECK(swap_index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be 2D");
++    TORCH_CHECK(prefetch_topk.dim() == 2, "prefetch_topk must be 2D");
++    TORCH_CHECK(swap_topk.dim() == 2, "swap_topk must be 2D");
++    TORCH_CHECK(prefetch_index.dim() == 2, "prefetch_index must be 2D");
++    TORCH_CHECK(swap_index.dim() == 2, "swap_index must be 2D");
++
++    TORCH_CHECK(topk_indices.size(1) == prefetch_topk.size(1), "the second dimension of topk_indices and prefetch_topk must be equal");
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    constexpr int32_t SIZE = 8;
++    constexpr int32_t DIM_0 = 0;
++    constexpr int32_t DIM_1 = 1;
++
++    int64_t dim = 0;
++    int64_t reduce = 0;
++
++    EXEC_NPU_CMD(
++        aclnnGather,
++        topk_indices,
++        dim,
++        prefetch_index,
++        prefetch_topk);
++
++    EXEC_NPU_CMD(
++        aclnnInplaceFillScalar,
++        tmp_tensor,
++        padValue);
++
++    at::Tensor sliced_view = tmp_tensor.slice(0, 0, topk_indices.size(DIM_0))
++                                       .slice(1, 0, topk_indices.size(DIM_1));
++
++    EXEC_NPU_CMD(
++        aclnnInplaceCopy,
++        sliced_view,
++        topk_indices);
++
++    EXEC_NPU_CMD(
++        aclnnInplaceScatter,
++        tmp_tensor,
++        dim,
++        swap_index,
++        swap_topk,
++        reduce);
++    return tmp_tensor.view({tmp_tensor.size(DIM_0), 1, expand_len}).slice(0, 0, topk_indices.size(DIM_0));
++}
++
++at::Tensor gsa_topk_expand(
++    at::Tensor& topk_indices, at::Tensor& swap_topk, at::Tensor& swap_index, const at::IntArrayRef &pad,
++    const at::Scalar padValue, int64_t expand_len)
++{
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(topk_indices.device().type() == c10::DeviceType::PrivateUse1, "topk_indices must be on NPU");
++    TORCH_CHECK(swap_topk.device().type() == c10::DeviceType::PrivateUse1, "swap_topk must be on NPU");
++    TORCH_CHECK(swap_index.device().type() == c10::DeviceType::PrivateUse1, "swap_index must be on NPU");
++    TORCH_CHECK(swap_index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be 2D");
++    TORCH_CHECK(swap_topk.dim() == 2, "swap_topk must be 2D");
++    TORCH_CHECK(swap_index.dim() == 2, "swap_index must be 2D");
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    constexpr int32_t SIZE = 8;
++    constexpr int32_t DIM_0 = 0;
++    constexpr int32_t DIM_1 = 1;
++
++    at::SmallVector<int64_t, SIZE> output_size = {topk_indices.size(DIM_0) + 2, expand_len};
++    at::Tensor gsa_indices_output = at::empty(output_size, topk_indices.options());
++
++    int64_t dim = 0;
++    int64_t reduce = 0;
++
++    at::Tensor padTensor = gsa_indices_output.slice(0, 0, topk_indices.size(DIM_0));
++    EXEC_NPU_CMD(
++        aclnnConstantPadNd,
++        topk_indices,
++        pad,
++        padValue,
++        padTensor);
++
++    EXEC_NPU_CMD(
++        aclnnInplaceScatter,
++        gsa_indices_output,
++        dim,
++        swap_index,
++        swap_topk,
++        reduce);
++    return gsa_indices_output.view({topk_indices.size(DIM_0) + 2, 1, expand_len}).slice(0, 0, topk_indices.size(DIM_0));
++}
++
++at::Tensor gsa_topk_expand_tmp(
++    at::Tensor& topk_indices, at::Tensor& swap_topk, at::Tensor& swap_index,
++    at::Tensor& tmp_tensor, const at::IntArrayRef &pad,
++    const at::Scalar padValue, int64_t expand_len)
++{
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(topk_indices.device().type() == c10::DeviceType::PrivateUse1, "topk_indices must be on NPU");
++    TORCH_CHECK(swap_topk.device().type() == c10::DeviceType::PrivateUse1, "swap_topk must be on NPU");
++    TORCH_CHECK(swap_index.device().type() == c10::DeviceType::PrivateUse1, "swap_index must be on NPU");
++    TORCH_CHECK(tmp_tensor.device().type() == c10::DeviceType::PrivateUse1, "tmp_tensor must be on NPU");
++    TORCH_CHECK(swap_index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be 2D");
++    TORCH_CHECK(swap_topk.dim() == 2, "swap_topk must be 2D");
++    TORCH_CHECK(swap_index.dim() == 2, "swap_index must be 2D");
++    TORCH_CHECK(tmp_tensor.dim() == 2, "tmp_tensor must be 2D");
++    TORCH_CHECK(tmp_tensor.is_contiguous(), "tmp_tensor must be contiguous");
++    TORCH_CHECK(tmp_tensor.dtype() == topk_indices.dtype(), "tmp_tensor dtype must match topk_indices");
++
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    TORCH_CHECK(tmp_tensor.size(0) >= topk_indices.size(0) + 2, "tmp_tensor rows must be no less than topk_indices rows + 2");
++    TORCH_CHECK(tmp_tensor.size(1) == expand_len, "tmp_tensor cols must equal expand_len");
++
++    constexpr int32_t DIM_0 = 0;
++    constexpr int32_t DIM_1 = 1;
++
++    int64_t dim = 0;
++    int64_t reduce = 0;
++
++    at::Tensor padTensor = tmp_tensor.slice(0, 0, topk_indices.size(DIM_0));
++    EXEC_NPU_CMD(
++        aclnnConstantPadNd,
++        topk_indices,
++        pad,
++        padValue,
++        padTensor);
++
++    // ③ scatter 覆盖 swap 行
++    EXEC_NPU_CMD(
++        aclnnInplaceScatter,
++        tmp_tensor,
++        dim,
++        swap_index,
++        swap_topk,
++        reduce);
++    return tmp_tensor.view({tmp_tensor.size(DIM_0), 1, expand_len}).slice(DIM_0, 0, topk_indices.size(DIM_0));
++}
++
+ std::tuple<at::Tensor, at::Tensor> npu_gemma_rms_norm(
+     const at::Tensor& x,
+     const at::Tensor& gamma,
+@@ -3242,6 +3611,68 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
+         );
+     ops.impl("npu_sparse_attn_sharedkv_metadata", torch::kPrivateUse1, &vllm_ascend::npu_sparse_attn_sharedkv_metadata_npu);
+ 
++    ops.def(
++        "gsa_scatter_copy(Tensor dst, Tensor src, Tensor index) -> ()"
++    );
++    ops.impl("gsa_scatter_copy", torch::kPrivateUse1, &vllm_ascend::gsa_scatter_copy);
++
++    ops.def(
++        "gsa_gather_copy(Tensor dst, Tensor src, Tensor index) -> ()"
++    );
++    ops.impl("gsa_gather_copy", torch::kPrivateUse1, &vllm_ascend::gsa_gather_copy);
++
++    ops.def(
++        "gsa_inplace_copy(Tensor dst, Tensor src) -> ()"
++    );
++    ops.impl("gsa_inplace_copy", torch::kPrivateUse1, &vllm_ascend::gsa_inplace_copy);
++
++    ops.def(
++        "gsa_fill(Tensor dst, Scalar padValue) -> ()"
++    );
++    ops.impl("gsa_fill", torch::kPrivateUse1, &vllm_ascend::gsa_fill);
++
++    ops.def(
++        "indexer_gather_qw(Tensor q_src, Tensor w_src, Tensor q_dst, Tensor w_dst, Tensor q_index, Tensor w_index) -> ()"
++    );
++    ops.impl("indexer_gather_qw", torch::kPrivateUse1, &vllm_ascend::indexer_gather_qw);
++
++    ops.def(
++        "gsa_gather_scatter_copy(Tensor dst, Tensor tmp, Tensor dst_index, Tensor src_index) -> ()"
++    );
++    ops.impl("gsa_gather_scatter_copy", torch::kPrivateUse1, &vllm_ascend::gsa_gather_scatter_copy);
++
++    ops.def(
++        "gsa_indices_scatter_and_expand(Tensor topk_indices, Tensor prefetch_topk,"
++        "                      Tensor swap_topk, Tensor prefetch_index,"
++        "                      Tensor swap_index, int[] pad,"
++        "                      Scalar padValue, int expand_len) -> Tensor"
++    );
++    ops.impl("gsa_indices_scatter_and_expand", torch::kPrivateUse1, &vllm_ascend::gsa_indices_scatter_and_expand);
++
++    ops.def(
++        "gsa_indices_scatter_and_expand_new(Tensor topk_indices, Tensor prefetch_topk,"
++        "                      Tensor swap_topk, Tensor prefetch_index,"
++        "                      Tensor swap_index, Tensor tmp_tensor, int[] pad,"
++        "                      Scalar padValue, int expand_len) -> Tensor"
++    );
++    ops.impl("gsa_indices_scatter_and_expand_new", torch::kPrivateUse1, &vllm_ascend::gsa_indices_scatter_and_expand_new);
++
++    ops.def(
++        "gsa_topk_expand(Tensor topk_indices,"
++        "                Tensor swap_topk,"
++        "                Tensor swap_index, int[] pad,"
++        "                Scalar padValue, int expand_len) -> Tensor"
++    );
++    ops.impl("gsa_topk_expand", torch::kPrivateUse1, &vllm_ascend::gsa_topk_expand);
++
++    ops.def(
++        "gsa_topk_expand_tmp(Tensor topk_indices,"
++        "                Tensor swap_topk,"
++        "                Tensor swap_index, Tensor tmp_tensor, int[] pad,"
++        "                Scalar padValue, int expand_len) -> Tensor"
++    );
++    ops.impl("gsa_topk_expand_tmp", torch::kPrivateUse1, &vllm_ascend::gsa_topk_expand_tmp);
++
+     ops.def(
+           "npu_hc_post("
+             "Tensor x, "
+diff --git a/csrc/torch_binding_meta.cpp b/csrc/torch_binding_meta.cpp
+index 6cd123571..d51208149 100644
+--- a/csrc/torch_binding_meta.cpp
++++ b/csrc/torch_binding_meta.cpp
+@@ -1425,6 +1425,228 @@ at::Tensor npu_lightning_indexer_quant_meta(
+     return lightning_indexer_quant_output;
+ }
+ 
++void gsa_scatter_copy_meta(
++    at::Tensor& dst, const at::Tensor& src, const at::Tensor& index)
++{
++    if (index.numel() == 0) {
++        return;
++    }
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++    TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1, "src must be on NPU");
++    TORCH_CHECK(index.device().type() == c10::DeviceType::PrivateUse1, "index must be on NPU");
++
++    TORCH_CHECK(index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(dst.dim() == 2, "dst must be 3D");
++    TORCH_CHECK(src.dim() == 2, "src must be 3D");
++    TORCH_CHECK(index.dim() == 2, "index must be 1D");
++
++    TORCH_CHECK(dst.size(1) == src.size(1), "the second dimension of dst and src must be equal");
++
++    return;
++}
++
++void gsa_gather_copy_meta(
++    at::Tensor& dst, const at::Tensor& src, const at::Tensor& index)
++{
++    if (index.numel() == 0) {
++        return;
++    }
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++    TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1, "src must be on NPU");
++    TORCH_CHECK(index.device().type() == c10::DeviceType::PrivateUse1, "index must be on NPU");
++
++    TORCH_CHECK(index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(dst.dim() == 2, "dst must be 3D");
++    TORCH_CHECK(src.dim() == 2, "src must be 3D");
++    TORCH_CHECK(index.dim() == 2, "index must be 1D");
++
++    TORCH_CHECK(dst.size(1) == src.size(1), "the second dimension of dst and src must be equal");
++
++    return;
++}
++
++void gsa_inplace_copy_meta(at::Tensor& dst, const at::Tensor& src)
++{
++    TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++    TORCH_CHECK(src.device().type() == c10::DeviceType::PrivateUse1, "src must be on NPU");
++}
++
++void gsa_fill_meta(at::Tensor& dst, const at::Scalar padValue)
++{
++    TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++}
++
++void gsa_gather_scatter_copy_meta(
++    at::Tensor& dst, at::Tensor &tmp, const at::Tensor& dst_index, const at::Tensor& src_index)
++{
++    if (dst_index.numel() == 0) {
++        return;
++    }
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(dst.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++    TORCH_CHECK(tmp.device().type() == c10::DeviceType::PrivateUse1, "src must be on NPU");
++    TORCH_CHECK(dst_index.device().type() == c10::DeviceType::PrivateUse1, "index must be on NPU");
++    TORCH_CHECK(src_index.device().type() == c10::DeviceType::PrivateUse1, "index must be on NPU");
++
++    TORCH_CHECK(dst_index.dtype() == torch::kInt64, "index must be torch.int64");
++    TORCH_CHECK(src_index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(dst.dim() == 2, "dst must be 3D");
++    TORCH_CHECK(tmp.dim() == 2, "src must be 3D");
++    TORCH_CHECK(dst_index.dim() == 2, "index must be 1D");
++    TORCH_CHECK(src_index.dim() == 2, "index must be 1D");
++
++    TORCH_CHECK(dst.size(1) == tmp.size(1), "the second dimension of dst and src must be equal");
++    return;
++}
++
++void indexer_gather_qw_meta(
++    const at::Tensor& q_src, const at::Tensor& w_src, at::Tensor& q_dst, at::Tensor& w_dst, const at::Tensor& q_index, const at::Tensor& w_index)
++{
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(q_src.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++    TORCH_CHECK(w_src.device().type() == c10::DeviceType::PrivateUse1, "src must be on NPU");
++    TORCH_CHECK(q_dst.device().type() == c10::DeviceType::PrivateUse1, "dst must be on NPU");
++    TORCH_CHECK(w_dst.device().type() == c10::DeviceType::PrivateUse1, "src must be on NPU");
++    TORCH_CHECK(q_index.device().type() == c10::DeviceType::PrivateUse1, "index must be on NPU");
++    TORCH_CHECK(w_index.device().type() == c10::DeviceType::PrivateUse1, "index must be on NPU");
++
++    TORCH_CHECK(q_index.dtype() == torch::kInt64, "index must be torch.int64");
++    TORCH_CHECK(w_index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(q_src.dim() == 2, "dst must be 2D");
++    TORCH_CHECK(w_src.dim() == 2, "src must be 2D");
++    TORCH_CHECK(q_dst.dim() == 2, "dst must be 2D");
++    TORCH_CHECK(w_dst.dim() == 2, "src must be 2D");
++    TORCH_CHECK(q_index.dim() == 2, "index must be 2D");
++    TORCH_CHECK(w_index.dim() == 2, "index must be 2D");
++
++    TORCH_CHECK(q_src.size(1) == q_dst.size(1), "the second dimension of dst and src must be equal");
++    TORCH_CHECK(w_src.size(1) == w_dst.size(1), "the second dimension of dst and src must be equal");
++}
++
++at::Tensor gsa_indices_scatter_and_expand_meta(
++    at::Tensor& topk_indices, at::Tensor &prefetch_topk, at::Tensor& swap_topk,
++    at::Tensor& prefetch_index, at::Tensor& swap_index, const at::IntArrayRef &pad,
++    const at::Scalar padValue, int64_t expand_len)
++{
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(topk_indices.device().type() == c10::DeviceType::PrivateUse1, "topk_indices must be on NPU");
++    TORCH_CHECK(prefetch_topk.device().type() == c10::DeviceType::PrivateUse1, "prefetch_topk must be on NPU");
++    TORCH_CHECK(swap_topk.device().type() == c10::DeviceType::PrivateUse1, "swap_topk must be on NPU");
++    TORCH_CHECK(prefetch_index.device().type() == c10::DeviceType::PrivateUse1, "prefetch_index must be on NPU");
++    TORCH_CHECK(swap_index.device().type() == c10::DeviceType::PrivateUse1, "swap_index must be on NPU");
++
++    TORCH_CHECK(prefetch_index.dtype() == torch::kInt64, "index must be torch.int64");
++    TORCH_CHECK(swap_index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be 2D");
++    TORCH_CHECK(prefetch_topk.dim() == 2, "prefetch_topk must be 2D");
++    TORCH_CHECK(swap_topk.dim() == 2, "swap_topk must be 2D");
++    TORCH_CHECK(prefetch_index.dim() == 2, "prefetch_index must be 2D");
++    TORCH_CHECK(swap_index.dim() == 2, "swap_index must be 2D");
++
++    TORCH_CHECK(topk_indices.size(1) == prefetch_topk.size(1), "the second dimension of topk_indices and prefetch_topk must be equal");
++
++    constexpr int32_t SIZE = 8;
++    constexpr int32_t DIM_0 = 0;
++    constexpr int32_t DIM_1 = 1;
++
++    at::SmallVector<int64_t, SIZE> output_size = {topk_indices.size(DIM_0), topk_indices.size(DIM_1), expand_len};
++    at::Tensor gsa_indices_output = at::empty(output_size, topk_indices.options().dtype(at::kInt));
++    return gsa_indices_output;
++}
++
++
++at::Tensor gsa_indices_scatter_and_expand_new_meta(
++    at::Tensor& topk_indices, at::Tensor &prefetch_topk, at::Tensor& swap_topk,
++    at::Tensor& prefetch_index, at::Tensor& swap_index, at::Tensor& tmp_tensor,
++    const at::IntArrayRef &pad, const at::Scalar padValue, int64_t expand_len)
++{
++    // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(topk_indices.device().type() == c10::DeviceType::PrivateUse1, "topk_indices must be on NPU");
++    TORCH_CHECK(prefetch_topk.device().type() == c10::DeviceType::PrivateUse1, "prefetch_topk must be on NPU");
++    TORCH_CHECK(swap_topk.device().type() == c10::DeviceType::PrivateUse1, "swap_topk must be on NPU");
++    TORCH_CHECK(prefetch_index.device().type() == c10::DeviceType::PrivateUse1, "prefetch_index must be on NPU");
++    TORCH_CHECK(swap_index.device().type() == c10::DeviceType::PrivateUse1, "swap_index must be on NPU");
++    TORCH_CHECK(tmp_tensor.device().type() == c10::DeviceType::PrivateUse1, "swap_index must be on NPU");
++
++    TORCH_CHECK(prefetch_index.dtype() == torch::kInt64, "index must be torch.int64");
++    TORCH_CHECK(swap_index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be 2D");
++    TORCH_CHECK(prefetch_topk.dim() == 2, "prefetch_topk must be 2D");
++    TORCH_CHECK(swap_topk.dim() == 2, "swap_topk must be 2D");
++    TORCH_CHECK(prefetch_index.dim() == 2, "prefetch_index must be 2D");
++    TORCH_CHECK(swap_index.dim() == 2, "swap_index must be 2D");
++
++    TORCH_CHECK(topk_indices.size(1) == prefetch_topk.size(1), "the second dimension of topk_indices and prefetch_topk must be equal");
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    constexpr int32_t SIZE = 8;
++    constexpr int32_t DIM_0 = 0;
++    constexpr int32_t DIM_1 = 1;
++
++    int64_t dim = 0;
++    int64_t reduce = 0;
++}
++
++at::Tensor gsa_topk_expand_meta(
++    at::Tensor& topk_indices, at::Tensor& swap_topk,
++    at::Tensor& swap_index, const at::IntArrayRef &pad,
++    const at::Scalar padValue, int64_t expand_len)
++{
++        // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(topk_indices.device().type() == c10::DeviceType::PrivateUse1, "topk_indices must be on NPU");
++    TORCH_CHECK(swap_topk.device().type() == c10::DeviceType::PrivateUse1, "swap_topk must be on NPU");
++    TORCH_CHECK(swap_index.device().type() == c10::DeviceType::PrivateUse1, "swap_index must be on NPU");
++    TORCH_CHECK(swap_index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be 2D");
++    TORCH_CHECK(swap_topk.dim() == 2, "swap_topk must be 2D");
++    TORCH_CHECK(swap_index.dim() == 2, "swap_index must be 2D");
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    constexpr int32_t SIZE = 8;
++    constexpr int32_t DIM_0 = 0;
++    constexpr int32_t DIM_1 = 1;
++
++    at::SmallVector<int64_t, SIZE> output_size = {topk_indices.size(DIM_0) + 2, expand_len};
++    at::Tensor gsa_indices_output = at::empty(output_size, topk_indices.options());
++    return gsa_indices_output;
++}
++
++at::Tensor gsa_topk_expand_tmp_meta(
++    at::Tensor& topk_indices, at::Tensor& swap_topk, at::Tensor& swap_index,
++    at::Tensor& tmp_tensor, const at::IntArrayRef &pad,
++    const at::Scalar padValue, int64_t expand_len)
++{
++        // ---------- 1. 输入合法性检查 ----------
++    TORCH_CHECK(topk_indices.device().type() == c10::DeviceType::PrivateUse1, "topk_indices must be on NPU");
++    TORCH_CHECK(swap_topk.device().type() == c10::DeviceType::PrivateUse1, "swap_topk must be on NPU");
++    TORCH_CHECK(swap_index.device().type() == c10::DeviceType::PrivateUse1, "swap_index must be on NPU");
++    TORCH_CHECK(tmp_tensor.device().type() == c10::DeviceType::PrivateUse1, "tmp_tensor must be on NPU");
++    TORCH_CHECK(swap_index.dtype() == torch::kInt64, "index must be torch.int64");
++
++    TORCH_CHECK(topk_indices.dim() == 2, "topk_indices must be 2D");
++    TORCH_CHECK(swap_topk.dim() == 2, "swap_topk must be 2D");
++    TORCH_CHECK(swap_index.dim() == 2, "swap_index must be 2D");
++    TORCH_CHECK(tmp_tensor.dim() == 2, "tmp_tensor must be 2D");
++    TORCH_CHECK(tmp_tensor.is_contiguous(), "tmp_tensor must be contiguous");
++    TORCH_CHECK(tmp_tensor.dtype() == topk_indices.dtype(), "tmp_tensor dtype must match topk_indices");
++
++    TORCH_CHECK(expand_len >= topk_indices.size(1), "the second dimension of topk_indices must samll than expand_len");
++    TORCH_CHECK(tmp_tensor.size(0) >= topk_indices.size(0) + 2, "tmp_tensor rows must be no less than topk_indices rows + 2");
++    TORCH_CHECK(tmp_tensor.size(1) == expand_len, "tmp_tensor cols must equal expand_len");
++    constexpr int32_t SIZE = 8;
++    constexpr int32_t DIM_0 = 0;
++
++    at::SmallVector<int64_t, SIZE> output_size = {topk_indices.size(DIM_0), 1, expand_len};
++    return at::empty(output_size, topk_indices.options().dtype(at::kInt));
++}
++
+ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_k2q_csr_meta(
+     const at::Tensor &q2k,
+     const at::Tensor &cu_seqlens,
+@@ -1856,6 +2078,26 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
+     ops.impl("npu_msa_index_score", &vllm_ascend::meta::npu_msa_index_score_meta);
+     ops.impl("npu_kv_quant_sparse_flash_attention_vllm",
+              &vllm_ascend::meta::npu_kv_quant_sparse_flash_attention_vllm_meta);
++    // gsa scatter copy
++    ops.impl("gsa_scatter_copy", &vllm_ascend::meta::gsa_scatter_copy_meta);
++    // gsa gather copy
++    ops.impl("gsa_gather_copy", &vllm_ascend::meta::gsa_gather_copy_meta);
++    // gsa gather copy
++    ops.impl("gsa_inplace_copy", &vllm_ascend::meta::gsa_inplace_copy_meta);
++    // gsa gather copy
++    ops.impl("gsa_fill", &vllm_ascend::meta::gsa_fill_meta);
++    // gsa gather copy
++    ops.impl("indexer_gather_qw", &vllm_ascend::meta::indexer_gather_qw_meta);
++    // gsa gather scatter copy
++    ops.impl("gsa_gather_scatter_copy", &vllm_ascend::meta::gsa_gather_scatter_copy_meta);
++        // gsa gather scatter copy
++    ops.impl("gsa_indices_scatter_and_expand", &vllm_ascend::meta::gsa_indices_scatter_and_expand_meta);
++        // gsa gather scatter copy
++    ops.impl("gsa_indices_scatter_and_expand_new", &vllm_ascend::meta::gsa_indices_scatter_and_expand_new_meta);
++    // gsa topk expend
++    ops.impl("gsa_topk_expand", &vllm_ascend::meta::gsa_topk_expand_meta);
++    // gsa topk expend with cached tmp_tensor
++    ops.impl("gsa_topk_expand_tmp", &vllm_ascend::meta::gsa_topk_expand_tmp_meta);
+     // Fused sparse attention overlap
+     ops.impl("npu_fused_sparse_attention_overlap", &vllm_ascend::meta::npu_fused_sparse_attention_overlap_meta);
+     // Fused lightning indexer manage
+diff --git a/vllm_ascend/attention/indexer.py b/vllm_ascend/attention/indexer.py
+index 04d8c281c..13242a23f 100644
+--- a/vllm_ascend/attention/indexer.py
++++ b/vllm_ascend/attention/indexer.py
+@@ -47,6 +47,13 @@ from vllm_ascend.utils import (
+     enable_sfa_dcp_replicated_indexer,
+     is_pd_decode_recompute_scheduler_enabled,
+ )
++from ucm.sparse.state import has_ucm_sparse
++from ucm.sparse.utils import (
++    IS_INDEXER_OFFLOAD,
++    MAX_INDEXER_BLOCK_NUM,
++    PTOPK_PREFETCH_ENABLE,
++    init_indexer_layer_map,
++)
+ 
+ # Slots of the k / scale caches inside an indexer's own ``k_cache.kv_cache``
+ # tuple (the scale slot exists only when LI C8 is enabled).
+@@ -205,6 +212,55 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+             self.c4_k_cache_dtype, self.c4_k_scale_cache_dtype = torch.uint8, torch.float8_e8m0fnu
+             self.c4_k_op_dtype = torch_npu.float4_e2m1fn_x2
+ 
++        # GSA (dev 0.23.0): the backend owns the per-layer DSA caches and the
++        # routing attrs consumed by DeviceOperator.indexer_select_post_process
++        # via ``sfa_impl=self``. Mirrors AscendSFAImpl's 0.23.0 derivation.
++        self.vllm_config = get_current_vllm_config()
++        self.layer_id = int(self.k_cache.prefix.split(".")[2])
++        self.layer_num = self.vllm_config.model_config.get_num_layers(
++            self.vllm_config.parallel_config
++        )
++        self.is_pdmix = (
++            self.vllm_config.kv_transfer_config is None or (
++                self.vllm_config.kv_transfer_config.is_kv_producer and
++                self.vllm_config.kv_transfer_config.is_kv_consumer
++            )
++        )
++        self.topk_layer_info, self.topk_layer_map, self.indexr_num = init_indexer_layer_map(self.vllm_config)
++        if self.layer_id < self.layer_num:
++            self.cur_topk_index = self.topk_layer_map[self.layer_id]
++        else:
++            self.cur_topk_index = self.layer_num - 1
++        self._gsa_layer_active = False
++        if has_ucm_sparse() and PTOPK_PREFETCH_ENABLE:
++            if self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer:
++                # gsa param
++                num_slots = MAX_INDEXER_BLOCK_NUM
++                if self.enable_sparse_li_c8:
++                    indexer_type = self.c8_k_cache_dtype
++                else:
++                    indexer_type = self.vllm_config.model_config.dtype
++
++                self.dsa_k_cache = torch.empty(
++                    (num_slots, self.vllm_config.cache_config.block_size, 1, 128),
++                    dtype=indexer_type,
++                    device=self.vllm_config.device_config.device_type,
++                    pin_memory=False,
++                )
++                if self.enable_sparse_li_c8:
++                    self.dsa_k_scale = torch.empty(
++                        (num_slots, self.vllm_config.cache_config.block_size, 1, 1),
++                        dtype=self.c8_k_scale_cache_dtype,
++                        device=self.vllm_config.device_config.device_type,
++                        pin_memory=False,
++                    )
++            else:
++                self.dsa_k_cache = None
++            self._gsa_layer_active = (
++                self.layer_id < self.layer_num
++                and (self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
++            )
++
+         model_type = get_current_vllm_config().model_config.hf_config.model_type
+         self.is_rope_neox_style = model_type not in ["glm_moe_dsa"]
+         self.use_torch_npu_lightning_indexer = model_type in ["glm_moe_dsa"]
+@@ -299,6 +355,30 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+                 k_li_scale.view(-1, *scale_per_token),
+             )
+ 
++    def _write_dsa_cache(
++        self,
++        k_li: torch.Tensor,
++        k_li_scale: torch.Tensor | None,
++        indexer_metadata: AscendSFAIndexerMetadata,
++    ) -> None:
++        """GSA (dev 0.23.0): scatter the k path output into the per-layer
++        DSA caches instead of the vLLM indexer cache. The raw dsa slot
++        mapping is used (no PCP/DSA-CP gather transform), matching dev's
++        inline GSA write."""
++        slot_mapping = indexer_metadata.dsa_slot_mapping[: indexer_metadata.gsa_slot_len]
++        torch_npu.npu_scatter_nd_update_(
++            self.dsa_k_cache.view(-1, k_li.shape[-1]),
++            slot_mapping.view(-1, 1),
++            k_li.view(-1, k_li.shape[-1]),
++        )  # b, s, n, d
++        if self.enable_sparse_li_c8:
++            assert k_li_scale is not None
++            torch_npu.npu_scatter_nd_update_(
++                self.dsa_k_scale.view(-1, k_li_scale.shape[-1]),
++                slot_mapping.view(-1, 1),
++                k_li_scale.view(-1, k_li_scale.shape[-1]),
++            )
++
+     def forward_k(
+         self,
+         hidden_states: torch.Tensor,
+@@ -425,8 +505,13 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+             # the TP cache gathers after Q to avoid concurrent cross-group AIV
+             # collectives during graph replay. wait() adds a stream dependency.
+             attn_q_gather_handle.wait()
+-        k_li, k_li_scale, slot_mapping = self._gather_cache_inputs(k_li, k_li_scale, indexer_metadata)
+-        self.write_cache(k_li, k_li_scale, slot_mapping)
++        if self._gsa_layer_active:
++            # GSA (dev 0.23.0): persist into the per-layer DSA caches with the
++            # raw dsa slot mapping instead of the vLLM indexer cache.
++            self._write_dsa_cache(k_li, k_li_scale, indexer_metadata)
++        else:
++            k_li, k_li_scale, slot_mapping = self._gather_cache_inputs(k_li, k_li_scale, indexer_metadata)
++            self.write_cache(k_li, k_li_scale, slot_mapping)
+         if not compute_topk:
+             return None
+ 
+@@ -491,6 +576,39 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+             q_li_shape_ori = q_li.shape
+             q_li, q_li_scale = self._quantize_li_tensor(q_li)
+ 
++        if self._gsa_layer_active:
++            # GSA (dev 0.23.0): key lengths come from the DSA metadata; the
++            # offload gather publishes q/weights to the indexer_last buffers
++            # for later layers; the selection op routes to this layer's DSA
++            # caches via ``sfa_impl`` (device_op.py GSA routing). GSA never
++            # combines with the C4 lightning indexer.
++            actual_seq_lengths_key = indexer_metadata.dsa_seq_len
++            if IS_INDEXER_OFFLOAD:
++                torch.ops._C_ascend.indexer_gather_qw(
++                    q_li.view(-1, self.n_head * self.head_dim),
++                    weights.view(-1, self.n_head),
++                    indexer_metadata.indexer_last_query[self.layer_id][: indexer_metadata.indexer_last_query_len].view(-1, self.n_head * self.head_dim),
++                    indexer_metadata.indexer_last_weight[self.layer_id][: indexer_metadata.indexer_last_query_len].view(-1, self.n_head),
++                    indexer_metadata.indexer_last_q_index[: indexer_metadata.indexer_last_query_len].view(-1, 1).expand((-1, self.n_head * self.head_dim)),
++                    indexer_metadata.indexer_last_q_index[: indexer_metadata.indexer_last_query_len].view(-1, 1).expand((-1, self.n_head)),
++                )
++            return DeviceOperator.indexer_select_post_process(
++                q_li,
++                q_li_scale,
++                q_li_shape_ori,
++                weights,
++                self.k_cache.kv_cache,
++                INDEXER_K_CACHE_SLOT,
++                INDEXER_SCALE_CACHE_SLOT,
++                indexer_metadata,
++                indexer_metadata.actual_seq_lengths_query,
++                actual_seq_lengths_key,
++                self.enable_sparse_li_c8,
++                False,
++                self.use_torch_npu_lightning_indexer,
++                sfa_impl=self,
++            )
++
+         topk_selector = getattr(indexer_metadata, "topk_selector", None)
+         if topk_selector is not None:
+             return topk_selector(q_li, weights, self, indexer_metadata, q_li_scale)
+diff --git a/vllm_ascend/attention/sfa_v1.py b/vllm_ascend/attention/sfa_v1.py
+index 5fbfab5ae..2bded6a94 100644
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -2,6 +2,10 @@ from collections.abc import Callable
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any, TypeVar
+ 
++import yaml
++import pathlib
++import math
++
+ import torch
+ import torch.distributed as dist
+ import torch_npu
+@@ -81,6 +85,23 @@ if TYPE_CHECKING:
+ 
+     from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+ 
++import torch.nn.functional as F
++from vllm.forward_context import ForwardContext, get_forward_context
++from vllm.model_executor.layers.attention.attention import (
++    maybe_execute_sparse_attention_begin,
++    maybe_execute_sparse_attention_finished)
++from ucm.sparse.state import has_ucm_sparse
++from ucm.sparse.utils import (
++    PTOPK_PREFETCH_ENABLE,
++    SPA_TOKENS_LEN,
++    DEFAULT_TOPK_LEN,
++    init_indexer_layer_map)
++
++import os
++import atexit
++import json
++
++import inspect
+ 
+ # NoPE sparse MLA operator helpers.
+ SMLA_METADATA_SIZE = 1024
+@@ -410,6 +431,7 @@ class AscendSFAMetadata:
+     # |---------- context_len ----------|
+     # |-------------------- seq_len ---------------------|
+     #                                   |-- query_len ---|
++    has_prefill: bool
+     num_actual_tokens: int  # Number of tokens excluding padding.
+     slot_mapping: torch.Tensor
+     seq_lens: torch.Tensor
+@@ -450,6 +472,34 @@ class AscendSFAMetadata:
+     smla_sinks: torch.Tensor | None = None
+ 
+ 
++    # gsa info
++    is_graph_dummy: bool = False
++    topk_indices_global: torch.Tensor = None
++    dsa_block_table: torch.Tensor = None
++    dsa_slot_mapping: torch.Tensor = None
++    dsa_seq_len: torch.Tensor = None
++    gsa_prefetch_index: torch.Tensor = None
++    gsa_prefetch_topk: torch.Tensor = None
++    gsa_swap_index: torch.Tensor = None
++    gsa_swap_topk: torch.Tensor = None
++    gsa_warmup_index: torch.Tensor = None
++    gsa_warmup_topk: torch.Tensor = None
++    gsa_prefetch_len: int = 0
++    gsa_swap_len: int = 0
++    gsa_warmup_len: int = 0
++    gsa_slot_len: int = 0
++    #### indexer offload
++    indexer_last_query: torch.Tensor = None
++    indexer_last_q_index: torch.Tensor = None
++    indexer_last_weight: torch.Tensor = None
++    indexer_last_query_len: int = 0
++    num_padding_reqs: int = 1
++    gsa_prefill_query: torch.Tensor = None
++    select_block_index: torch.Tensor = None
++    gsa_topk_win_tmp: torch.Tensor = None
++
++
++
+ M = TypeVar("M", bound=AscendSFAMetadata)
+ 
+ 
+@@ -658,6 +708,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
+         slot_mapping = pcp_slot_mapping[:num_input_tokens]
+         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
+ 
++        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
++        query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
++        has_prefill = any(query_lens_cpu > self.decode_threshold)
++
+         block_size = self.kernel_block_size
+ 
+         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
+@@ -692,6 +746,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
+         )
+ 
+         metadata = self.metadata_cls(  # type: ignore
++            has_prefill=has_prefill,
+             num_input_tokens=num_input_tokens,
+             num_actual_tokens=num_actual_tokens,
+             cum_query_lens=cum_query_lens,
+@@ -799,6 +854,9 @@ class AscendSFAImpl(MLAAttentionImpl):
+         self.num_kv_heads = num_kv_heads
+         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+ 
++        assert kv_sharing_target_layer_name is not None
++        self.layer_id = int(kv_sharing_target_layer_name.split(".")[2])
++
+         # MLA Args
+         self.q_lora_rank = kwargs["q_lora_rank"]
+         self.kv_lora_rank = kwargs["kv_lora_rank"]
+@@ -845,6 +903,21 @@ class AscendSFAImpl(MLAAttentionImpl):
+         self.sfa_qsfa_kr_cache_dummy: torch.Tensor | None = None
+ 
+         self.local_num_heads = self.num_heads
++
++        self.num_spec_tokens = 1
++        speculative_config =self.vllm_config.speculative_config
++        if speculative_config:
++            self.num_spec_tokens += speculative_config.num_speculative_tokens
++        self.layer_num = self.vllm_config.model_config.get_num_layers(
++            self.vllm_config.parallel_config
++        )
++        self.is_pdmix = (
++            self.vllm_config.kv_transfer_config is None or (
++                self.vllm_config.kv_transfer_config.is_kv_producer and
++                self.vllm_config.kv_transfer_config.is_kv_consumer
++            )
++        )
++
+         self.layer_name = kwargs.get("layer_name")
+         hf_config = self.vllm_config.model_config.hf_config
+         hf_text_config = getattr(self.vllm_config.model_config, "hf_text_config", None)
+@@ -903,6 +976,36 @@ class AscendSFAImpl(MLAAttentionImpl):
+ 
+         self.enable_sp = enable_sp()
+ 
++        # LI C8 switch and cache dtypes (0.30.0 moved them onto AscendIndexer;
++        # the GSA path reads them from the impl, mirroring the 0.30.0
++        # canonical derivation in indexer.py / model_runner_v1.py).
++        self.enable_sparse_li_c8 = get_ascend_config().is_sparse_li_c8_layer(self.layer_name)
++        if self.enable_sparse_li_c8:
++            self.c8_k_cache_dtype = kv_cache_dtype_str_to_dtype(
++                self.vllm_config.attention_config.indexer_kv_dtype,
++                self.vllm_config.model_config,
++            )
++            if self.c8_k_cache_dtype == torch.float8_e4m3fn:
++                self.c8_k_scale_cache_dtype = torch.float32
++            elif self.c8_k_cache_dtype == torch.int8:
++                self.c8_k_scale_cache_dtype = torch.float16
++
++        if has_ucm_sparse() and PTOPK_PREFETCH_ENABLE:
++            if self.has_indexer and (self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer):
++                # gsa param: the per-layer DSA caches moved onto the indexer
++                # backend (see AscendSFAIndexerBackend.__init__); alias them
++                # here for the begin/execute hooks below.
++                self.dsa_k_cache = self.indexer.impl.dsa_k_cache
++                if self.enable_sparse_li_c8:
++                    self.dsa_k_scale = self.indexer.impl.dsa_k_scale
++            else:
++                self.dsa_k_cache = None
++        self.topk_layer_info, self.topk_layer_map, self.indexr_num = init_indexer_layer_map(self.vllm_config)
++        if self.layer_id < self.layer_num:
++            self.cur_topk_index = self.topk_layer_map[self.layer_id]
++        else:
++            self.cur_topk_index = self.layer_num - 1
++
+     @property
+     def uses_packed_sfa_main_cache(self) -> bool:
+         return bool(self.enable_sparse_sfa_c8 or self.enable_sparse_sfa_turboquant)
+@@ -1577,6 +1680,23 @@ class AscendSFAImpl(MLAAttentionImpl):
+ 
+     def _prepare_indexer_metadata(self, indexer_metadata, attn_metadata) -> None:
+         """Allow an attention backend to supply indexer selection metadata."""
++        # GSA (dev 0.23.0): hand the DSA write/select context to the indexer
++        # backend -- the dsa slot mapping for the per-layer cache write, and
++        # the block table / key lengths / offload buffers for the selection.
++        if (
++            has_ucm_sparse() and PTOPK_PREFETCH_ENABLE
++            and self.layer_id < self.layer_num
++            and (self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
++            and self.runtime_has_indexer
++        ):
++            indexer_metadata.dsa_slot_mapping = attn_metadata.dsa_slot_mapping
++            indexer_metadata.gsa_slot_len = attn_metadata.gsa_slot_len
++            indexer_metadata.dsa_block_table = attn_metadata.dsa_block_table
++            indexer_metadata.dsa_seq_len = attn_metadata.dsa_seq_len
++            indexer_metadata.indexer_last_query = attn_metadata.indexer_last_query
++            indexer_metadata.indexer_last_weight = attn_metadata.indexer_last_weight
++            indexer_metadata.indexer_last_q_index = attn_metadata.indexer_last_q_index
++            indexer_metadata.indexer_last_query_len = attn_metadata.indexer_last_query_len
+         return
+ 
+     def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:
+@@ -1650,6 +1770,9 @@ class AscendSFAImpl(MLAAttentionImpl):
+         attn_metadata,
+         actual_seq_lengths_query,
+         actual_seq_lengths_key,
++        # GSA swap sub-batch's block-table row selector (v0230 8th-positional
++        # convention).
++        swap_len: torch.Tensor = None,
+         block_table=None,
+     ):
+         if self.enable_sparse_sfa_turboquant:
+@@ -1679,6 +1802,7 @@ class AscendSFAImpl(MLAAttentionImpl):
+             attn_metadata,
+             actual_seq_lengths_query,
+             actual_seq_lengths_key,
++            swap_len,
+             block_table=block_table,
+         )
+         if self.qk_rope_head_dim == 0:
+@@ -1943,6 +2067,13 @@ class AscendSFAImpl(MLAAttentionImpl):
+         if attn_metadata is None:
+             return self._forward_dummy(hidden_states, output)
+ 
++        # GSA: prefill-step marker from the builder (any query longer than
++        # decode_threshold). Read unconditionally: the dataclass always
++        # carries the field, and the dev-style guarded extraction would leave
++        # it undefined on pure-producer nodes where the GSA guards never
++        # consume it anyway.
++        has_prefill = attn_metadata.has_prefill
++
+         if self.qk_rope_head_dim == 0 and not input_is_sequence_parallel:
+             num_tokens = min(hidden_states.shape[0], attn_metadata.slot_mapping.shape[0])
+             if get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL:
+@@ -1975,6 +2106,9 @@ class AscendSFAImpl(MLAAttentionImpl):
+         actual_seq_lengths_query = parallel_context.actual_seq_lengths_query
+         actual_seq_lengths_key = parallel_context.actual_seq_lengths_key
+ 
++        if self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer:
++            forward_context: ForwardContext = get_forward_context()
++
+         fused_type: PreprocessType = self.preprocess_type
+         # PROLOG_V3 serves every attention state (decode, spec decoding and
+         # prefill); only MLAPO carries a per-call token-count limit.
+@@ -2103,7 +2237,58 @@ class AscendSFAImpl(MLAAttentionImpl):
+         # A sharded-decode PCP rank can own no request but must still write
+         # and gather KV with the other ranks.
+         has_local_query = attn_metadata.num_actual_tokens > 0
+-        if self.runtime_has_indexer:
++        if (
++            has_ucm_sparse() and PTOPK_PREFETCH_ENABLE
++            and self.layer_id < self.layer_num
++            and (self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
++            and self.runtime_has_indexer
++        ):
++            # ============ GSA section (migrated from dev 0.23.0) ============
++            # (1) Begin hook: launch the layer's GSA sparse-attention
++            # orchestration before this layer's k write (prefill steps only,
++            # matching dev). The composed cache tuple places the indexer
++            # k/scale caches at (1, 2) with a packed main cache (C8/TQ4) or
++            # (2, 3) with split k/v -- the same derivation dev used.
++            if has_prefill:
++                if self.uses_packed_sfa_main_cache:
++                    dsa_k_cache_idx = 1
++                    dsa_k_scale_cache_idx = 2
++                else:
++                    dsa_k_cache_idx = 2
++                    dsa_k_scale_cache_idx = 3
++                k_cache = kv_cache[0]
++                v_cache = kv_cache[0] if self.uses_packed_sfa_main_cache else kv_cache[1]
++                vllm_indexer_cache = kv_cache[dsa_k_cache_idx] if self.has_indexer else None
++                dsa_k_scale_cache = self.dsa_k_scale if self.enable_sparse_li_c8 else None
++                vllm_dsa_cache = kv_cache[dsa_k_scale_cache_idx] if self.enable_sparse_li_c8 else None
++                _, _, _, _ = maybe_execute_sparse_attention_begin(None, k_cache, v_cache, layer_name, forward_context, indexer_cache=self.dsa_k_cache, indexer_scale=dsa_k_scale_cache, vllm_indexer_cache=vllm_indexer_cache, vllm_indexer_scale=vllm_dsa_cache, has_indexer=self.has_indexer, use_li_c8=self.enable_sparse_li_c8)
++
++            # (2) k path + DSA cache write + top-k: the unified indexer call
++            # (0.30.0 moved the k path, the cache write and the selection
++            # into AscendSFAIndexerBackend.forward, and the GSA adaptation
++            # lives there now too). The backend owns the per-layer
++            # dsa_k_cache / dsa_k_scale (allocated in its __init__), writes
++            # k through the raw dsa slot mapping, and the selection op
++            # routes to the DSA caches via ``sfa_impl`` (device_op.py GSA
++            # routing), so no inline k-path recompute is needed here.
++            assert k_hidden_states is not None
++            assert indexer_attn_metadata is not None
++            self._prepare_indexer_metadata(indexer_attn_metadata, attn_metadata)
++            topk_indices = self.indexer(
++                hidden_states,
++                q_c,
++                k_hidden_states,
++                indexer_attn_metadata,
++                compute_topk=not self.skip_topk and has_local_query,
++                attn_q_gather_handle=self._get_indexer_attn_q_gather_handle(attn_metadata),
++            )
++            # (3) skip_topk layers reuse the shared index cache (their
++            # dsa_k_cache stays fresh through the k path + write above).
++            if self.skip_topk:
++                topk_indices = self._get_indexcache_topk_indices(parallel_context.topk_num_tokens)
++            elif self.use_index_cache and has_local_query:
++                self._update_indexcache_topk_indices(topk_indices)
++        elif self.runtime_has_indexer:
+             # One unified indexer call: k path -> cache write -> top-k
+             # selection (the selection kernel reads the freshly written
+             # cache). MTP skip_topk layers still run the k path and the write
+@@ -2144,15 +2329,94 @@ class AscendSFAImpl(MLAAttentionImpl):
+         # inside the indexer's forward would leave their gate closed.
+         with attention_transfer_window():
+             if has_local_query:
+-                attn_output = self._execute_sparse_flash_attention_process(
+-                    ql_nope,
+-                    q_pe,
+-                    kv_cache,
+-                    topk_indices,
+-                    attn_metadata,
+-                    actual_seq_lengths_query,
+-                    actual_seq_lengths_key,
+-                )
++                if (
++                    has_ucm_sparse() and PTOPK_PREFETCH_ENABLE
++                    and self.layer_id < self.layer_num
++                    and (self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
++                ):
++                    # ============ GSA attention section (dev 0.23.0) ============
++                    if has_prefill:
++                        # Prefill: copy the fresh top-k rows into the prefetch /
++                        # warmup slots, patch the swapped rows back in, run the
++                        # main batch, then recompute the swap sub-batch with its
++                        # corrected lengths and overwrite.
++                        if attn_metadata.gsa_prefetch_len > 0 and self.has_indexer:
++                            attn_metadata.gsa_prefetch_topk[self.cur_topk_index][:attn_metadata.gsa_prefetch_len].copy_(topk_indices[attn_metadata.gsa_prefetch_index[:attn_metadata.gsa_prefetch_len]])
++                        if attn_metadata.gsa_warmup_len > 0 and self.has_indexer:
++                            attn_metadata.gsa_warmup_topk[self.cur_topk_index][:attn_metadata.gsa_warmup_len].copy_(topk_indices[attn_metadata.gsa_warmup_index[:attn_metadata.gsa_warmup_len]])
++                        if attn_metadata.gsa_swap_len != 0:
++                            topk_indices.index_copy_(0, attn_metadata.gsa_swap_index[:attn_metadata.gsa_swap_len], attn_metadata.gsa_swap_topk[self.cur_topk_index][:attn_metadata.gsa_swap_len, :, :DEFAULT_TOPK_LEN])
++                        attn_output = self._execute_sparse_flash_attention_process(
++                            ql_nope,
++                            q_pe,
++                            kv_cache,
++                            topk_indices,
++                            attn_metadata,
++                            actual_seq_lengths_query,
++                            actual_seq_lengths_key,
++                        )
++                        if attn_metadata.gsa_swap_len != 0:
++                            # swap sub-batch: v0230 8th-positional convention,
++                            # swap_len = the swap requests' select_block_index
++                            # slice (block-table row selector), with the swap
++                            # requests' prefill query rows and key lengths.
++                            attn_output_gsa = self._execute_sparse_flash_attention_process(
++                                ql_nope[attn_metadata.gsa_swap_index[:attn_metadata.gsa_swap_len]],
++                                q_pe[attn_metadata.gsa_swap_index[:attn_metadata.gsa_swap_len]],
++                                kv_cache,
++                                attn_metadata.gsa_swap_topk[self.cur_topk_index][:attn_metadata.gsa_swap_len],
++                                attn_metadata,
++                                attn_metadata.gsa_prefill_query[:attn_metadata.gsa_swap_len//self.num_spec_tokens],
++                                actual_seq_lengths_key[attn_metadata.select_block_index[:attn_metadata.gsa_swap_len//self.num_spec_tokens]],
++                                attn_metadata.select_block_index[:attn_metadata.gsa_swap_len//self.num_spec_tokens],
++                            )
++                            attn_output.index_copy_(0, attn_metadata.gsa_swap_index[:attn_metadata.gsa_swap_len], attn_output_gsa)
++                    else:
++                        # Decode: gather-copy the fresh top-k rows into the warmup
++                        # / prefetch slots, then expand the swap rows to
++                        # spec-token width and run the whole batch.
++                        if attn_metadata.gsa_warmup_len > 0 and self.has_indexer:
++                            torch.ops._C_ascend.gsa_gather_copy(attn_metadata.gsa_warmup_topk[self.cur_topk_index][:attn_metadata.gsa_warmup_len].view(-1, DEFAULT_TOPK_LEN),
++                                                topk_indices.view(-1, DEFAULT_TOPK_LEN),
++                                                attn_metadata.gsa_warmup_index[:attn_metadata.gsa_warmup_len].view(-1, 1).expand((-1, DEFAULT_TOPK_LEN)))
++                        if attn_metadata.gsa_prefetch_len != 0 and self.has_indexer:
++                            torch.ops._C_ascend.gsa_gather_copy(attn_metadata.gsa_prefetch_topk[self.cur_topk_index][:attn_metadata.gsa_prefetch_len].view(-1, DEFAULT_TOPK_LEN),
++                                                topk_indices.view(-1, DEFAULT_TOPK_LEN),
++                                                attn_metadata.gsa_prefetch_index[:attn_metadata.gsa_prefetch_len].view(-1, 1).expand((-1, DEFAULT_TOPK_LEN)))
++                        topk_indices_out = torch.ops._C_ascend.gsa_topk_expand_tmp(
++                            topk_indices.view(-1, DEFAULT_TOPK_LEN),
++                            attn_metadata.gsa_swap_topk[self.cur_topk_index][:attn_metadata.gsa_swap_len].view(-1, SPA_TOKENS_LEN),
++                            attn_metadata.gsa_swap_index[:attn_metadata.gsa_swap_len].view(-1, 1).expand((-1, SPA_TOKENS_LEN)),
++                            attn_metadata.gsa_topk_win_tmp,
++                            [0, SPA_TOKENS_LEN - DEFAULT_TOPK_LEN, 0, 0],
++                            -1,
++                            SPA_TOKENS_LEN
++                        )
++                        attn_output = self._execute_sparse_flash_attention_process(
++                            ql_nope, q_pe, kv_cache, topk_indices_out, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
++                        )
++                else:
++                    attn_output = self._execute_sparse_flash_attention_process(
++                        ql_nope,
++                        q_pe,
++                        kv_cache,
++                        topk_indices,
++                        attn_metadata,
++                        actual_seq_lengths_query,
++                        actual_seq_lengths_key,
++                    )
++
++        # GSA finished hook (dev 0.23.0): finalize the layer's sparse-attention
++        # orchestration on prefill steps that produced attention output.
++        if (
++            has_ucm_sparse() and PTOPK_PREFETCH_ENABLE and has_prefill
++            and self.layer_id < self.layer_num
++            and (self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
++            and has_local_query
++        ):
++            k_cache = kv_cache[0]
++            v_cache = kv_cache[0] if self.uses_packed_sfa_main_cache else kv_cache[1]
++            maybe_execute_sparse_attention_finished(ql_nope, k_cache, v_cache, attn_output, layer_name, forward_context, has_indexer=self.has_indexer, use_li_c8=self.enable_sparse_li_c8)
+ 
+         if has_local_query:
+             attn_output = self._v_up_proj(attn_output)
+diff --git a/vllm_ascend/core/recompute_scheduler.py b/vllm_ascend/core/recompute_scheduler.py
+index b666df588..41cae14f1 100644
+--- a/vllm_ascend/core/recompute_scheduler.py
++++ b/vllm_ascend/core/recompute_scheduler.py
+@@ -48,6 +48,10 @@ from vllm_ascend.core.dyntra_lb_scheduler import (
+ )
+ from vllm_ascend.utils import get_ascend_config
+ 
++from ucm.sparse.state import ensure_ucm_sparse_initialized, get_ucm_sparse, has_ucm_sparse
++from ucm.sparse.base import  UcmSparseRole, INVALID_SLOT
++from ucm.sparse.utils import  IS_OPEN_GSA, PTOPK_PREFETCH_ENABLE
++import os
+ 
+ @dataclass
+ class RecomputeSchedulerConfig(SchedulerConfig):
+@@ -208,6 +212,9 @@ class RecomputeScheduler(Scheduler):
+             # Do not schedule any requests when paused.
+             token_budget = 0
+ 
++        if has_ucm_sparse() and PTOPK_PREFETCH_ENABLE:
++            get_ucm_sparse().update_scheduler_free_slot(0)
++
+         # Encoder-related.
+         scheduled_encoder_inputs: dict[str, list[int]] = {}
+         encoder_compute_budget = self.max_num_encoder_input_tokens
+@@ -231,8 +238,15 @@ class RecomputeScheduler(Scheduler):
+ 
+         # First, schedule the RUNNING requests.
+         req_index = 0
++        req_sparsed_slots: dict[str, int] = {}
+         while req_index < len(self.running) and token_budget > 0:
+             request = self.running[req_index]
++
++            num_slots_sparsed = INVALID_SLOT
++            if self.ucm_sparse:
++                num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(request, self.num_lookahead_tokens)
++            req_sparsed_slots.update({request.request_id: num_slots_sparsed})
++
+             if input_budget <= draft_slots:
+                 break
+ 
+@@ -342,6 +356,7 @@ class RecomputeScheduler(Scheduler):
+                         request,
+                         num_new_tokens,
+                         num_lookahead_tokens=self.num_lookahead_tokens,
++                        num_slots_sparsed=num_slots_sparsed,
+                     )
+ 
+                     if new_blocks is not None:
+@@ -478,6 +493,12 @@ class RecomputeScheduler(Scheduler):
+                 assert request_queue is not None
+ 
+                 request = request_queue.peek_request()
++
++                num_slots_sparsed = INVALID_SLOT   ####  suit for skipped
++                if self.ucm_sparse:
++                    num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(request, self.num_lookahead_tokens)
++                req_sparsed_slots.update({request.request_id: num_slots_sparsed})
++
+                 request_id = request.request_id
+ 
+                 # try to promote blocked statuses while traversing skipped queue.
+@@ -747,6 +768,7 @@ class RecomputeScheduler(Scheduler):
+                     delay_cache_blocks=load_kv_async,
+                     num_encoder_tokens=num_encoder_tokens,
+                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
++                    num_slots_sparsed=num_slots_sparsed,
+                     reserved_blocks=reserved_blocks,
+                     has_scheduled_reqs=bool(self.running),
+                 )
+@@ -967,6 +989,7 @@ class RecomputeScheduler(Scheduler):
+             scheduled_encoder_inputs=scheduled_encoder_inputs,
+             scheduled_encoder_input_stats=scheduled_encoder_input_stats,
+             num_common_prefix_blocks=num_common_prefix_blocks,
++            req_sparsed_slots=req_sparsed_slots,
+             preempted_req_ids=self.reset_preempted_req_ids,
+             # finished_req_ids is an existing state in the scheduler,
+             # instead of being newly scheduled in this step.
+diff --git a/vllm_ascend/device/device_op.py b/vllm_ascend/device/device_op.py
+index f5e86ce32..a208bd0e7 100644
+--- a/vllm_ascend/device/device_op.py
++++ b/vllm_ascend/device/device_op.py
+@@ -32,6 +32,8 @@ from vllm_ascend.ops.triton.fla.solve_tril import solve_tril_16x16_kernel
+ from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
+ from vllm_ascend.quantization.quant_type import QuantType
+ from vllm_ascend.quantization.utils import QUANT_DTYPES, get_dynamic_mx_quant_scale_alg
++from ucm.sparse.state import has_ucm_sparse
++from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE
+ 
+ if TYPE_CHECKING:
+     from vllm_ascend.models.deepseek_v41.mixed_quant_attention import MixedQuantPackedCacheOps
+@@ -471,8 +473,29 @@ class BaseDeviceAdaptor:
+         enable_sparse_li_c8: bool,
+         enable_sparse_li_c4: bool,
+         use_torch_npu_lightning_indexer: bool,
++        sfa_impl=None,
+     ) -> torch.Tensor:
+         indexer_cache_idx = indexer_k_cache_idx
++        # GSA (dev 0.23.0 adapt-1020 routing): on GSA layers route the
++        # selection to the per-layer DSA caches and the dsa block table
++        # carried by ``sfa_impl`` (the indexer backend, which allocates them);
++        # otherwise keep the stock vLLM indexer cache + block table.
++        if (
++            sfa_impl is not None
++            and has_ucm_sparse()
++            and PTOPK_PREFETCH_ENABLE
++            and sfa_impl.layer_id < sfa_impl.layer_num
++            and (sfa_impl.is_pdmix or not sfa_impl.vllm_config.kv_transfer_config.is_kv_producer)
++        ):
++            block_table = attn_metadata.dsa_block_table[sfa_impl.cur_topk_index][:len(actual_seq_lengths_query)]
++            dsa_cache = sfa_impl.dsa_k_cache
++            if enable_sparse_li_c8:
++                dsa_cache_scale = sfa_impl.dsa_k_scale
++        else:
++            block_table = attn_metadata.block_table
++            dsa_cache = kv_cache[indexer_cache_idx]
++            if enable_sparse_li_c8:
++                dsa_cache_scale = kv_cache[indexer_scale_cache_idx]
+         if enable_sparse_li_c4:
+             raise RuntimeError("C4 lightning indexer is only supported on A5 devices.")
+ 
+@@ -484,13 +507,13 @@ class BaseDeviceAdaptor:
+             weights = weights.to(torch.float16)
+             topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
+                 query=q_li.view(q_li_shape_ori),
+-                key=kv_cache[indexer_cache_idx],
++                key=dsa_cache,
+                 weights=weights,
+                 query_dequant_scale=q_li_scale.view(q_li_shape_ori[:-1]),
+-                key_dequant_scale=kv_cache[indexer_scale_cache_idx].squeeze(2),  # B S N D -> B S D
++                key_dequant_scale=dsa_cache_scale.squeeze(2),  # B S N D -> B S D
+                 actual_seq_lengths_query=actual_seq_lengths_query,
+                 actual_seq_lengths_key=actual_seq_lengths_key,
+-                block_table=attn_metadata.block_table,
++                block_table=block_table,
+                 query_quant_mode=0,
+                 key_quant_mode=0,
+                 layout_query="TND",
+@@ -501,11 +524,11 @@ class BaseDeviceAdaptor:
+         else:
+             topk_indices, _ = torch_npu.npu_lightning_indexer(
+                 query=q_li,
+-                key=kv_cache[indexer_cache_idx],
++                key=dsa_cache,
+                 weights=weights,
+                 actual_seq_lengths_query=actual_seq_lengths_query,
+                 actual_seq_lengths_key=actual_seq_lengths_key,
+-                block_table=attn_metadata.block_table,
++                block_table=block_table,
+                 layout_query="TND",
+                 layout_key="PA_BSND",
+                 sparse_count=2048,
+@@ -524,6 +547,7 @@ class BaseDeviceAdaptor:
+         attn_metadata,
+         actual_seq_lengths_query: torch.Tensor,
+         actual_seq_lengths_key: torch.Tensor,
++        swap_len: torch.Tensor = None,
+         *,
+         block_table: torch.Tensor | None = None,
+         sparse_mode: int = 3,
+@@ -531,6 +555,11 @@ class BaseDeviceAdaptor:
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         if block_table is None:
+             block_table = attn_metadata.block_table
++        # GSA swap sub-batch (dev 0.23.0): re-run attention for the swapped
++        # requests with their own block-table rows (swap_len = the swap
++        # requests' select_block_index slice).
++        if swap_len is not None:
++            block_table = attn_metadata.block_table[swap_len]
+         kv = kv_cache[0]
+ 
+         # The kv-quant sparse attention op only accepts packed quantized KV.
+@@ -1695,9 +1724,27 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
+         enable_sparse_li_c8: bool,
+         enable_sparse_li_c4: bool,
+         use_torch_npu_lightning_indexer: bool,
++        sfa_impl=None,
+     ) -> torch.Tensor:
+         indexer_cache_idx = indexer_k_cache_idx
+         indexer_scale_cache_idx = indexer_scale_cache_idx
++        # GSA (dev 0.23.0 adapt-1020 routing): A5 mirror of the base routing.
++        if (
++            sfa_impl is not None
++            and has_ucm_sparse()
++            and PTOPK_PREFETCH_ENABLE
++            and sfa_impl.layer_id < sfa_impl.layer_num
++            and (sfa_impl.is_pdmix or not sfa_impl.vllm_config.kv_transfer_config.is_kv_producer)
++        ):
++            block_table = attn_metadata.dsa_block_table[sfa_impl.cur_topk_index][:len(actual_seq_lengths_query)]
++            dsa_cache = sfa_impl.dsa_k_cache
++            if enable_sparse_li_c8:
++                dsa_k_scale = sfa_impl.dsa_k_scale.squeeze(2)
++        else:
++            block_table = attn_metadata.block_table
++            dsa_cache = kv_cache[indexer_cache_idx]
++            if enable_sparse_li_c8:
++                dsa_k_scale = kv_cache[indexer_scale_cache_idx].squeeze(2)
+ 
+         if enable_sparse_li_c4:
+             assert len(kv_cache) == 2
+@@ -1773,17 +1820,17 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
+ 
+             if q_li_scale is not None:
+                 q_li_scale = q_li_scale.view(q_li_shape_ori[:-1])
+-                key_dequant_scale = kv_cache[indexer_scale_cache_idx].squeeze(2)
++                key_dequant_scale = dsa_k_scale
+ 
+                 topk_indices = torch_npu.npu_quant_lightning_indexer(
+                     query=q_li.view(q_li_shape_ori),
+-                    key=kv_cache[indexer_cache_idx],
++                    key=dsa_cache,
+                     weights=weights,
+                     query_dequant_scale=q_li_scale,
+                     key_dequant_scale=key_dequant_scale,
+                     actual_seq_lengths_query=actual_seq_lengths_query,
+                     actual_seq_lengths_key=actual_seq_lengths_key,
+-                    block_table=attn_metadata.block_table,
++                    block_table=block_table,
+                     query_quant_mode=0,
+                     key_quant_mode=0,
+                     layout_query="TND",
+@@ -1794,11 +1841,11 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
+             else:
+                 topk_indices, _ = torch_npu.npu_lightning_indexer(
+                     query=q_li.view(q_li_shape_ori),
+-                    key=kv_cache[indexer_cache_idx],
++                    key=dsa_cache,
+                     weights=weights,
+                     actual_seq_lengths_query=actual_seq_lengths_query,
+                     actual_seq_lengths_key=actual_seq_lengths_key,
+-                    block_table=attn_metadata.block_table,
++                    block_table=block_table,
+                     layout_query="TND",
+                     layout_key="PA_BSND",
+                     sparse_count=2048,
+@@ -1807,11 +1854,11 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
+         else:
+             topk_indices, _ = torch_npu.npu_lightning_indexer(
+                 query=q_li,
+-                key=kv_cache[indexer_cache_idx],
++                key=dsa_cache,
+                 weights=weights,
+                 actual_seq_lengths_query=actual_seq_lengths_query,
+                 actual_seq_lengths_key=actual_seq_lengths_key,
+-                block_table=attn_metadata.block_table,
++                block_table=block_table,
+                 layout_query="TND",
+                 layout_key="PA_BSND",
+                 sparse_count=2048,
+diff --git a/vllm_ascend/patch/platform/patch_balance_schedule.py b/vllm_ascend/patch/platform/patch_balance_schedule.py
+index dd3de6b03..654b3bb56 100644
+--- a/vllm_ascend/patch/platform/patch_balance_schedule.py
++++ b/vllm_ascend/patch/platform/patch_balance_schedule.py
+@@ -79,6 +79,10 @@ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ from vllm_ascend.ascend_config import init_ascend_config
+ 
++from ucm.sparse.state import ensure_ucm_sparse_initialized, get_ucm_sparse, has_ucm_sparse
++from ucm.sparse.base import  UcmSparseRole, INVALID_SLOT
++from ucm.sparse.utils import  IS_OPEN_GSA, PTOPK_PREFETCH_ENABLE
++import os
+ 
+ def _balance_scheduling_enabled(vllm_config) -> bool:
+     # Primary source of truth is AscendConfig. The additional_config fallback
+@@ -187,6 +191,9 @@ class BalanceScheduler(Scheduler):
+             # Do not schedule any requests when paused.
+             token_budget = 0
+ 
++        if has_ucm_sparse() and PTOPK_PREFETCH_ENABLE:
++            get_ucm_sparse().update_scheduler_free_slot(0)
++
+         # Encoder-related.
+         scheduled_encoder_inputs: dict[str, list[int]] = {}
+         encoder_compute_budget = self.max_num_encoder_input_tokens
+@@ -206,9 +213,15 @@ class BalanceScheduler(Scheduler):
+ 
+         # First, schedule the RUNNING requests.
+         req_index = 0
++        req_sparsed_slots: dict[str, int] = {}
+         while req_index < len(self.running) and token_budget > 0:
+             request = self.running[req_index]
+ 
++            num_slots_sparsed = INVALID_SLOT
++            if self.ucm_sparse:
++                num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(request, self.num_lookahead_tokens)
++            req_sparsed_slots.update({request.request_id: num_slots_sparsed})
++
+             if (
+                 request.num_output_placeholders > 0
+                 # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
+@@ -297,6 +310,7 @@ class BalanceScheduler(Scheduler):
+                         request,
+                         num_new_tokens,
+                         num_lookahead_tokens=self.num_lookahead_tokens,
++                        num_slots_sparsed=num_slots_sparsed,
+                     )
+ 
+                     if new_blocks is not None:
+@@ -406,6 +420,12 @@ class BalanceScheduler(Scheduler):
+                     break
+ 
+                 request = request_queue.peek_request()
++
++                num_slots_sparsed = INVALID_SLOT   ####  suit for skipped
++                if self.ucm_sparse:
++                    num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(request, self.num_lookahead_tokens)
++                req_sparsed_slots.update({request.request_id: num_slots_sparsed})
++
+                 request_id = request.request_id
+ 
+                 # try to promote blocked statuses while traversing skipped queue.
+@@ -621,6 +641,7 @@ class BalanceScheduler(Scheduler):
+                     delay_cache_blocks=load_kv_async,
+                     num_encoder_tokens=num_encoder_tokens,
+                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
++                    num_slots_sparsed=num_slots_sparsed,
+                     reserved_blocks=reserved_blocks,
+                     has_scheduled_reqs=bool(self.running),
+                 )
+@@ -803,6 +824,7 @@ class BalanceScheduler(Scheduler):
+             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+             scheduled_encoder_inputs=scheduled_encoder_inputs,
+             num_common_prefix_blocks=num_common_prefix_blocks,
++            req_sparsed_slots=req_sparsed_slots,
+             preempted_req_ids={req.request_id for req in preempted_reqs},
+             # finished_req_ids is an existing state in the scheduler,
+             # instead of being newly scheduled in this step.
+diff --git a/vllm_ascend/worker/block_table.py b/vllm_ascend/worker/block_table.py
+index f596dcd9c..3f32e15cb 100644
+--- a/vllm_ascend/worker/block_table.py
++++ b/vllm_ascend/worker/block_table.py
+@@ -140,6 +140,12 @@ class BlockTable:
+         self.block_table.np[tgt, :num_blocks] = self.block_table.np[src, :num_blocks]
+         self.num_blocks_per_row[tgt] = num_blocks
+ 
++    def reset_row(self, row_idx: int) -> None:
++        self.num_blocks_per_row[row_idx] = 0
++        self.block_table.cpu[row_idx].fill_(0)
++        self.block_table.gpu[row_idx].fill_(0)
++        self.block_table.np[row_idx].fill(0)
++
+     def swap_row(self, src: int, tgt: int) -> None:
+         num_blocks_src = self.num_blocks_per_row[src]
+         num_blocks_tgt = self.num_blocks_per_row[tgt]
+@@ -450,6 +456,10 @@ class MultiGroupBlockTable:
+         for i, block_table in enumerate(self.block_tables):
+             block_table.append_row(block_ids[i], row_idx)
+ 
++    def reset_row(self, row_idx: int) -> None:
++        for i, block_table in enumerate(self.block_tables):
++            block_table.reset_row(row_idx)
++
+     def add_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
+         for i, block_table in enumerate(self.block_tables):
+             block_table.add_row(block_ids[i], row_idx)
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 30c76975b..a67b7fe0a 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -262,6 +262,13 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
+ from vllm.model_executor.models.interfaces import supports_multimodal_pruning
+ 
+ from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
++from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
++from ucm.sparse.base import INVALID_SLOT
++from ucm.sparse.utils import  IS_OPEN_GSA, PTOPK_PREFETCH_ENABLE, IS_INDEXER_OFFLOAD
++import vllm_ascend.envs as envs_ascend
++import os
++import yaml
++import pathlib
+ 
+ if TYPE_CHECKING:
+     import xgrammar as xgr  # type: ignore[import-untyped]
+@@ -1332,6 +1339,17 @@ class NPUModelRunner(GPUModelRunner):
+             out=positions_np,
+         )
+ 
++        sparsed_positions = positions_np.copy()
++        req_sparsed_slots = scheduler_output.req_sparsed_slots
++        for req_id in self.input_batch.req_id_to_index:
++            is_sparsed_request = req_sparsed_slots[req_id] != INVALID_SLOT
++            req_index = self.input_batch.req_id_to_index[req_id]
++            offset = 0 if req_index == 0 else cu_num_tokens[req_index - 1] # TODO: support MTP
++            end = cu_num_tokens[req_index]
++            if is_sparsed_request:
++                # sparsed_positions[offset] = req_sparsed_slots[req_id] - 1
++                sparsed_positions[offset:end] = list(range(req_sparsed_slots[req_id] - end + offset, req_sparsed_slots[req_id]))
++
+         if self.use_dcp:
+             self.dcp_manager.init_batch_info(
+                 num_scheduled_tokens,
+@@ -1360,7 +1378,7 @@ class NPUModelRunner(GPUModelRunner):
+                 self.input_batch,
+                 self.arange_np,
+                 req_indices,
+-                positions_np,
++                sparsed_positions,
+                 cu_num_tokens,
+                 self._draft_token_ids,  # type: ignore[has-type]
+                 scheduler_output,
+@@ -1456,6 +1474,14 @@ class NPUModelRunner(GPUModelRunner):
+         )
+         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+ 
++        is_sparsed_np = np.zeros((num_reqs,), dtype=np.bool_)
++        for req_id in self.input_batch.req_id_to_index:
++            is_sparsed_request = scheduler_output.req_sparsed_slots[req_id] != INVALID_SLOT
++            req_index = self.input_batch.req_id_to_index[req_id]
++            if is_sparsed_request:
++                self.optimistic_seq_lens_cpu[req_index] = req_sparsed_slots[req_id]
++                is_sparsed_np[req_index] = True
++
+         # Fill unused with -1. Needed for reshape_and_cache in attention_cp
+         self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
+ 
+@@ -1477,7 +1503,7 @@ class NPUModelRunner(GPUModelRunner):
+         num_tokens_np = np.array(num_tokens, dtype=np.int32)
+         base_num_reqs = self.input_batch.num_reqs
+         num_reqs = base_num_reqs
+-        discard_requests_mask = self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
++        discard_requests_mask = (self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np) & (~is_sparsed_np)
+ 
+         discard_request_indices = np.nonzero(discard_requests_mask)[0]
+         self.num_discarded_requests = len(discard_request_indices)
+@@ -1598,9 +1624,16 @@ class NPUModelRunner(GPUModelRunner):
+                 + self.query_pos.gpu[:total_num_scheduled_tokens]
+             )
+ 
+-        self.seq_lens[:num_reqs] = (
+-            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+-        )
++        if has_ucm_sparse() and PTOPK_PREFETCH_ENABLE:
++            self.sparse_positions[:total_num_scheduled_tokens].copy_(torch.from_numpy(sparsed_positions[:total_num_scheduled_tokens]), non_blocking=True)
++            self.seq_lens[:num_reqs].copy_(
++                self.optimistic_seq_lens_cpu[:num_reqs], non_blocking=True
++            )
++        else:
++            self.sparse_positions = self.positions
++            self.seq_lens[:num_reqs] = (
++                self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
++            )
+         self.seq_lens[num_reqs:].fill_(0)
+ 
+         # In async spec decode mode, optimistic_seq_lens_cpu assumes all
+@@ -1620,7 +1653,7 @@ class NPUModelRunner(GPUModelRunner):
+         self.input_batch.block_table.compute_slot_mapping(
+             num_reqs,
+             self.query_start_loc.gpu[: num_reqs + 1],
+-            self.positions[:total_num_scheduled_tokens],
++            self.sparse_positions[:total_num_scheduled_tokens],
+         )
+ 
+         if self.use_async_spec_decode and self.uses_mrope:
+@@ -2592,9 +2625,17 @@ class NPUModelRunner(GPUModelRunner):
+                 if mamba_copy_connector is None:
+                     mamba_utils.do_mamba_copy_block(preprocess_bufs)
+             self._restore_c8_mxfp_loaded_v_scales(scheduler_output)
++
++            self.maybe_execute_ucm_sparse_begin(scheduler_output, attn_metadata)
++
+             hidden_states = self._model_forward(
+                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+             )
++
++            self.maybe_execute_ucm_sparse_warmup()
++            if self.vllm_config.speculative_config is None:
++                self.maybe_execute_ucm_sparse_finished()
++
+             self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
+                 profiling_chunk_config,
+                 execution_start_time,
+@@ -2922,6 +2963,14 @@ class NPUModelRunner(GPUModelRunner):
+                         for req_id in req_ids_output_copy
+                     ]
+ 
++        if has_ucm_sparse() and self.vllm_config.speculative_config:
++            if spec_decode_metadata is None:
++                self.maybe_execute_ucm_sparse_finished()
++            else:
++                valid_counts = (sampler_output.sampled_token_ids != -1).sum(dim=1)
++                if has_ucm_sparse() and self.vllm_config.speculative_config:
++                    self.maybe_execute_ucm_sparse_finished(torch.where(valid_counts > 0, valid_counts - 1, torch.tensor(-1)).tolist())
++
+         model_runner_output = ModelRunnerOutput(
+             req_ids=req_ids_output_copy,
+             req_id_to_index=req_id_to_index_output_copy,
+@@ -3787,6 +3836,12 @@ class NPUModelRunner(GPUModelRunner):
+                     common_v41_batch_metadata=common_v41_batch_metadata,
+                     full_graph_mode=cudagraph_runtime_mode == CUDAGraphMode.FULL,
+                 )
++            is_pdmix = (
++                self.vllm_config.kv_transfer_config is None or (
++                    self.vllm_config.kv_transfer_config.is_kv_producer and
++                    self.vllm_config.kv_transfer_config.is_kv_consumer
++                )
++            )
+             if (for_cudagraph_capture
+                     and not isinstance(builder, (
+                         AscendDSAMetadataBuilder,
+@@ -3795,12 +3850,51 @@ class NPUModelRunner(GPUModelRunner):
+                         v41_metadata_builder_type,
+                     ))):
+                 attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
++                if (
++                    hasattr(self.vllm_config.model_config, "hf_text_config") and
++                    hasattr(self.vllm_config.model_config.hf_text_config, "index_topk") and
++                    has_ucm_sparse() and PTOPK_PREFETCH_ENABLE and
++                    (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
++                ):
++                    attn_metadata_i.gsa_slot_len = common_attn_metadata.num_input_tokens
++                    attn_metadata_i.gsa_prefetch_len = common_attn_metadata.num_input_tokens
++                    attn_metadata_i.gsa_warmup_len = 0
++                    attn_metadata_i.gsa_swap_len = common_attn_metadata.num_input_tokens + 1
++                    if IS_INDEXER_OFFLOAD:
++                        attn_metadata_i.indexer_last_query_len = common_attn_metadata.num_input_tokens
++
+             else:
+                 attn_metadata_i = builder.build(
+                     common_prefix_len=cascade_attn_prefix_len,
+                     common_attn_metadata=common_attn_metadata,
+                     **extra_attn_metadata_args,
+                 )
++
++            if (
++                hasattr(self.vllm_config.model_config, "hf_text_config") and
++                hasattr(self.vllm_config.model_config.hf_text_config, "index_topk") and
++                has_ucm_sparse() and PTOPK_PREFETCH_ENABLE and
++                (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
++            ):
++                attn_metadata_i.num_padding_reqs = common_attn_metadata.num_input_tokens
++                attn_metadata_i.gsa_prefill_query = self.gsa_prefill_query
++                attn_metadata_i.gsa_topk_win_tmp = self.gsa_topk_win_tmp
++                # TODO
++                attn_metadata_i.dsa_seq_len = self.dsa_seq_len.npu[:common_attn_metadata.num_reqs]
++                attn_metadata_i.dsa_block_table = self.dsa_block_table.npu[:, :common_attn_metadata.num_reqs]
++                attn_metadata_i.dsa_slot_mapping = self.dsa_slot_mapping.npu[:common_attn_metadata.num_input_tokens]
++                attn_metadata_i.gsa_prefetch_index = self.gsa_prefetch_index.npu[:common_attn_metadata.num_input_tokens]
++                attn_metadata_i.gsa_swap_index = self.gsa_swap_index.npu[:common_attn_metadata.num_input_tokens]
++                attn_metadata_i.gsa_warmup_index = self.gsa_warmup_index.npu
++                attn_metadata_i.gsa_prefetch_topk = self.gsa_prefetch_topk.npu[:, :common_attn_metadata.num_input_tokens]
++                attn_metadata_i.gsa_swap_topk = self.gsa_swap_topk.npu[:, :common_attn_metadata.num_input_tokens + 1]
++                attn_metadata_i.gsa_warmup_topk = self.gsa_warmup_topk.npu
++                #### indexer offload
++                if IS_INDEXER_OFFLOAD:
++                    attn_metadata_i.indexer_last_query = self.indexer_last_query.npu
++                    attn_metadata_i.indexer_last_q_index = self.indexer_last_q_index.npu
++                    attn_metadata_i.indexer_last_weight = self.indexer_last_weight.npu
++
+             if device_metadata_provider is not None:
+                 assert device_metadata_tasks is not None
+                 device_metadata_tasks.extend(device_metadata_provider.take_device_metadata_tasks())
+@@ -3906,6 +4000,37 @@ class NPUModelRunner(GPUModelRunner):
+         self._maybe_eager_restore_copy_sfa_tails(attn_metadata)
+         return attn_metadata, spec_decode_common_attn_metadata
+ 
++    def maybe_execute_ucm_sparse_begin(self, scheduler_output: "SchedulerOutput", attn_metadata: AscendCommonAttentionMetadata):
++        if not has_ucm_sparse():
++            return
++        if has_kv_transfer_group():
++            uc_connector = get_kv_transfer_group()
++            uc_setup_model = getattr(uc_connector, "setup_model", None)
++            if callable(uc_setup_model):
++                uc_setup_model(self.model)
++        ucm_sparse = get_ucm_sparse()
++        ucm_sparse.build_sparse_meta(scheduler_output, self.requests, self.input_batch, attn_metadata)
++        ucm_sparse.execute_begin(scheduler_output, attn_metadata)
++
++    def maybe_execute_ucm_sparse_warmup(self):
++        if not has_ucm_sparse():
++            return
++        ucm_sparse = get_ucm_sparse()
++        ucm_sparse.warmup()
++
++    def maybe_execute_ucm_sparse_finished(self, rec_result=None):
++        if not has_ucm_sparse():
++            return
++        ucm_sparse = get_ucm_sparse()
++        # return ucm_sparse.execute_finished(logits_indices)
++        ucm_sparse.execute_finished(rec_result)
++
++    def ucm_sparse_request_finished_in_worker(self, request_id: str | int):
++        if not has_ucm_sparse():
++            return
++        ucm_sparse = get_ucm_sparse()
++        ucm_sparse.request_finished_in_worker(request_id)
++
+     def _should_build_dummy_attn_metadata(
+         self,
+         force_attention: bool = False,
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index 670a0bab9..7f38f34e9 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -112,6 +112,11 @@ torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
+ from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
+ from vllm.utils.torch_utils import set_random_seed  # noqa: E402
+ 
++import os
++import time
++from ucm.sparse.state import ensure_ucm_sparse_initialized, get_ucm_sparse, has_ucm_sparse
++from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE
++
+ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
+     ["torch.npu.current_stream"],
+     TorchInGraphFunctionVariable,
+@@ -515,6 +520,13 @@ class NPUWorker(WorkerBase):
+         else:
+             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
+ 
++        if (
++            hasattr(self.vllm_config.model_config, "hf_text_config") and
++            hasattr(self.vllm_config.model_config.hf_text_config, "index_topk") and
++            has_ucm_sparse() and PTOPK_PREFETCH_ENABLE
++        ):
++            self.maybe_init_ucm_sparse_dsa(self.model_runner)
++
+         if self.rank == 0:
+             # If usage stat is enabled, collect relevant info.
+             report_usage_stats(self.vllm_config)
+@@ -1302,6 +1314,7 @@ class NPUWorker(WorkerBase):
+             )
+         init_ascend_model_parallel(self.parallel_config, self.vllm_config.engram_config)
+         ensure_ec_transfer_initialized(self.vllm_config)
++        ensure_ucm_sparse_initialized(self.vllm_config)
+ 
+     def get_supported_pooling_tasks(self):
+         return self.model_runner.get_supported_pooling_tasks()
+@@ -1343,6 +1356,12 @@ class NPUWorker(WorkerBase):
+             logger.error("query NPU card %s fail: %s", self.local_rank, e)
+         return
+ 
++    def maybe_init_ucm_sparse_dsa(self, model_runner):
++        if not has_ucm_sparse():
++            return
++        ucm_sparse = get_ucm_sparse()
++        ucm_sparse.init_dsa_data(model_runner)
++
+ 
+ def parse_text_output(output) -> None:
+     lines = output.strip().split("\n")

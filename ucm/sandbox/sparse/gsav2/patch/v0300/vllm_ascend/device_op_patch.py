@@ -6,13 +6,14 @@ device_op. Upstream 0.30.0 changes accounted for here:
 - ``indexer_select_post_process`` lost its ``sfa_impl`` first argument and
   now receives explicit ``indexer_k_cache_idx`` / ``indexer_scale_cache_idx``
   slot indices (the caller, ``vllm_ascend.attention.indexer``, passes the
-  indexer's own cache tuple). The GSA routing needs the SFA impl state
+  indexer's own cache tuple). The GSA routing needs the per-layer GSA state
   (``layer_id`` / ``layer_num`` / ``is_pdmix`` / ``cur_topk_index`` /
   ``dsa_k_cache`` / ``dsa_k_scale``), so the patched version keeps the 0.30.0
   signature and adds an optional keyword-only ``sfa_impl``: the upstream
   ``indexer.py`` call site keeps working (``sfa_impl=None`` -> upstream
-  behavior), while the GSA SFA forward passes ``sfa_impl=self`` to select the
-  per-layer DSA cache and block table.
+  behavior), while the patched indexer backend forward (``indexer_patch.py``)
+  passes ``sfa_impl=self`` -- the backend owns the DSA caches and the
+  routing attrs -- to select the per-layer DSA cache and block table.
 - ``execute_kv_quant_sparse_flash_attention`` was renamed by upstream to
   ``_execute_kv_quant_sparse_flash_attention_vllm`` (staticmethod on both
   Base and A5); the GSA patch now targets the new name on both adaptors.
@@ -54,17 +55,20 @@ def indexer_select_post_process(
     sfa_impl=None,
 ) -> torch.Tensor:
     from ucm.sparse.state import has_ucm_sparse
+    from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE
 
     indexer_cache_idx = indexer_k_cache_idx
     if enable_sparse_li_c4:
         raise RuntimeError("C4 lightning indexer is only supported on A5 devices.")
 
-    # GSA routing: with sparse state active, attention layers read the
-    # per-layer DSA cache (dsa_k_cache / dsa_k_scale) and the per-step
-    # top-k block table instead of the shared indexer cache tuple.
+    # GSA routing: with sparse state active, the indexer backend (passed as
+    # ``sfa_impl`` by the patched backend forward -- see indexer_patch.py)
+    # selects its per-layer DSA cache (dsa_k_cache / dsa_k_scale) and the
+    # per-step top-k block table instead of the shared indexer cache tuple.
     if (
         sfa_impl is not None
         and has_ucm_sparse()
+        and PTOPK_PREFETCH_ENABLE
         and sfa_impl.layer_id < sfa_impl.layer_num
         and (
             sfa_impl.is_pdmix
@@ -324,6 +328,7 @@ def indexer_select_post_process_a5(
     sfa_impl=None,
 ) -> torch.Tensor:
     from ucm.sparse.state import has_ucm_sparse
+    from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE
 
     indexer_cache_idx = indexer_k_cache_idx
     indexer_scale_cache_idx = indexer_scale_cache_idx
@@ -332,6 +337,7 @@ def indexer_select_post_process_a5(
     if (
         sfa_impl is not None
         and has_ucm_sparse()
+        and PTOPK_PREFETCH_ENABLE
         and sfa_impl.layer_id < sfa_impl.layer_num
         and (
             sfa_impl.is_pdmix

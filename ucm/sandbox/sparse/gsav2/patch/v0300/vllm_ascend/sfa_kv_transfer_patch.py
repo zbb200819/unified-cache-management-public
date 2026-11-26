@@ -1,21 +1,26 @@
 """Replace the vLLM-Ascend 0.30.0 SFA forward with the GSA-aware version.
 
 Rebased from the 0.23.0 GSA patch (``v0230/vllm_ascend/sfa_kv_transfer_patch.py``)
-onto the 0.30.0 ``AscendSFAImpl.forward``. The 0.30.0 forward was restructured
-(prolog-v3/mlapo preprocess helpers, ``SFAForwardContext`` parallel plumbing,
-unified ``AscendIndexer.forward`` k path + top-k call, ``g_proj`` gating,
-``attention_transfer_window``, sequence-parallel o_proj finalize); this patch
-keeps the upstream body and injects the GSA semantics from the 0.23.0 version:
+onto the 0.30.0 ``AscendSFAImpl.forward``, then aligned with the ucm-v0300
+in-tree GSA adaptation (dsa caches on the indexer backend, unified indexer
+call). The 0.30.0 forward was restructured (prolog-v3/mlapo preprocess
+helpers, ``SFAForwardContext`` parallel plumbing, unified
+``AscendIndexer.forward`` k path + top-k call, ``g_proj`` gating,
+``attention_transfer_window``, sequence-parallel o_proj finalize); this
+patch keeps the upstream body and injects the GSA semantics from the 0.23.0
+version:
 
 * ``maybe_execute_sparse_attention_begin/finished`` hooks around the layer
-  (pdmix / decode workers, ``layer_id < layer_num``).
-* The lightning-indexer k path computed inline from the raw/prepared hidden
-  states and scattered into the per-layer ``dsa_k_cache`` (0.23.0
-  ``indexer_select_pre_process`` + the GSA branch of its scatter; 0.30.0 moved
-  the compute into ``AscendIndexer.forward_k`` which writes the vllm-owned
-  cache instead -- GSA needs the per-layer DSA cache).
-* Top-k via the injected impl-level ``indexer_select_post_process``
-  (``sfa_v1_patch.py``) whose device-op dispatch routes to the GSA DSA caches.
+  (pdmix / decode workers, ``layer_id < layer_num``, prefill steps only --
+  gated by ``PTOPK_PREFETCH_ENABLE`` and the runner-attached
+  ``has_prefill``).
+* One unified indexer call for sparse layers: the patched backend forward
+  (``indexer_patch.py``) computes the k path, persists it into the
+  per-layer ``dsa_k_cache`` (raw dsa slot mapping) and runs the selection
+  whose device-op dispatch routes to the GSA DSA caches via
+  ``sfa_impl=self``. No inline k-path recompute and no impl-level
+  ``indexer_select_post_process`` -- both were 0.23.0-era workarounds for
+  the indexer not owning the caches.
 * The prefill/decode ``gsa_prefetch/warmup/swap`` top-k bookkeeping and the
   swap sub-batch attention call (``swap_len`` = ``select_block_index`` slice,
   v0230 8th-positional convention).
@@ -50,7 +55,7 @@ def forward(
         maybe_execute_sparse_attention_begin,
         maybe_execute_sparse_attention_finished,
     )
-    from ucm.sparse.utils import DEFAULT_TOPK_LEN, SPA_TOKENS_LEN
+    from ucm.sparse.utils import DEFAULT_TOPK_LEN, PTOPK_PREFETCH_ENABLE, SPA_TOKENS_LEN
 
     assert output is not None, "Output tensor must be provided."
     # GSA (v0230): pdmix runs the sparse path on producer+consumer workers;
@@ -62,6 +67,7 @@ def forward(
     gsa_active = (
         (is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
         and has_ucm_sparse()
+        and PTOPK_PREFETCH_ENABLE
         and self.layer_id < self.layer_num
     )
     if self.enable_sparse_sfa_turboquant:
@@ -232,122 +238,73 @@ def forward(
     # A sharded-decode PCP rank can own no request but must still write
     # and gather KV with the other ranks.
     has_local_query = attn_metadata.num_actual_tokens > 0
+    # GSA: has_prefill is attached by the patched
+    # NPUModelRunner._build_attention_metadata using the 0.23.0 builder
+    # formula (any query longer than decode_threshold).
+    has_prefill = attn_metadata.has_prefill
     if gsa_active and self.runtime_has_indexer:
         # ============ GSA top-k section (v0230 semantics) ============
         # (1) Begin hook: launch the layer's GSA sparse-attention
-        # orchestration. Runs before this layer's k_li write, like v0230.
-        # The composed cache tuple places the indexer k/scale caches at
-        # (1, 2) with a packed main cache (C8/TQ4) or (2, 3) with split
-        # k/v -- the same derivation the 0.23.0 forward used.
-        if self.uses_packed_sfa_main_cache:
-            dsa_k_cache_idx = 1
-            dsa_k_scale_cache_idx = 2
-        else:
-            dsa_k_cache_idx = 2
-            dsa_k_scale_cache_idx = 3
-        k_cache = kv_cache[0]
-        v_cache = kv_cache[0] if self.uses_packed_sfa_main_cache else kv_cache[1]
-        vllm_indexer_cache = kv_cache[dsa_k_cache_idx] if self.has_indexer else None
-        dsa_k_scale_cache = self.dsa_k_scale if self.enable_sparse_li_c8 else None
-        vllm_indexer_scale_cache = (
-            kv_cache[dsa_k_scale_cache_idx] if self.enable_sparse_li_c8 else None
-        )
-        _, _, _, _ = maybe_execute_sparse_attention_begin(
-            None,
-            k_cache,
-            v_cache,
-            layer_name,
-            get_forward_context(),
-            indexer_cache=self.dsa_k_cache,
-            indexer_scale=dsa_k_scale_cache,
-            vllm_indexer_cache=vllm_indexer_cache,
-            vllm_indexer_scale=vllm_indexer_scale_cache,
-            has_indexer=self.has_indexer,
-            use_li_c8=self.enable_sparse_li_c8,
-        )
+        # orchestration before this layer's k write (prefill steps only,
+        # matching dev). The composed cache tuple places the indexer
+        # k/scale caches at (1, 2) with a packed main cache (C8/TQ4) or
+        # (2, 3) with split k/v -- the same derivation the 0.23.0 forward
+        # used. ``self.dsa_k_cache`` aliases the indexer backend's
+        # per-layer cache (sfa_v1_patch._make_gsa_aware_init).
+        if has_prefill:
+            if self.uses_packed_sfa_main_cache:
+                dsa_k_cache_idx = 1
+                dsa_k_scale_cache_idx = 2
+            else:
+                dsa_k_cache_idx = 2
+                dsa_k_scale_cache_idx = 3
+            k_cache = kv_cache[0]
+            v_cache = kv_cache[0] if self.uses_packed_sfa_main_cache else kv_cache[1]
+            vllm_indexer_cache = kv_cache[dsa_k_cache_idx] if self.has_indexer else None
+            dsa_k_scale_cache = self.dsa_k_scale if self.enable_sparse_li_c8 else None
+            vllm_indexer_scale_cache = (
+                kv_cache[dsa_k_scale_cache_idx] if self.enable_sparse_li_c8 else None
+            )
+            _, _, _, _ = maybe_execute_sparse_attention_begin(
+                None,
+                k_cache,
+                v_cache,
+                layer_name,
+                get_forward_context(),
+                indexer_cache=self.dsa_k_cache,
+                indexer_scale=dsa_k_scale_cache,
+                vllm_indexer_cache=vllm_indexer_cache,
+                vllm_indexer_scale=vllm_indexer_scale_cache,
+                has_indexer=self.has_indexer,
+                use_li_c8=self.enable_sparse_li_c8,
+            )
 
-        # (2) k path: compute the lightning-indexer k from the raw (fused
-        # paths) / prepared (native path) hidden states -- 0.23.0
-        # ``indexer_select_pre_process`` -- and scatter it into the
-        # per-layer ``dsa_k_cache`` (the GSA branch of the 0.23.0 k_li
-        # scatter). 0.30.0's ``AscendIndexer.forward_k`` writes the
-        # vllm-owned indexer cache instead, so GSA recomputes here; the
-        # hadamard matrix lives on the indexer in 0.30.0
-        # (``q_hadamard`` is numerically identical to 0.23.0's
-        # ``AscendSFAImpl.k_hadamard``).
-        from vllm.triton_utils import HAS_TRITON
-        from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
-
-        assert self.has_indexer
-        assert self.wk_weights_proj is not None
-        assert self.k_norm is not None
+        # (2) One unified indexer call: k path + DSA cache write + top-k.
+        # The patched backend forward (indexer_patch.py) computes the k
+        # path, persists it into the per-layer dsa_k_cache (raw dsa slot
+        # mapping) and runs the selection whose device-op dispatch routes
+        # to the DSA caches via ``sfa_impl`` (device_op_patch.py), so no
+        # inline k-path recompute is needed here. The GSA routing fields
+        # are copied onto the indexer metadata first
+        # (sfa_v1_patch._prepare_indexer_metadata).
         assert k_hidden_states is not None
-        kw, _ = self.wk_weights_proj(k_hidden_states)
-        k_li = kw[:, : self.head_dim]
-        k_li = self.k_norm(k_li).unsqueeze(1)
-        k_li = k_li.view(-1, 1, self.head_dim)
-        if HAS_TRITON:
-            k_li = rope_forward_triton_siso(
-                k_li,
-                cos.view(-1, self.qk_rope_head_dim),
-                sin.view(-1, self.qk_rope_head_dim),
-                rope_dim=self.qk_rope_head_dim,
-                is_neox_style=self.is_rope_neox_style,
-            )
-        else:
-            k_li_pe, k_li_nope = torch.split(
-                k_li,
-                [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim],
-                dim=-1,
-            )
-            k_li_pe = torch_npu.npu_rotary_mul(
-                k_li_pe.unsqueeze(2),
-                cos.view(-1, 1, 1, self.qk_rope_head_dim),
-                sin.view(-1, 1, 1, self.qk_rope_head_dim),
-            ).squeeze(2)
-            k_li = torch.cat([k_li_pe, k_li_nope], dim=-1)
-        k_li_scale = None
-        if self.enable_sparse_li_c8:
-            k_li = k_li @ self.indexer.q_hadamard
-            k_li, k_li_scale = torch_npu.npu_dynamic_quant(
-                k_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype
-            )
-            k_li_scale = k_li_scale.to(self.c8_k_scale_cache_dtype).unsqueeze(-1)
-        torch_npu.npu_scatter_nd_update_(
-            self.dsa_k_cache.view(-1, k_li.shape[-1]),
-            attn_metadata.dsa_slot_mapping[: attn_metadata.gsa_slot_len].view(-1, 1),
-            k_li.view(-1, k_li.shape[-1]),
-        )  # b, s, n, d
-        if self.enable_sparse_li_c8:
-            assert k_li_scale is not None
-            torch_npu.npu_scatter_nd_update_(
-                self.dsa_k_scale.view(-1, k_li_scale.shape[-1]),
-                attn_metadata.dsa_slot_mapping[: attn_metadata.gsa_slot_len].view(-1, 1),
-                k_li_scale.view(-1, k_li_scale.shape[-1]),
-            )
+        assert indexer_attn_metadata is not None
+        self._prepare_indexer_metadata(indexer_attn_metadata, attn_metadata)
+        topk_indices = self.indexer(
+            hidden_states,
+            q_c,
+            k_hidden_states,
+            indexer_attn_metadata,
+            compute_topk=not self.skip_topk and has_local_query,
+            attn_q_gather_handle=self._get_indexer_attn_q_gather_handle(attn_metadata),
+        )
 
-        # (3) Top-k. skip_topk layers reuse the shared index cache (their
-        # dsa_k_cache stays fresh through the k path above, as in v0230);
-        # sparse layers run the injected impl-level
-        # ``indexer_select_post_process`` whose device-op dispatch routes
-        # to the GSA DSA caches / dsa_block_table.
-        topk_num_tokens = parallel_context.topk_num_tokens
+        # (3) skip_topk layers reuse the shared index cache (their
+        # dsa_k_cache stays fresh through the k path + write above).
         if self.skip_topk:
-            topk_indices = self._get_indexcache_topk_indices(topk_num_tokens)
-        else:
-            assert q_c is not None
-            topk_indices = self.indexer_select_post_process(
-                x=hidden_states,
-                q_c=q_c,
-                kv_cache=kv_cache,
-                attn_metadata=attn_metadata,
-                cos=cos,
-                sin=sin,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-            )
-            if self.use_index_cache and has_local_query:
-                self._update_indexcache_topk_indices(topk_indices)
+            topk_indices = self._get_indexcache_topk_indices(parallel_context.topk_num_tokens)
+        elif self.use_index_cache and has_local_query:
+            self._update_indexcache_topk_indices(topk_indices)
     elif self.runtime_has_indexer:
         # One unified indexer call: k path -> cache write -> top-k
         # selection (the selection kernel reads the freshly written
@@ -391,10 +348,7 @@ def forward(
         if has_local_query:
             if gsa_active:
                 # ============ GSA attention section (v0230 semantics) ===
-                # has_prefill is attached by the patched
-                # NPUModelRunner._build_attention_metadata using the 0.23.0
-                # builder formula (any query longer than decode_threshold).
-                has_prefill = attn_metadata.has_prefill
+                # has_prefill was read above the top-k section.
                 if has_prefill:
                     # Prefill: copy the fresh top-k rows into the
                     # prefetch / warmup slots, patch the swapped rows back
@@ -534,8 +488,10 @@ def forward(
                     actual_seq_lengths_key,
                 )
 
-    if gsa_active and has_local_query:
+    if gsa_active and has_prefill and has_local_query:
         # ============ GSA finished hook (v0230 semantics) ============
+        # Prefill steps that produced attention output only, matching the
+        # in-tree ucm-v0300 gate.
         k_cache = kv_cache[0]
         v_cache = kv_cache[0] if self.uses_packed_sfa_main_cache else kv_cache[1]
         maybe_execute_sparse_attention_finished(

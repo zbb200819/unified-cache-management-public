@@ -1,29 +1,38 @@
 """GSA SFA patches for vLLM-Ascend 0.30.0.
 
 Rebased from the 0.23.0 GSA patch layer onto the 0.30.0
-``vllm_ascend.attention.sfa_v1``. Upstream 0.30.0 changes accounted for:
+``vllm_ascend.attention.sfa_v1``, then aligned with the ucm-v0300 in-tree
+GSA adaptation (dsa caches on the indexer backend, unified indexer call).
+Upstream 0.30.0 changes accounted for:
 
 * ``AscendSFAImpl.__init__`` no longer derives ``layer_id`` from
   ``kv_sharing_target_layer_name`` (it only stores the name), does not set
-  ``layer_num`` / ``is_pdmix`` / ``num_spec_tokens`` / the indexer aliases
-  (``n_head`` / ``wq_b`` / ``wk_weights_proj`` / ``k_norm``) /
+  ``layer_num`` / ``is_pdmix`` / ``num_spec_tokens`` /
   ``enable_sparse_li_c8`` + c8 cache dtypes, and allocates no per-layer DSA
   caches. Instead of replacing the whole (large, fast-moving) upstream
   ``__init__`` like the 0.23.0 patch did, this patch wraps it and appends the
-  GSA block afterwards -- the GSA additions are purely additive.
+  GSA block afterwards -- the GSA additions are purely additive. The
+  per-layer DSA caches now live on the indexer backend
+  (``indexer_patch.py``); the impl keeps aliases for the begin hook and the
+  GSA forward.
 * ``AscendIndexer`` (vllm_ascend.attention.indexer) now owns the q/k
   lightning-indexer compute (``wq_b`` / ``wk_weights_proj`` / ``q_hadamard``
-  buffer / ``enable_sparse_li_c8`` / c8 dtypes). The injected impl-level
-  ``indexer_select_post_process`` keeps computing q_li itself (the GSA
-  forward calls it with the SFA-stage hidden states, bypassing the indexer's
-  own forward for sparse layers) and sources those fields from the wrapped
-  aliases / ``self.indexer.q_hadamard``.
+  buffer / ``enable_sparse_li_c8`` / c8 dtypes). The GSA forward therefore
+  calls the indexer once per layer (the patched backend forward handles the
+  DSA cache write and the selection -- see ``indexer_patch.py``) instead of
+  the 0.23.0 impl-level ``indexer_select_post_process``; the impl-level
+  method is no longer injected.
+* ``_prepare_indexer_metadata`` (a 0.30.0 no-op hook) is patched to copy the
+  per-step GSA routing fields (dsa slot mapping / block table / seq lens /
+  indexer_last buffers) from the SFA metadata onto the indexer metadata, so
+  the backend's GSA forward finds them on its independently built metadata.
 * ``DeviceOperator.indexer_select_post_process`` lost its ``sfa_impl`` first
   argument and takes explicit ``indexer_k_cache_idx`` /
   ``indexer_scale_cache_idx`` slots plus ``enable_sparse_li_c4``; the patched
   0.30.0 device op accepts a keyword-only ``sfa_impl`` that selects the GSA
-  DSA caches (see ``v0300/vllm_ascend/device_op_patch.py``), so the impl-level
-  method passes ``sfa_impl=self`` instead of the 0.23.0 positional style.
+  DSA caches (see ``v0300/vllm_ascend/device_op_patch.py``). With the
+  unified indexer call the backend itself is the ``sfa_impl`` (it owns the
+  dsa caches and the routing attrs).
 * ``record_attention_compute_start`` and the ``FLOAT8_E8M0FNU_DTYPE``
   constant were removed upstream; the latter is now
   ``torch_npu.float8_e8m0fnu``.
@@ -54,8 +63,8 @@ def _make_gsa_aware_init(orig_init):
     work unchanged, runs the original init first, then appends the GSA
     fields. Everything the GSA forward / device-op routing reads
     (``layer_id`` / ``layer_num`` / ``is_pdmix`` / ``cur_topk_index`` /
-    ``dsa_k_cache`` / ``dsa_k_scale`` / indexer aliases / c8 dtypes) is set
-    here.
+    the ``dsa_k_cache`` / ``dsa_k_scale`` aliases to the indexer backend)
+    is set here.
     """
 
     def __init__(
@@ -73,7 +82,7 @@ def _make_gsa_aware_init(orig_init):
         **kwargs,
     ) -> None:
         from ucm.sparse.state import has_ucm_sparse
-        from ucm.sparse.utils import MAX_INDEXER_BLOCK_NUM, init_indexer_layer_map
+        from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE, init_indexer_layer_map
 
         orig_init(
             self,
@@ -116,25 +125,6 @@ def _make_gsa_aware_init(orig_init):
             and self.vllm_config.kv_transfer_config.is_kv_consumer
         )
 
-        # Indexer aliases consumed by the injected impl-level
-        # ``indexer_select_post_process`` (0.23.0 kept these on the impl;
-        # 0.30.0 moved them onto AscendIndexer, so mirror them back).
-        if self.has_indexer:
-            self.n_head: int = self.indexer.n_head  # 64
-            self.wq_b = self.indexer.wq_b
-            self.wk_weights_proj = self.indexer.wk_weights_proj
-            self.k_norm = self.indexer.k_norm
-        else:
-            self.n_head = 0
-            self.wq_b = None
-            self.wk_weights_proj = None
-            self.k_norm = None
-        self.is_rope_neox_style = True
-        self.use_torch_npu_lightning_indexer = False
-        if self.vllm_config.model_config.hf_config.model_type in ["glm_moe_dsa"]:
-            self.is_rope_neox_style = False
-            self.use_torch_npu_lightning_indexer = True
-
         # LI C8: mirror the 0.30.0 canonical derivation
         # (indexer.py / model_runner_v1.py): the layer-scoped switch comes
         # from AscendConfig, the cache dtype from attention_config.
@@ -153,32 +143,18 @@ def _make_gsa_aware_init(orig_init):
             elif self.c8_k_cache_dtype == torch.int8:
                 self.c8_k_scale_cache_dtype = torch.float16
 
-        # GSA: per-layer DSA (sparse) indexer cache. Only layers below
-        # layer_num with an indexer on pdmix / decode nodes allocate it.
-        if has_ucm_sparse():
+        # GSA: the per-layer DSA (sparse) indexer caches moved onto the
+        # indexer backend (allocated in its wrapped __init__, see
+        # ``indexer_patch.py``); the impl keeps aliases for the begin hook
+        # and the GSA forward. Only layers below layer_num with an indexer
+        # on pdmix / decode nodes have a cache.
+        if has_ucm_sparse() and PTOPK_PREFETCH_ENABLE:
             if self.has_indexer and (
                 self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer
             ):
-                # gsa param
-                num_slots = MAX_INDEXER_BLOCK_NUM
+                self.dsa_k_cache = self.indexer.impl.dsa_k_cache
                 if self.enable_sparse_li_c8:
-                    indexer_type = self.c8_k_cache_dtype
-                else:
-                    indexer_type = self.vllm_config.model_config.dtype
-
-                self.dsa_k_cache = torch.empty(
-                    (num_slots, self.vllm_config.cache_config.block_size, 1, 128),
-                    dtype=indexer_type,
-                    device=self.vllm_config.device_config.device_type,
-                    pin_memory=False,
-                )
-                if self.enable_sparse_li_c8:
-                    self.dsa_k_scale = torch.empty(
-                        (num_slots, self.vllm_config.cache_config.block_size, 1, 1),
-                        dtype=self.c8_k_scale_cache_dtype,
-                        device=self.vllm_config.device_config.device_type,
-                        pin_memory=False,
-                    )
+                    self.dsa_k_scale = self.indexer.impl.dsa_k_scale
             else:
                 self.dsa_k_cache = None
         self.topk_layer_info, self.topk_layer_map, self.indexr_num = (
@@ -193,156 +169,35 @@ def _make_gsa_aware_init(orig_init):
     return __init__
 
 
-def indexer_select_post_process(
-    self,
-    x: torch.Tensor,
-    q_c: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-    kv_cache: tuple[torch.Tensor, ...],
-    attn_metadata: M,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    actual_seq_lengths_query: torch.Tensor,
-    actual_seq_lengths_key: torch.Tensor,
-):
-    from vllm.triton_utils import HAS_TRITON
-    from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
+def _prepare_indexer_metadata(self, indexer_metadata, attn_metadata) -> None:
+    """GSA (mirrors the ucm-v0300 in-tree sfa_v1.py): copy the per-step DSA
+    routing fields from the SFA attention metadata onto the indexer
+    metadata (built independently by the indexer's own builder), so the
+    backend's GSA forward (``indexer_patch.py``) finds them.
 
+    Upstream 0.30.0 keeps this as a no-op hook; the gate makes it a no-op
+    again whenever the GSA sparse path is inactive.
+    """
     from ucm.sparse.state import has_ucm_sparse
-    from ucm.sparse.utils import IS_INDEXER_OFFLOAD
-
-    if not self.has_indexer:
-        raise RuntimeError(
-            f"indexer_select_post_process should not be called when indexer is None. layer_name={self.layer_name}."
-        )
-
-    assert self.wk_weights_proj is not None
-    assert self.wq_b is not None
-
-    kw, _ = self.wk_weights_proj(x)
-    weights = kw[:, self.head_dim :]
-    if isinstance(q_c, tuple):
-        q_c_tensor, q_c_scale = q_c
-        q_c_tensor = q_c_tensor.view(-1, q_c_tensor.shape[-1])
-        quant_matmul_kwargs = dict(
-            bias=None,
-            output_dtype=x.dtype,
-        )
-        if q_c_tensor.dtype == torch.float8_e4m3fn:
-            if q_c_scale.dim() == 2:
-                q_c_scale = q_c_scale.view(q_c_scale.shape[0], -1, 2)
-            quant_matmul_kwargs.update(
-                scale_dtype=torch_npu.float8_e8m0fnu,
-                pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
-                group_sizes=[
-                    1,
-                    1,
-                    getattr(self.wq_b.quant_method.quant_method, "group_size", 32),
-                ],
-            )
-        elif q_c_scale.dim() > 1 and q_c_scale.shape[-1] == 1:
-            q_c_scale = q_c_scale.squeeze(dim=-1)
-        q_li = torch_npu.npu_quant_matmul(
-            q_c_tensor,
-            self.wq_b.weight,
-            self.wq_b.weight_scale,
-            pertoken_scale=q_c_scale,
-            **quant_matmul_kwargs,
-        )
-    else:
-        q_li, _ = self.wq_b(q_c)
-    q_li = q_li.view(-1, self.n_head, self.head_dim)
-    if HAS_TRITON:
-        q_li = rope_forward_triton_siso(
-            q_li,
-            cos,
-            sin,
-            rope_dim=self.qk_rope_head_dim,
-            is_neox_style=self.is_rope_neox_style,
-        )
-    else:
-        q_li_pe, q_li_nope = torch.split(
-            q_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
-        )
-
-        q_li_pe = q_li_pe.unsqueeze(2)
-        q_li_pe = torch_npu.npu_rotary_mul(q_li_pe, cos, sin)
-        q_li_pe = q_li_pe.squeeze(2)
-        q_li = torch.cat([q_li_pe, q_li_nope], dim=-1)
-
-    q_li_scale = None
-    q_li_shape_ori = None
-    if self.enable_sparse_li_c8:
-        # Same math as AscendIndexer._quantize_li_tensor (the hadamard
-        # buffer lives on the indexer in 0.30.0).
-        assert self.indexer.q_hadamard is not None
-        q_li_shape_ori = q_li.shape
-        q_li = q_li @ self.indexer.q_hadamard
-        q_li, q_li_scale = torch_npu.npu_dynamic_quant(
-            q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype
-        )
-        q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)  # [b*s,]
+    from ucm.sparse.utils import PTOPK_PREFETCH_ENABLE
 
     if (
         has_ucm_sparse()
+        and PTOPK_PREFETCH_ENABLE
         and self.layer_id < self.layer_num
-        and (self.is_pdmix or not self.vllm_config.kv_transfer_config.is_kv_producer)
+        and (
+            self.is_pdmix
+            or not self.vllm_config.kv_transfer_config.is_kv_producer
+        )
     ):
-        actual_seq_lengths_key = attn_metadata.dsa_seq_len
-        if IS_INDEXER_OFFLOAD and self.has_indexer:
-            torch.ops._C_gsa.indexer_gather_qw(
-                q_li.view(-1, self.n_head * self.head_dim),
-                weights.view(-1, self.n_head),
-                attn_metadata.indexer_last_query[self.layer_id][
-                    : attn_metadata.indexer_last_query_len
-                ].view(-1, self.n_head * self.head_dim),
-                attn_metadata.indexer_last_weight[self.layer_id][
-                    : attn_metadata.indexer_last_query_len
-                ].view(-1, self.n_head),
-                attn_metadata.indexer_last_q_index[
-                    : attn_metadata.indexer_last_query_len
-                ]
-                .view(-1, 1)
-                .expand((-1, self.n_head * self.head_dim)),
-                attn_metadata.indexer_last_q_index[
-                    : attn_metadata.indexer_last_query_len
-                ]
-                .view(-1, 1)
-                .expand((-1, self.n_head)),
-            )
-
-    # GSA routing reads the per-layer dsa_k_cache via ``sfa_impl``, so the
-    # cache slots only matter for the upstream fallback path. The forward
-    # hands in the composed SFA cache tuple (main + indexer caches), where
-    # the indexer k/scale caches sit at (1, 2) with a packed main cache
-    # (C8/TQ4) or (2, 3) with split k/v -- the same derivation the 0.23.0
-    # device op performed internally on this tuple layout.
-    if self.uses_packed_sfa_main_cache:
-        indexer_k_cache_idx = 1
-        indexer_scale_cache_idx = 2
-    else:
-        indexer_k_cache_idx = 2
-        indexer_scale_cache_idx = 3
-
-    # 0.30.0 device-op signature: explicit indexer cache slots + c4/c8
-    # switches, with the GSA routing selected by the keyword-only
-    # ``sfa_impl`` (dsa_k_cache / dsa_block_table). GSA never combines with
-    # the C4 lightning indexer, so c4 is always False on this path.
-    return DeviceOperator.indexer_select_post_process(
-        q_li,
-        q_li_scale,
-        q_li_shape_ori,
-        weights,
-        kv_cache,
-        indexer_k_cache_idx,
-        indexer_scale_cache_idx,
-        attn_metadata,
-        actual_seq_lengths_query,
-        actual_seq_lengths_key,
-        self.enable_sparse_li_c8,
-        False,
-        self.use_torch_npu_lightning_indexer,
-        sfa_impl=self,
-    )
+        indexer_metadata.dsa_slot_mapping = attn_metadata.dsa_slot_mapping
+        indexer_metadata.gsa_slot_len = attn_metadata.gsa_slot_len
+        indexer_metadata.dsa_block_table = attn_metadata.dsa_block_table
+        indexer_metadata.dsa_seq_len = attn_metadata.dsa_seq_len
+        indexer_metadata.indexer_last_query = attn_metadata.indexer_last_query
+        indexer_metadata.indexer_last_weight = attn_metadata.indexer_last_weight
+        indexer_metadata.indexer_last_q_index = attn_metadata.indexer_last_q_index
+        indexer_metadata.indexer_last_query_len = attn_metadata.indexer_last_query_len
 
 
 def _execute_sparse_flash_attention_process(
@@ -508,14 +363,14 @@ def _patch(mod):
         patch_or_inject(target, "__init__", _patched)
         logger.info("UCM GSA AscendSFAImpl.__init__ wrapper patch applied")
 
-    # Impl-level lightning-indexer q computation + GSA routing. 0.30.0 does
-    # not define this method on the impl (AscendIndexer.forward owns the
-    # compute and calls the device op without sfa_impl), so it is injected;
-    # the GSA forward (sfa_kv_transfer_patch) calls it for sparse layers.
-    if not hasattr(target, "indexer_select_post_process"):
-        _patched = _make_patched(mod, indexer_select_post_process)
-        patch_or_inject(target, "indexer_select_post_process", _patched)
-        logger.info("UCM GSA AscendSFAImpl.indexer_select_post_process injected")
+    # GSA metadata copy hook: upstream 0.30.0 defines this as a no-op on
+    # the impl; the patched version copies the per-step DSA routing fields
+    # onto the indexer metadata for the backend's GSA forward (the stock
+    # branch keeps a no-op through the gate).
+    if hasattr(target, "_prepare_indexer_metadata"):
+        _patched = _make_patched(mod, _prepare_indexer_metadata)
+        patch_or_inject(target, "_prepare_indexer_metadata", _patched)
+        logger.info("UCM GSA AscendSFAImpl._prepare_indexer_metadata patch applied")
 
     if hasattr(target, "_execute_sparse_flash_attention_process"):
         _patched = _make_patched(mod, _execute_sparse_flash_attention_process)
