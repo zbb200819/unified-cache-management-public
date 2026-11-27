@@ -41,7 +41,7 @@ public:
     __aicore__ inline void ProcessVec2L(const RunInfo &info);
     __aicore__ inline void InitBuffers(TPipe *pipe);
     __aicore__ inline void InitParams(const struct ConstInfo &constInfo,
-                                      const KvQuantSparseFlashAttentionTilingDataMla *__restrict tilingData);
+                                      const KvQuantSparseFlashAttentionGsaTilingDataMla *__restrict tilingData);
     __aicore__ inline void InitVec0GlobalTensor(const GlobalTensor<int32_t> &kvValidSizeGm,
                                                 const GlobalTensor<K_ROPE_T> &kvMergeGm,
                                                 const GlobalTensor<K_ROPE_T> &keyRopeGm,
@@ -143,7 +143,7 @@ private:
     static constexpr T RECIP_OF_LN2 = 1 / LN2;
     static constexpr T SOFTMAX_MIN_NUM = -2e38;
 
-    const KvQuantSparseFlashAttentionTilingDataMla *__restrict tilingData;
+    const KvQuantSparseFlashAttentionGsaTilingDataMla *__restrict tilingData;
 
     uint32_t pingpongFlag = 0U;
     ConstInfo constInfo = {};
@@ -226,7 +226,7 @@ template <typename QSFAT> __aicore__ inline void QSFAVectorService<QSFAT>::InitB
 template <typename QSFAT>
 __aicore__ inline void
 QSFAVectorService<QSFAT>::InitParams(const struct ConstInfo &constInfo,
-                                     const KvQuantSparseFlashAttentionTilingDataMla *__restrict tilingData)
+                                     const KvQuantSparseFlashAttentionGsaTilingDataMla *__restrict tilingData)
 {
     this->constInfo = constInfo;
     this->tilingData = tilingData;

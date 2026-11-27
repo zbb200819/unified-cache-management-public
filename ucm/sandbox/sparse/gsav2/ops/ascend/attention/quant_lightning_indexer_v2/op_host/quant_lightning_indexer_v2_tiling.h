@@ -1,0 +1,356 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+/*!
+ * \file quant_lightning_indexer_v2_tiling.h
+ * \brief
+ */
+
+#ifndef QUANT_LIGHTNING_INDEXER_V2_TILING_H
+#define QUANT_LIGHTNING_INDEXER_V2_TILING_H
+
+#include "common/include/op_host/op_const_def_transformer.h"
+#include "err/ops_err.h"
+#include "exe_graph/runtime/tiling_context.h"
+#include "platform/platform_info.h"
+#include "register/op_def_registry.h"
+#include "register/tilingdata_base.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "tiling/tiling_api.h"
+#include "../../lightning_indexer_v2/op_host/checkers/checker_context_lightning_indexer_v2.h"
+
+namespace optiling {
+// ------------------公共定义--------------------------
+struct TilingRequiredParaInfo {
+    const gert::CompileTimeTensorDesc* desc;
+    const gert::StorageShape* shape;
+};
+
+struct TilingOptionalParaInfo {
+    const gert::CompileTimeTensorDesc* desc;
+    const gert::Tensor* tensor;
+};
+
+enum class DataLayout : uint32_t {
+    BSND = 0,
+    TND = 1,
+    PA_BBND = 2
+};
+
+// ------------------算子原型索引常量定义----------------
+// Inputs Index
+constexpr uint32_t QUERY_INDEX = 0;
+constexpr uint32_t KEY_INDEX = 1;
+constexpr uint32_t WEIGTHS_INDEX = 2;
+constexpr uint32_t QUERY_DEQUANT_SCALE_INDEX = 3;
+constexpr uint32_t KEY_DEQUANT_SCALE_INDEX = 4;
+constexpr uint32_t CU_SEQLENS_Q_INDEX = 5;
+constexpr uint32_t CU_SEQLENS_K_INDEX = 6;
+constexpr uint32_t SEQUSED_Q_INDEX = 7;
+constexpr uint32_t SEQUSED_K_INDEX = 8;
+constexpr uint32_t CMP_RESIDUAL_K_INDEX = 9;
+constexpr uint32_t BLOCK_TABLE_INDEX = 10;
+constexpr uint32_t OUTPUT_IDX_OFFSET_INDEX = 11;
+constexpr uint32_t METADATA_INDEX = 12;
+constexpr uint32_t CAUSAL_SEQLENS_KV_GLOBAL_INDEX = 13;
+constexpr uint32_t SPARSE_INDICES_INDEX = 0;
+constexpr uint32_t SPARSE_VALUES_INDEX = 1;
+constexpr uint32_t CANDIDATE_BLOCK_INDICES_OUTPUT_INDEX = 2;
+constexpr uint32_t CANDIDATE_BLOCK_LENGTH_OUTPUT_INDEX = 3;
+// Attributes Index
+constexpr uint32_t ATTR_TOPK_INDEX = 0;
+constexpr uint32_t ATTR_QUANT_MODE_INDEX = 1;
+constexpr uint32_t ATTR_MAX_SEQLEN_Q_INDEX = 2;
+constexpr uint32_t ATTR_QUERY_LAYOUT_INDEX = 3;
+constexpr uint32_t ATTR_KEY_LAYOUT_INDEX = 4;
+constexpr uint32_t ATTR_MASK_MODE_INDEX = 5;
+constexpr uint32_t ATTR_CMP_RATIO_INDEX = 6;
+constexpr uint32_t ATTR_RETURN_VALUE_INDEX = 7;
+// candidate（两级 TopK source 模式）属性索引
+constexpr uint32_t ATTR_CANDIDATE_TOPK_BLOCKS_INDEX = 8;
+constexpr uint32_t ATTR_CANDIDATE_BLOCK_SIZE_INDEX = 9;
+// DCP（Decode Context Parallel）属性索引：单 ListInt，固定顺序
+// [cp_world, cp_rank, cp_kv_cache_interleave_size]，size 必须为 3
+constexpr uint32_t ATTR_DCP_PARAMS_INDEX = 10;
+constexpr uint32_t DCP_PARAMS_SIZE = 3;
+constexpr size_t DCP_PARAM_CP_WORLD = 0;
+constexpr size_t DCP_PARAM_CP_RANK = 1;
+constexpr size_t DCP_PARAM_INTERLEAVE = 2;
+
+// Dim Index
+constexpr uint32_t DIM_IDX_ZERO = 0;
+constexpr uint32_t DIM_IDX_ONE = 1;
+constexpr uint32_t DIM_IDX_TWO = 2;
+constexpr uint32_t DIM_IDX_THREE = 3;
+// Dim Num
+constexpr uint32_t DIM_NUM_TWO = 2;
+constexpr uint32_t DIM_NUM_THREE = 3;
+constexpr uint32_t DIM_NUM_FOUR = 4;
+// 入参限制常量
+constexpr uint32_t HEAD_DIM_LIMIT = 128;
+constexpr uint32_t SPARSE_LIMIT = 2048;
+constexpr uint32_t SPARSE_LIMIT_8K = 8192;
+constexpr uint32_t G_SIZE_LIMIT = 64;
+constexpr uint32_t GSIZE_FAST_24 = 24;
+constexpr uint32_t GSIZE_FAST_32 = 32;
+constexpr uint32_t G_SIZE_LIMIT_32_950 = 32;
+// candidate 开启时额外放行 g=32（块级候选形态使用 4 行基本块，mBaseSize=4*g）
+constexpr uint32_t G_SIZE_LIMIT_CANDIDATE_32 = 32;
+constexpr uint32_t BLOCK_SIZE_LIMIT = 1024;
+constexpr uint32_t BLOCK_SIZE_FACTOR = 16;
+constexpr uint32_t SPARSE_MODE_LOWER = 3;
+using lightning_indexer_v2_checker::QUANT_MODE_FP8;
+using lightning_indexer_v2_checker::QUANT_MODE_INT8;
+using lightning_indexer_v2_checker::QUANT_MODE_MXFP8;
+using lightning_indexer_v2_checker::QUANT_MODE_HIFLOAT8;
+using lightning_indexer_v2_checker::QUANT_MODE_MXFP4;
+using lightning_indexer_v2_checker::QUANT_MODE_HIFLOAT4;
+using lightning_indexer_v2_checker::MX_SCALE_SHAPE_ALIGN;
+using lightning_indexer_v2_checker::MX_E8M0_SCALE_PACK_NUM;
+using lightning_indexer_v2_checker::MXFP4_PACK_NUM;
+using lightning_indexer_v2_checker::HIFLOAT4_PACK_NUM;
+// quant_mode=7: W4A4 signed int4，q/k 以 DT_INT4 进入 tiling/kernel（与 W8A8 复用 dtype 位段分发）。
+// torch 侧无 int4 dtype，以 nibble 打包的 uint8 为载体（低半字节=偶数下标，补码 -8..7）。
+constexpr uint32_t QUANT_MODE_INT4 = 7;
+constexpr uint32_t INT4_PACK_NUM = 2;
+constexpr uint32_t MX_SCALE_GROUP_SIZE = 32; // MX量化每32个D维元素对应1个E8M0 scale
+constexpr uint32_t HIFLOAT4_BLOCK_SIZE = 64; // HIFLOAT4每64个D维元素对应1个scale
+
+// ------------------candidate（两级 TopK source 模式）常量------------------
+constexpr int32_t CANDIDATE_TOPK_BLOCKS_OFF = -1;    // 关闭（默认，现网行为）
+constexpr int32_t CANDIDATE_TOPK_BLOCKS_FIX = 2048;  // 当前开启仅支持 2048
+constexpr int32_t CANDIDATE_BLOCK_SIZE_OFF = -1;     // 关闭态配套值（只接受 (-1,-1) 或 (2048,8)）
+constexpr uint32_t CANDIDATE_BLOCK_SIZE_DEFAULT = 8; // 开启态唯一合法值（32B 块内归约粒度）
+
+// -----------算子TilingData定义---------------
+BEGIN_TILING_DATA_DEF(QLIV2TilingData)
+TILING_DATA_FIELD_DEF(uint32_t, bSize)
+TILING_DATA_FIELD_DEF(uint32_t, n2Size)
+TILING_DATA_FIELD_DEF(uint32_t, gSize)
+TILING_DATA_FIELD_DEF(uint32_t, s1Size)
+TILING_DATA_FIELD_DEF(uint32_t, s2Size)
+TILING_DATA_FIELD_DEF(uint32_t, sparseCount)
+TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum)
+TILING_DATA_FIELD_DEF(uint32_t, blockSize)
+TILING_DATA_FIELD_DEF(uint32_t, maxBlockNumPerBatch)
+TILING_DATA_FIELD_DEF(uint32_t, sparseMode)
+TILING_DATA_FIELD_DEF(uint32_t, cmpRatio)
+TILING_DATA_FIELD_DEF(uint32_t, returnValue)
+TILING_DATA_FIELD_DEF(int32_t, maxSeqlenQ)
+TILING_DATA_FIELD_DEF(uint32_t, keyStride0)
+TILING_DATA_FIELD_DEF(uint32_t, keyDequantScaleStride0)
+TILING_DATA_FIELD_DEF(uint32_t, quantMode)
+// ---- candidate（两级 TopK source 模式）----
+TILING_DATA_FIELD_DEF(int32_t, candidateTopkBlocks) // -1=关闭
+TILING_DATA_FIELD_DEF(uint32_t, candidateBlockSize) // 当前仅 8
+// DCP（Decode Context Parallel）：cpWorld>1 时启用
+TILING_DATA_FIELD_DEF(uint32_t, cpWorld)
+TILING_DATA_FIELD_DEF(uint32_t, cpRank)
+TILING_DATA_FIELD_DEF(uint32_t, cpInterleaveSize)
+
+// fast 模板专用字段，追加在末尾以保持既有字段的二进制布局不变
+TILING_DATA_FIELD_DEF(uint32_t, fastUsedCoreNum)
+TILING_DATA_FIELD_DEF(uint64_t, fastWorkspaceGroupStride)
+TILING_DATA_FIELD_DEF(uint32_t, aicNum)
+TILING_DATA_FIELD_DEF(uint32_t, aivNum)
+END_TILING_DATA_DEF
+REGISTER_TILING_DATA_CLASS(QuantLightningIndexerV2, QLIV2TilingData)
+
+// -----------算子CompileInfo定义-------------------
+struct QLIV2CompileInfo {};
+
+// -----------算子Tiling入参结构体定义---------------
+struct QLIV2ParaInfo {
+    TilingRequiredParaInfo query = {nullptr, nullptr};
+    TilingRequiredParaInfo key = {nullptr, nullptr};
+    TilingRequiredParaInfo weights = {nullptr, nullptr};
+    TilingRequiredParaInfo query_dequant_scale = {nullptr, nullptr};
+    TilingRequiredParaInfo key_dequant_scale = {nullptr, nullptr};
+    TilingOptionalParaInfo cuSeqLensQ = {nullptr, nullptr};
+    TilingOptionalParaInfo cuSeqLensK = {nullptr, nullptr};
+    TilingOptionalParaInfo sequsedQ = {nullptr, nullptr};
+    TilingOptionalParaInfo sequsedK = {nullptr, nullptr};
+    TilingOptionalParaInfo cmpResidualK = {nullptr, nullptr};
+    TilingOptionalParaInfo blockTable = {nullptr, nullptr};
+    TilingOptionalParaInfo outputIdxOffset = {nullptr, nullptr};
+    TilingOptionalParaInfo metadata = {nullptr, nullptr};
+    TilingOptionalParaInfo causalSeqLensKvGlobal = {nullptr, nullptr};
+    TilingRequiredParaInfo attenOut = {nullptr, nullptr};
+    TilingRequiredParaInfo sparseValues = {nullptr, nullptr};
+
+    const int32_t* quantMode = nullptr;
+    const int32_t* maxSeqlenQ = nullptr;
+    const char* layOutQuery = nullptr;
+    const char* layOutKey = nullptr;
+    const int32_t* blockSize = nullptr;
+    const int32_t* sparseMode = nullptr;
+    const int32_t* sparseCount = nullptr;
+    const int64_t* cmpRatio = nullptr;
+    const int32_t* returnValue = nullptr;
+    const int64_t* candidateTopkBlocks = nullptr;
+    const int64_t* candidateBlockSize = nullptr;
+    // DCP: 单 ListInt 属性 [cp_world, cp_rank, cp_kv_cache_interleave_size]（cp_world>1 时启用）
+    const gert::TypedContinuousVector<int64_t>* dcpParams = nullptr;
+};
+
+// -----------算子Tiling入参信息类---------------
+class QLIV2TilingInfo {
+public:
+    const char* opName = nullptr;
+    fe::PlatFormInfos* platformInfo = nullptr;
+    QLIV2ParaInfo opParamInfo;
+    // Base Param
+    platform_ascendc::SocVersion socVersion = platform_ascendc::SocVersion::ASCEND910B;
+    NpuArch npuArch = NpuArch::DAV_2201;
+    uint32_t bSize = 0;
+    uint32_t n1Size = 0;
+    uint32_t n2Size = 0;
+    uint32_t s1Size = 0;
+    int64_t s2Size = 0;
+    uint32_t qkHeadDim = 0;
+    uint32_t gSize = 0;
+    // TND 下 query shape 为 [Total, N, D]，t1Size 记录物理 T1；
+    // slow 路径的 s1Size 在 TND 下保持 0，fast 的 workspace 预留上界计算单独使用本字段。
+    uint64_t t1Size = 0;
+    // PageAttention
+    bool pageAttentionFlag = false;
+    int32_t blockSize = 0;
+    uint32_t maxBlockNumPerBatch = 0;
+    // Mask
+    int32_t sparseMode = 0;
+    // Others Flag
+    int32_t quantMode = 0;
+    uint32_t sparseCount = 0;
+    uint32_t cmpRatio = 1;
+    bool returnValue = false;
+    uint32_t keyStride0 = 0;
+    uint32_t keyDequantScaleStride0 = 0;
+    std::vector<uint32_t> keyStridesVec;
+    std::vector<uint32_t> keyDequantScaleStridesVec;
+    int32_t maxSeqlenQ = -1;
+    // candidate（两级 TopK source 模式）
+    int32_t candidateTopkBlocks = CANDIDATE_TOPK_BLOCKS_OFF;
+    uint32_t candidateBlockSize = CANDIDATE_BLOCK_SIZE_DEFAULT;
+    // DCP（Decode Context Parallel）：cpWorld>1 时启用，不单独设 enable 开关
+    bool dcpEnable = false;
+    uint32_t cpWorld = 1;
+    uint32_t cpRank = 0;
+    uint32_t cpInterleaveSize = 1;
+    bool causalSeqLensKvGlobalPresent = false;
+    // DType
+    ge::DataType inputQType = Ops::Transformer::DT_FLOAT16;
+    ge::DataType inputKType = Ops::Transformer::DT_FLOAT16;
+    ge::DataType outputType = Ops::Transformer::DT_INT32;
+    // Layout
+    DataLayout inputQLayout = DataLayout::BSND;
+    DataLayout inputKLayout = DataLayout::PA_BBND;
+};
+
+// -----------算子Tiling入参信息解析及Check类---------------
+class QLIV2InfoParser {
+public:
+    explicit QLIV2InfoParser(gert::TilingContext* context)
+        : context_(context)
+    {}
+    ~QLIV2InfoParser() = default;
+
+    ge::graphStatus CheckRequiredInOutExistence() const;
+    ge::graphStatus CheckRequiredAttrExistence() const;
+    ge::graphStatus CheckQliv2RequiredParameters() const;
+    ge::graphStatus GetActualSeqLenSize(int64_t& size, const gert::Tensor* tensor,
+                                        const std::string& actualSeqLenName) const;
+    ge::graphStatus GetOpName();
+    ge::graphStatus GetNpuInfo();
+    void GetInputParaInfo();
+    void GetOutputParaInfo();
+    void GetOptionalInputParaInfo();
+    ge::graphStatus GetAttrParaInfo();
+    ge::graphStatus CheckAttrParaInfo();
+    ge::graphStatus GetOpParaInfo();
+    ge::graphStatus ValidateInputShapesMatch();
+    ge::graphStatus CheckScaleShape();
+    ge::graphStatus GetAndCheckInOutDataType();
+    ge::graphStatus GetHeadDim();
+    ge::graphStatus GetBatchSize();
+    ge::graphStatus GetS1Size();
+    ge::graphStatus GetAndCheckOptionalInput();
+    ge::graphStatus CheckDcpParams();
+    ge::graphStatus CheckShapeDim();
+    ge::graphStatus GetAndCheckBlockSize();
+    ge::graphStatus GetQueryKeyAndOutLayout();
+    ge::graphStatus GetN1Size();
+    ge::graphStatus GetAndCheckN2Size();
+    ge::graphStatus GetGSize();
+    ge::graphStatus GetS2SizeForPageAttention();
+    ge::graphStatus GetS2SizeForBatchContinuous();
+    ge::graphStatus GetS2Size();
+    ge::graphStatus GetAttenMaskInfo();
+    ge::graphStatus GetActualSeqInfo();
+    ge::graphStatus CheckKeyContiguous() const;
+    ge::graphStatus CheckTemplateCombinationSupport();
+    void GenerateInfo(QLIV2TilingInfo& QLIV2Info);
+    ge::graphStatus ParseAndCheck(QLIV2TilingInfo& QLIV2Info);
+
+public:
+    gert::TilingContext* context_ = nullptr;
+    const char* opName_;
+    fe::PlatFormInfos* platformInfo_;
+    QLIV2ParaInfo qliV2Params_;
+
+    // BaseParams
+    int64_t bSize_ = 0;
+    int64_t n1Size_ = 0;
+    int64_t n2Size_ = 0;
+    int64_t gSize_ = 0;
+    int64_t s1Size_ = 0;
+    uint64_t t1Size_ = 0;
+    int64_t s2Size_ = 0;
+    int64_t headDim_ = 0;
+    // Layout
+    DataLayout qLayout_ = DataLayout::BSND;
+    DataLayout kLayout_ = DataLayout::PA_BBND;
+    // PageAttention
+    uint32_t maxBlockNumPerBatch_ = 0;
+    int64_t blockSize_ = 0;
+    platform_ascendc::SocVersion socVersion_ = platform_ascendc::SocVersion::ASCEND910B;
+    NpuArch npuArch_ = NpuArch::DAV_2201;
+    ge::DataType inputQType_ = Ops::Transformer::DT_FLOAT16;
+    ge::DataType inputKType_ = Ops::Transformer::DT_FLOAT16;
+    ge::DataType weightsType_ = Ops::Transformer::DT_FLOAT16;
+    ge::DataType inputQueryScaleType_ = Ops::Transformer::DT_FLOAT16;
+    ge::DataType inputKeyScaleType_ = Ops::Transformer::DT_FLOAT16;
+    ge::DataType blockTableType_ = Ops::Transformer::DT_FLOAT16;
+    ge::DataType inputKRopeType_ = Ops::Transformer::DT_FLOAT16;
+    ge::DataType outputType_ = Ops::Transformer::DT_FLOAT16;
+    ge::DataType valuesOutType_ = Ops::Transformer::DT_BF16;
+    std::vector<uint32_t> keyStridesVec_;
+    std::vector<uint32_t> keyDequantScaleStridesVec_;
+    // DCP（Decode Context Parallel）解析结果：cp_world>1 时启用
+    bool dcpEnable_ = false;
+    uint32_t cpWorld_ = 1;
+    uint32_t cpRank_ = 0;
+    uint32_t cpInterleave_ = 1;
+    bool causalPresent_ = false;
+};
+
+// ---------------算子Tiling类---------------
+class QuantLightningIndexerV2Tiling {
+public:
+    explicit QuantLightningIndexerV2Tiling(gert::TilingContext* context)
+        : context_(context) {};
+    ge::graphStatus DoTiling(QLIV2TilingInfo* tilingInfo);
+
+private:
+    gert::TilingContext* context_ = nullptr;
+    QLIV2TilingData tilingData_;
+};
+
+} // namespace optiling
+#endif // QUANT_LIGHTNING_INDEXER_V2_TILING_H

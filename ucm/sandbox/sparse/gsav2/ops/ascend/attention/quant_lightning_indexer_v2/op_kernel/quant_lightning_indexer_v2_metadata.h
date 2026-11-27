@@ -1,0 +1,106 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+/*!
+ * \file quant_lightning_indexer_v2_metadata.h
+ * \brief
+ */
+
+#ifndef QUANT_LIGHTNING_INDEXER_V2_METADATA_H
+#define QUANT_LIGHTNING_INDEXER_V2_METADATA_H
+
+#include <cstdint>
+
+namespace optiling {
+
+// Constants
+// 总长度按1024个int32元素对齐，扩展区在动态分核信息之后。
+inline constexpr uint32_t QLI_V2_METADATA_ALIGNMENT = 1024;
+
+using QLI_V2_METADATA_T = int32_t;
+
+inline constexpr uint32_t QLI_V2_METADATA_SIZE = 8;
+inline constexpr uint32_t QLD_V2_METADATA_SIZE = 8;
+
+// 扩展区起点由实际核数确定，与调用方分配的缓冲区总长度无关
+#ifdef __CCE_AICORE__
+__aicore__ inline constexpr uint64_t GetQliV2MetadataExtensionOffset(uint32_t aicNum, uint32_t aivNum)
+#else
+inline constexpr uint64_t GetQliV2MetadataExtensionOffset(uint32_t aicNum, uint32_t aivNum)
+#endif
+{
+    return static_cast<uint64_t>(aicNum) * QLI_V2_METADATA_SIZE + static_cast<uint64_t>(aivNum) * QLD_V2_METADATA_SIZE;
+}
+
+#ifdef __CCE_AICORE__
+__aicore__ inline constexpr uint64_t GetQliV2MetadataSize(uint32_t aicNum, uint32_t aivNum)
+#else
+inline constexpr uint64_t GetQliV2MetadataSize(uint32_t aicNum, uint32_t aivNum)
+#endif
+{
+    const uint64_t coreSize = GetQliV2MetadataExtensionOffset(aicNum, aivNum);
+    return (coreSize + QLI_V2_METADATA_ALIGNMENT - 1) / QLI_V2_METADATA_ALIGNMENT * QLI_V2_METADATA_ALIGNMENT;
+}
+
+// LI Metadata Index Definitions
+inline constexpr uint32_t QLI_V2_CORE_ENABLE_INDEX = 0;
+inline constexpr uint32_t QLI_V2_BN2_START_INDEX = 1;
+inline constexpr uint32_t QLI_V2_M_START_INDEX = 2;
+inline constexpr uint32_t QLI_V2_S2_START_INDEX = 3;
+inline constexpr uint32_t QLI_V2_BN2_END_INDEX = 4;
+inline constexpr uint32_t QLI_V2_M_END_INDEX = 5;
+inline constexpr uint32_t QLI_V2_S2_END_INDEX = 6;
+inline constexpr uint32_t QLI_V2_FIRST_QLD_V2_DATA_WORKSPACE_IDX_INDEX = 7;
+
+// LD Metadata Index Definitions
+inline constexpr uint32_t QLD_V2_CORE_ENABLE_INDEX = 0;
+inline constexpr uint32_t QLD_V2_BN2_IDX_INDEX = 1;
+inline constexpr uint32_t QLD_V2_M_IDX_INDEX = 2;
+inline constexpr uint32_t QLD_V2_WORKSPACE_IDX_INDEX = 3;
+inline constexpr uint32_t QLD_V2_WORKSPACE_NUM_INDEX = 4;
+inline constexpr uint32_t QLD_V2_M_START_INDEX = 5;
+inline constexpr uint32_t QLD_V2_M_NUM_INDEX = 6;
+
+// fast模板准入标志使用扩展区第0项，不占用AIC/AIV分核记录
+inline constexpr uint32_t QLI_V2_A5_FAST_FLAG_OFFSET = 0;
+inline constexpr uint32_t QLI_V2_A5_FAST_DISABLE = 0;
+inline constexpr uint32_t QLI_V2_A5_FAST_ENABLE = 1;
+// fast准入与Kernel TopK状态使用相同的容量上限
+inline constexpr uint32_t QLI_V2_A5_FAST_SPARSE_CAPACITY = 2048U;
+
+// arch22 fast 分核记录（扩展区，3 槽连续）：每 group 依次为 enable、tile 起点与终点
+// （左闭右开）；每 group 占 3 槽，group数按对齐后剩余的扩展区容量截断
+// 当前 910B AIC 核数不超过 36，即最多 36 group（108 int32）
+inline constexpr uint32_t QLI_V2_A3_FAST_GROUP_SLOT_NUM = 3;
+inline constexpr uint32_t QLI_V2_A3_FAST_ENABLE_SLOT = 0;
+inline constexpr uint32_t QLI_V2_A3_FAST_START_SLOT = 1;
+inline constexpr uint32_t QLI_V2_A3_FAST_END_SLOT = 2;
+
+/**
+ * @brief 获取属性的绝对索引
+ * @param coreIdx 核索引
+ * @param metaIdx 元数据索引
+ * @param isAIV 是否为AIV数据，默认为false
+ * @return 返回属性的绝对索引
+ */
+#ifdef __CCE_AICORE__
+__aicore__ inline uint32_t GetAttrAbsIndex(uint32_t coreIdx, uint32_t metaIdx, uint32_t aicNum, bool isAIV = false)
+{
+    if (isAIV) {
+        return QLI_V2_METADATA_SIZE * aicNum + QLD_V2_METADATA_SIZE * coreIdx + metaIdx;
+    } else {
+        return QLI_V2_METADATA_SIZE * coreIdx + metaIdx;
+    }
+}
+#endif
+
+}; // namespace optiling
+
+#endif // QUANT_LIGHTNING_INDEXER_V2_METADATA_H

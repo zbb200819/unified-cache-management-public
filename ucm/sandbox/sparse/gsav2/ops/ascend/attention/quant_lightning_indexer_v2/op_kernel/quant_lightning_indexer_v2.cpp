@@ -1,0 +1,131 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+/*!
+ * \file quant_lightning_indexer_v2.cpp
+ * \brief
+ */
+
+#include "kernel_operator.h"
+#include "lib/matmul_intf.h"
+#if (defined(__NPU_ARCH__) && (__NPU_ARCH__ == 9201 || __NPU_ARCH__ == 9202)) || (__CCE_AICORE__ == 310)
+#include "arch35/quant_lightning_indexer_v2_kernel_arch35.h"
+#if (__CCE_AICORE__ == 310) && !(defined(__NPU_ARCH__) && (__NPU_ARCH__ == 9201 || __NPU_ARCH__ == 9202))
+#include "arch35/quant_lightning_indexer_v2_fast_kernel_arch35.h"
+#endif
+#else
+#include "arch22/quant_lightning_indexer_v2_kernel_arch22.h"
+#include "arch22/quant_lightning_indexer_v2_fast_kernel_arch22.h"
+#endif
+#include "quant_lightning_indexer_v2_template_tiling_key.h"
+using namespace QLIV2Kernel;
+
+#define INVOKE_LI_NO_KFC_OP_IMPL(templateClass, ...) \
+    do { \
+        templateClass<QLIV2Type<__VA_ARGS__>> op; \
+        op.Init(query, key, weights, queryScale, keyScale, cuSeqlensQ, cuSeqlensK, sequsedQ, sequsedK, cmpResidualK, \
+                blockTable, outputIdxOffset, metadata, sparseIndices, sparseValues, user, tiling_data, &tPipe); \
+        op.Process(); \
+    } while (0)
+
+// arch22: candidate（两级 TopK source 模式）需要把候选块输出透传给 kernel 主控类；
+// candidate 关闭时该指针为空，QLIV2Preload 内部按 candidateOn=false 走原单级 TopK 路径
+#define INVOKE_LI_CANDIDATE_OP_IMPL(templateClass, ...) \
+    do { \
+        templateClass<QLIV2Type<__VA_ARGS__>> op; \
+        op.Init(query, key, weights, queryScale, keyScale, cuSeqlensQ, cuSeqlensK, sequsedQ, sequsedK, cmpResidualK, \
+                blockTable, outputIdxOffset, metadata, causalSeqlensKvGlobal, sparseIndices, sparseValues, \
+                candidateBlockIndices, candidateBlockLength, user, tiling_data, &tPipe); \
+        op.Process(); \
+    } while (0)
+
+// fast 模板不使用 TPipe
+#define INVOKE_LI_FAST_OP_IMPL(templateClass, ...) \
+    do { \
+        templateClass<QLIV2Type<__VA_ARGS__>> op; \
+        op.Init(query, key, weights, queryScale, keyScale, cuSeqlensQ, cuSeqlensK, sequsedQ, sequsedK, cmpResidualK, \
+                blockTable, outputIdxOffset, metadata, sparseIndices, sparseValues, user, tiling_data, nullptr); \
+        op.Process(); \
+    } while (0)
+
+template <int DT_Q, int DT_K, int DT_OUT, int PAGE_ATTENTION, int Q_LAYOUT_T, int K_LAYOUT_T, int QUANT_MODE>
+__global__ __aicore__ void quant_lightning_indexer_v2(
+    __gm__ uint8_t* query, __gm__ uint8_t* key, __gm__ uint8_t* weights, __gm__ uint8_t* queryScale,
+    __gm__ uint8_t* keyScale, __gm__ uint8_t* cuSeqlensQ, __gm__ uint8_t* cuSeqlensK, __gm__ uint8_t* sequsedQ,
+    __gm__ uint8_t* sequsedK, __gm__ uint8_t* cmpResidualK, __gm__ uint8_t* blockTable, __gm__ uint8_t* outputIdxOffset,
+    __gm__ uint8_t* metadata, __gm__ uint8_t* causalSeqlensKvGlobal, __gm__ uint8_t* sparseIndices,
+    __gm__ uint8_t* sparseValues, __gm__ uint8_t* candidateBlockIndices, __gm__ uint8_t* candidateBlockLength,
+    __gm__ uint8_t* workspace, __gm__ uint8_t* tiling)
+{
+    __gm__ uint8_t* user = GetUserWorkspace(workspace);
+#if (defined(__NPU_ARCH__) && (__NPU_ARCH__ == 9201 || __NPU_ARCH__ == 9202))
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_1);
+#else
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+#endif
+    GET_TILING_DATA_WITH_STRUCT(QLIV2TilingData, tiling_data_in, tiling);
+    const QLIV2TilingData* __restrict tiling_data = &tiling_data_in;
+
+#if (defined(__NPU_ARCH__) && (__NPU_ARCH__ == 9201 || __NPU_ARCH__ == 9202)) || (__CCE_AICORE__ == 310)
+    // 声明条件与本分支条件保持一致，避免在 9201/9202 下 __CCE_AICORE__ != 310 的编译组合漏声明
+    TPipe tPipe;
+
+#if (__CCE_AICORE__ == 310) && !(defined(__NPU_ARCH__) && (__NPU_ARCH__ == 9201 || __NPU_ARCH__ == 9202))
+    if (QLIV2FastDispatch<DT_Q, DT_K, PAGE_ATTENTION, Q_LAYOUT_T, K_LAYOUT_T>::TryRun(
+            query, key, weights, queryScale, keyScale, cuSeqlensQ, cuSeqlensK, sequsedK, blockTable, outputIdxOffset,
+            metadata, sparseIndices, sparseValues, user, tiling_data)) {
+        return;
+    }
+#endif
+    if constexpr (QUANT_MODE == QUANT_MODE_FP8) {
+        INVOKE_LI_NO_KFC_OP_IMPL(QLIV2Preload, fp8_e4m3fn_t, fp8_e4m3fn_t, float, uint16_t, int32_t, PAGE_ATTENTION,
+                                 LI_LAYOUT(Q_LAYOUT_T), LI_LAYOUT(K_LAYOUT_T), float, float, QUANT_MODE);
+    } else if constexpr (QUANT_MODE == QUANT_MODE_MXFP8) {
+        INVOKE_LI_NO_KFC_OP_IMPL(QLIV2Preload, fp8_e4m3fn_t, fp8_e4m3fn_t, float, uint16_t, int32_t, PAGE_ATTENTION,
+                                 LI_LAYOUT(Q_LAYOUT_T), LI_LAYOUT(K_LAYOUT_T), fp8_e8m0_t, float, QUANT_MODE);
+    } else if constexpr (QUANT_MODE == QUANT_MODE_HIFLOAT8) {
+        INVOKE_LI_NO_KFC_OP_IMPL(QLIV2Preload, hifloat8, hifloat8, float, uint16_t, int32_t, PAGE_ATTENTION,
+                                 LI_LAYOUT(Q_LAYOUT_T), LI_LAYOUT(K_LAYOUT_T), float, float, QUANT_MODE);
+    } else if constexpr (QUANT_MODE == QUANT_MODE_MXFP4) {
+        INVOKE_LI_NO_KFC_OP_IMPL(QLIV2Preload, fp4x2_e2m1_t, fp4x2_e2m1_t, bfloat16_t, uint16_t, int32_t,
+                                 PAGE_ATTENTION, LI_LAYOUT(Q_LAYOUT_T), LI_LAYOUT(K_LAYOUT_T), fp8_e8m0_t, float,
+                                 QUANT_MODE);
+    } else if constexpr (QUANT_MODE == QUANT_MODE_INT8) {
+        INVOKE_LI_NO_KFC_OP_IMPL(QLIV2Preload, int8_t, int8_t, int32_t, uint16_t, int32_t, PAGE_ATTENTION,
+                                 LI_LAYOUT(Q_LAYOUT_T), LI_LAYOUT(K_LAYOUT_T), half, half, QUANT_MODE);
+    }
+#if (defined(__NPU_ARCH__) && (__NPU_ARCH__ == 9201 || __NPU_ARCH__ == 9202))
+    else if constexpr (QUANT_MODE == QUANT_MODE_HIFLOAT4) {
+        INVOKE_LI_NO_KFC_OP_IMPL(QLIV2Preload, hifloat4x2_t, hifloat4x2_t, bfloat16_t, uint16_t, int32_t,
+                                 PAGE_ATTENTION, LI_LAYOUT(Q_LAYOUT_T), LI_LAYOUT(K_LAYOUT_T), float, float,
+                                 QUANT_MODE);
+    }
+#endif
+
+#else
+    // fastUsedCoreNum != 0 表示 tiling 侧已判定走 fast 模板；candidate 开启时
+    // host tiling 恒不选 fast，int4 也由 tiling 校验拦截，各路径互斥
+    if (tiling_data->fastUsedCoreNum != 0U) {
+        INVOKE_LI_FAST_OP_IMPL(QLIV2FastKernel, int8_t, int8_t, float, uint16_t, int32_t, PAGE_ATTENTION,
+                               LI_LAYOUT(Q_LAYOUT_T), LI_LAYOUT(K_LAYOUT_T));
+        return;
+    }
+    TPipe tPipe;
+    // 910B 统一走 QLIV2Preload：candidate 参数在关闭态为空，行为与原单级 TopK 一致。
+    // W8A8/W4A4 由 TilingKey 的 dtype 位段（DT_Q/DT_K）在编译期完成模板分发。
+    if constexpr (DT_Q == QLIV2_TPL_INT4) {
+        INVOKE_LI_CANDIDATE_OP_IMPL(QLIV2Preload, int4b_t, int4b_t, float, uint16_t, int32_t, PAGE_ATTENTION,
+                                    LI_LAYOUT(Q_LAYOUT_T), LI_LAYOUT(K_LAYOUT_T));
+    } else {
+        INVOKE_LI_CANDIDATE_OP_IMPL(QLIV2Preload, int8_t, int8_t, float, uint16_t, int32_t, PAGE_ATTENTION,
+                                    LI_LAYOUT(Q_LAYOUT_T), LI_LAYOUT(K_LAYOUT_T));
+    }
+#endif
+}

@@ -47,7 +47,10 @@ function(op_add_subdirectory OP_LIST OP_DIR_LIST)
     set(_OP_LIST)
     set(_OP_DIR_LIST)
 
-    file(GLOB OP_HOST_CMAKE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/**/op_host/CMakeLists.txt")
+    file(GLOB OP_HOST_CMAKE_FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/*/op_host/CMakeLists.txt"
+        "${CMAKE_CURRENT_SOURCE_DIR}/attention/*/op_host/CMakeLists.txt"
+    )
 
     foreach(OP_CMAKE_FILE ${OP_HOST_CMAKE_FILES})
         get_filename_component(OP_HOST_DIR "${OP_CMAKE_FILE}" DIRECTORY)
@@ -264,7 +267,7 @@ function(add_opc_config)
 endfunction()
 
 function(add_ops_src_copy)
-    cmake_parse_arguments(SRC_COPY "" "TARGET_NAME;SRC;DST;BE_RELIED;COMPUTE_UNIT" "" ${ARGN})
+    cmake_parse_arguments(SRC_COPY "KERNEL_ONLY" "TARGET_NAME;SRC;DST;BE_RELIED;COMPUTE_UNIT" "" ${ARGN})
 
     set(OPS_UTILS_INC_KERNEL_TARGET ops_utils_inc_kernel_${SRC_COPY_COMPUTE_UNIT})
     if (EXISTS ${OPS_ADV_UTILS_KERNEL_INC})
@@ -284,9 +287,14 @@ function(add_ops_src_copy)
 
     if (NOT TARGET ${SRC_COPY_TARGET_NAME})
         set(_BUILD_FLAG ${SRC_COPY_DST}/${SRC_COPY_TARGET_NAME}.done)
+        if (SRC_COPY_KERNEL_ONLY)
+            set(_SRC_COPY_ROOT ${SRC_COPY_SRC}/op_kernel)
+        else ()
+            set(_SRC_COPY_ROOT ${SRC_COPY_SRC})
+        endif ()
         add_custom_command(OUTPUT ${_BUILD_FLAG}
                 COMMAND mkdir -p ${SRC_COPY_DST}
-                COMMAND cp -rf ${SRC_COPY_SRC}/op_kernel/* ${SRC_COPY_DST}
+                COMMAND cp -rf ${_SRC_COPY_ROOT}/. ${SRC_COPY_DST}
                 COMMAND touch ${_BUILD_FLAG}
         )
 
@@ -349,7 +357,8 @@ function(add_bin_compile_target)
             add_dependencies(${op_file} ${OP_TARGET_NAME})
             list(APPEND _ops_target_list ${OP_TARGET_NAME})
 
-            set(OP_SRC_OUT_DIR  ${SRC_OUT_DIR}/${op_file})
+            file(RELATIVE_PATH _op_rel_dir ${CMAKE_SOURCE_DIR} ${${op_file}_dir})
+            set(OP_SRC_OUT_DIR  ${SRC_OUT_DIR}/${_op_rel_dir})
             set(OP_BIN_OUT_DIR  ${BIN_OUT_DIR}/${op_file})
             file(MAKE_DIRECTORY ${OP_SRC_OUT_DIR})
 
@@ -364,17 +373,39 @@ function(add_bin_compile_target)
                     ${BINARY_COMPUTE_UNIT}
             )
 
+            # CANN 9.1 resolves kernels at ../ascendc/<op>, while newer templates
+            # use the copied op_kernel tree next to the generated Python file.
+            get_filename_component(_op_src_parent "${OP_SRC_OUT_DIR}" DIRECTORY)
+            set(OP_LEGACY_SRC_OUT_DIR ${_op_src_parent}/ascendc/${op_file})
+            add_ops_src_copy(
+                    TARGET_NAME
+                    ${OP_TARGET_NAME}_legacy_src_copy
+                    SRC
+                    ${${op_file}_dir}
+                    DST
+                    ${OP_LEGACY_SRC_OUT_DIR}
+                    COMPUTE_UNIT
+                    ${BINARY_COMPUTE_UNIT}
+                    KERNEL_ONLY
+            )
+
             if (DEFINED ${op_file}_depends)
                 foreach(depend_info ${${op_file}_depends})
                     get_filename_component(_depend_op_name "${depend_info}" NAME)
-                    set(_depend_op_target ${_depend_op_name}_${BINARY_COMPUTE_UNIT}_src_copy)
+                    set(_depend_primary_target ${_depend_op_name}_${BINARY_COMPUTE_UNIT}_src_copy)
+                    if (TARGET ${_depend_primary_target})
+                        add_dependencies(${OP_TARGET_NAME}_src_copy ${_depend_primary_target})
+                        continue()
+                    endif ()
+                    string(REPLACE "/" "_" _depend_op_target_name "${depend_info}")
+                    set(_depend_op_target ${_depend_op_target_name}_${BINARY_COMPUTE_UNIT}_src_copy)
                     add_ops_src_copy(
                             TARGET_NAME
                             ${_depend_op_target}
                             SRC
                             ${CMAKE_SOURCE_DIR}/${depend_info}
                             DST
-                            ${SRC_OUT_DIR}/${_depend_op_name}
+                            ${SRC_OUT_DIR}/${depend_info}
                             COMPUTE_UNIT
                             ${BINARY_COMPUTE_UNIT}
                             BE_RELIED
@@ -475,7 +506,12 @@ function(add_bin_compile_target)
             if (ENABLE_OPS_HOST)
                 add_dependencies(${OP_TARGET_NAME}_${op_index} optiling generate_ops_info)
             endif ()
-            add_dependencies(${OP_TARGET_NAME}_${op_index} ${OP_TARGET_NAME}_src_copy ${OP_TARGET_NAME}_py_copy ${OP_TARGET_NAME}_mkdir)
+            add_dependencies(${OP_TARGET_NAME}_${op_index}
+                    ${OP_TARGET_NAME}_src_copy
+                    ${OP_TARGET_NAME}_legacy_src_copy
+                    ${OP_TARGET_NAME}_py_copy
+                    ${OP_TARGET_NAME}_mkdir
+            )
             add_dependencies(${OP_TARGET_NAME} ${OP_TARGET_NAME}_${op_index})
         endif ()
     endforeach()

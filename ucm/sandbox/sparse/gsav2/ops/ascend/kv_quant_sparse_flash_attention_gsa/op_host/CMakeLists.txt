@@ -12,6 +12,12 @@ add_ops_compile_options(
 )
 
 set(kv_quant_sparse_flash_attention_gsa PARENT_SCOPE)
+set(kv_quant_sparse_flash_attention_gsa_depends
+    attention/common
+    attention/sparse_flash_attention
+    common
+    CACHE INTERNAL "Dependencies for kv_quant_sparse_flash_attention_gsa"
+)
 
 # def.cpp 喂给 op_host_aclnn → op_build 生成 aclnn 接口
 target_sources(op_host_aclnn PRIVATE

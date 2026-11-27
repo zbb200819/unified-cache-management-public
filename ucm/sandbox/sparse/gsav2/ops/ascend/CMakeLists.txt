@@ -156,6 +156,11 @@ if (BUILD_OPEN_PROJECT)
     target_sources(optiling PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/utils/src/fallback_comm.cpp
     )
+    target_include_directories(optiling PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/common/include
+            ${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/op_common/op_host
+    )
     target_compile_options(optiling PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-std=c++11>
             -fvisibility=hidden
@@ -556,12 +561,7 @@ install(DIRECTORY ${OPS_ADV_UTILS_KERNEL_INC}/
 foreach (op_dir ${OP_DIR_LIST})
     get_filename_component(_op_name "${op_dir}" NAME)
 
-    file(GLOB KERNEL_FILES
-            ${op_dir}/op_kernel/*.cpp
-            ${op_dir}/op_kernel/*.h
-    )
-
-    install(FILES ${KERNEL_FILES}
+    install(DIRECTORY ${op_dir}/op_kernel/
             DESTINATION ${IMPL_INSTALL_DIR}/ascendc/${_op_name}
             OPTIONAL
     )

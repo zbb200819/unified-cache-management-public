@@ -72,7 +72,7 @@ public:
                                 __gm__ uint8_t *sinks, __gm__ uint8_t *attentionOut,
                                 __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum,
                                 __gm__ uint8_t *actualSparseLengths, __gm__ uint8_t *workspace,
-                                const KvQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
+                                const KvQuantSparseFlashAttentionGsaTilingDataMla *__restrict tiling,
 				                __gm__ uint8_t *gmTiling, TPipe *tPipe);
 
     __aicore__ inline void Process();
@@ -111,7 +111,7 @@ private:
 
     static constexpr uint32_t dbWorkspaceRatio = PRELOAD_NUM;
 
-    const KvQuantSparseFlashAttentionTilingDataMla *__restrict tilingData = nullptr;
+    const KvQuantSparseFlashAttentionGsaTilingDataMla *__restrict tilingData = nullptr;
 
     TPipe *pipe = nullptr;
 
@@ -467,7 +467,7 @@ __aicore__ inline void KvQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uint8_
     __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *sinks, __gm__ uint8_t *attentionOut,
     __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, __gm__ uint8_t *actualSparseLengths,
     __gm__ uint8_t *workspace,
-    const KvQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
+    const KvQuantSparseFlashAttentionGsaTilingDataMla *__restrict tiling,
     __gm__ uint8_t *gmTiling, TPipe *tPipe)
 {
     if ASCEND_IS_AIC {

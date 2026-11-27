@@ -19,16 +19,8 @@
 #include "kernel_operator_list_tensor_intf.h"
 #include "lib/matrix/matmul/tiling.h"
 #include "lib/matmul_intf.h"
-#if __has_include("../../common/op_kernel/arch35/vf/vf_mul_sel_softmaxflashv2_cast_nz_sfa.h")
-#include "../../common/op_kernel/arch35/vf/vf_mul_sel_softmaxflashv2_cast_nz_sfa.h"
-#else
-#include "../../common/arch35/vf/vf_mul_sel_softmaxflashv2_cast_nz_sfa.h"
-#endif
-#if __has_include("../../common/op_kernel/arch35/vf/vf_flashupdate_new.h")
-#include "../../common/op_kernel/arch35/vf/vf_flashupdate_new.h"
-#else
-#include "../../common/arch35/vf/vf_flashupdate_new.h"
-#endif
+#include "../../../attention/common/op_kernel/arch35/vf/vf_mul_sel_softmaxflashv2_cast_nz_sfa.h"
+#include "../../../attention/common/op_kernel/arch35/vf/vf_flashupdate_new.h"
 
 using namespace AscendC;
 using namespace FaVectorApi;
@@ -55,7 +47,7 @@ public:
 
     // ==================== Functions ======================
     __aicore__ inline QSFAVectorService() {};
-    __aicore__ inline void InitVecBlock(TPipe *pipe, const KvQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
+    __aicore__ inline void InitVecBlock(TPipe *pipe, const KvQuantSparseFlashAttentionGsaTilingDataMla *__restrict tiling,
         CVSharedParams &sharedParams, int32_t aicIdx, uint8_t subBlockIdx, __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths)
     {
         if ASCEND_IS_AIV {
@@ -132,7 +124,7 @@ private:
     __aicore__ inline void GetExtremeValue(T &negativeScalar);
 
     TPipe *tPipe;
-    const KvQuantSparseFlashAttentionTilingDataMla *__restrict tilingData;
+    const KvQuantSparseFlashAttentionGsaTilingDataMla *__restrict tilingData;
 
     GlobalTensor<OUTPUT_T> attentionOutGm;
     GlobalTensor<KV_T> keyGm;
@@ -598,29 +590,29 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::ProcessVec1SoftmaxDispa
     if (runInfo.s2LoopCount == 0) {
         if (likely(runInfo.s2RealSize == 128)) { // s2RealSize等于128分档, VF内常量化减少if判断
             ProcessVec1Vf<T, Q_T, false, s1BaseSize, s2BaseSize, FaVectorApi::OriginNRange::EQ_128_SFA>(
-                stage1CastTensor, mmRes, sumUb, maxUb, maxUb, apiTmpBuffer, runInfo.halfMRealSize, runInfo.s2RealSize,
+                stage1CastTensor, mmRes, sumUb, maxUb, maxUb, apiTmpBuffer, nullptr, runInfo.halfMRealSize, runInfo.s2RealSize,
                 static_cast<T>(constInfo.softmaxScale), negativeFloatScalar);
         } else if (runInfo.s2RealSize <= 64) { // s2RealSize小于等于64分档, VF内常量化减少if判断
             ProcessVec1Vf<T, Q_T, false, s1BaseSize, s2BaseSize, FaVectorApi::OriginNRange::GT_0_AND_LTE_64_SFA>(
-                stage1CastTensor, mmRes, sumUb, maxUb, maxUb, apiTmpBuffer, runInfo.halfMRealSize, runInfo.s2RealSize,
+                stage1CastTensor, mmRes, sumUb, maxUb, maxUb, apiTmpBuffer, nullptr, runInfo.halfMRealSize, runInfo.s2RealSize,
                 static_cast<T>(constInfo.softmaxScale), negativeFloatScalar);
         } else if (runInfo.s2RealSize < 128) { // s2RealSize小于128分档, VF内常量化减少if判断
             ProcessVec1Vf<T, Q_T, false, s1BaseSize, s2BaseSize, FaVectorApi::OriginNRange::GT_64_AND_LTE_128_SFA>(
-                stage1CastTensor, mmRes, sumUb, maxUb, maxUb, apiTmpBuffer, runInfo.halfMRealSize,
+                stage1CastTensor, mmRes, sumUb, maxUb, maxUb, apiTmpBuffer, nullptr, runInfo.halfMRealSize,
                 runInfo.s2RealSize, static_cast<T>(constInfo.softmaxScale), negativeFloatScalar);
         }
     } else {
         if (likely(runInfo.s2RealSize == 128)) { // s2RealSize等于128分档, VF内常量化减少if判断
             ProcessVec1Vf<T, Q_T, true, s1BaseSize, s2BaseSize, FaVectorApi::OriginNRange::EQ_128_SFA>(
-                stage1CastTensor, mmRes, sumUb, maxUb, maxUb, apiTmpBuffer, runInfo.halfMRealSize,
+                stage1CastTensor, mmRes, sumUb, maxUb, maxUb, apiTmpBuffer, nullptr, runInfo.halfMRealSize,
                 runInfo.s2RealSize, static_cast<T>(constInfo.softmaxScale), negativeFloatScalar);
         } else if (runInfo.s2RealSize <= 64) { // s2RealSize小于等于64分档, VF内常量化减少if判断
             ProcessVec1Vf<T, Q_T, true, s1BaseSize, s2BaseSize, FaVectorApi::OriginNRange::GT_0_AND_LTE_64_SFA>(
-                stage1CastTensor, mmRes, sumUb, maxUb, maxUb, apiTmpBuffer, runInfo.halfMRealSize,
+                stage1CastTensor, mmRes, sumUb, maxUb, maxUb, apiTmpBuffer, nullptr, runInfo.halfMRealSize,
                 runInfo.s2RealSize, static_cast<T>(constInfo.softmaxScale), negativeFloatScalar);
         } else if (runInfo.s2RealSize < 128) { // s2RealSize小于128分档, VF内常量化减少if判断
             ProcessVec1Vf<T, Q_T, true, s1BaseSize, s2BaseSize, FaVectorApi::OriginNRange::GT_64_AND_LTE_128_SFA>(
-                stage1CastTensor, mmRes, sumUb, maxUb, maxUb, apiTmpBuffer, runInfo.halfMRealSize,
+                stage1CastTensor, mmRes, sumUb, maxUb, maxUb, apiTmpBuffer, nullptr, runInfo.halfMRealSize,
                 runInfo.s2RealSize, static_cast<T>(constInfo.softmaxScale), negativeFloatScalar);
         }
     }
@@ -878,7 +870,7 @@ public:
     __aicore__ inline void CleanOutput(__gm__ uint8_t *attentionOut, ConstInfo &constInfo) {}
     __aicore__ inline void InitGlobalBuffer(__gm__ uint8_t *key, __gm__ uint8_t *value, __gm__ uint8_t *sparseIndices,
         __gm__ uint8_t *blockTable) {}
-    __aicore__ inline void InitVecBlock(TPipe *pipe, const KvQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
+    __aicore__ inline void InitVecBlock(TPipe *pipe, const KvQuantSparseFlashAttentionGsaTilingDataMla *__restrict tiling,
         CVSharedParams &sharedParams, int32_t aicIdx, uint8_t subBlockIdx, __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths) {};
     __aicore__ inline void InitLocalBuffer(TPipe *pipe, ConstInfo &constInfo) {}
 

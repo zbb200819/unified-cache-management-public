@@ -155,7 +155,7 @@ struct InnerSplitParams {
 };
 
 // -----------算子TilingData定义---------------
-BEGIN_TILING_DATA_DEF(KvQuantSparseFlashAttentionBaseParamsMla)
+BEGIN_TILING_DATA_DEF(KvQuantSparseFlashAttentionGsaBaseParamsMla)
 TILING_DATA_FIELD_DEF(uint32_t, batchSize)
 TILING_DATA_FIELD_DEF(uint32_t, seqSize)
 TILING_DATA_FIELD_DEF(uint32_t, qSeqSize)
@@ -178,22 +178,22 @@ TILING_DATA_FIELD_DEF(uint32_t, hasActualSparseLengths)
 TILING_DATA_FIELD_DEF(uint32_t, returnSoftmaxLse)
 END_TILING_DATA_DEF
 
-REGISTER_TILING_DATA_CLASS(KvQuantSparseFlashAttentionBaseParamsMlaOp, KvQuantSparseFlashAttentionBaseParamsMla)
+REGISTER_TILING_DATA_CLASS(KvQuantSparseFlashAttentionGsaBaseParamsMlaOp, KvQuantSparseFlashAttentionGsaBaseParamsMla)
 
-BEGIN_TILING_DATA_DEF(KvQuantSparseFlashAttentionSingleCoreParamsMla)
+BEGIN_TILING_DATA_DEF(KvQuantSparseFlashAttentionGsaSingleCoreParamsMla)
 TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum);
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(KvQuantSparseFlashAttentionSingleCoreParamsMlaOp,
-    KvQuantSparseFlashAttentionSingleCoreParamsMla)
+REGISTER_TILING_DATA_CLASS(KvQuantSparseFlashAttentionGsaSingleCoreParamsMlaOp,
+    KvQuantSparseFlashAttentionGsaSingleCoreParamsMla)
 
-BEGIN_TILING_DATA_DEF(KvQuantSparseFlashAttentionSingleCoreTensorSizeMla)
+BEGIN_TILING_DATA_DEF(KvQuantSparseFlashAttentionGsaSingleCoreTensorSizeMla)
 TILING_DATA_FIELD_DEF(uint32_t, mmResUbSize);
 TILING_DATA_FIELD_DEF(uint32_t, bmm2ResUbSize);
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(KvQuantSparseFlashAttentionSingleCoreTensorSizeMlaOp,
-    KvQuantSparseFlashAttentionSingleCoreTensorSizeMla)
+REGISTER_TILING_DATA_CLASS(KvQuantSparseFlashAttentionGsaSingleCoreTensorSizeMlaOp,
+    KvQuantSparseFlashAttentionGsaSingleCoreTensorSizeMla)
 
-BEGIN_TILING_DATA_DEF(KvQuantSparseFlashAttentionSplitKVParamsMla)
+BEGIN_TILING_DATA_DEF(KvQuantSparseFlashAttentionGsaSplitKVParamsMla)
 TILING_DATA_FIELD_DEF(uint32_t, s2)             // S2切分份数P(仅尾波任务)
 TILING_DATA_FIELD_DEF(uint32_t, accumOutSize)   // FD workspace
 TILING_DATA_FIELD_DEF(uint32_t, logSumExpSize)  // FD workspace
@@ -201,25 +201,25 @@ TILING_DATA_FIELD_DEF(uint32_t, tailTaskNum)    // 被切分的尾波任务数x(
 TILING_DATA_FIELD_DEF(uint32_t, taskNumTotal)   // host 估计的全局任务总数(取上界,仅用于 FD 尺寸上界)
 TILING_DATA_FIELD_DEF(uint32_t, s2LoopsEst)     // host 估计的每任务 s2 迭代数 L(kernel 加权分核用)
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(KvQuantSparseFlashAttentionSplitKVParamsMlaOp,
-    KvQuantSparseFlashAttentionSplitKVParamsMla)
+REGISTER_TILING_DATA_CLASS(KvQuantSparseFlashAttentionGsaSplitKVParamsMlaOp,
+    KvQuantSparseFlashAttentionGsaSplitKVParamsMla)
 
 // 内切基本块参数
-BEGIN_TILING_DATA_DEF(KvQuantSparseFlashAttentionInnerSplitParams)
+BEGIN_TILING_DATA_DEF(KvQuantSparseFlashAttentionGsaInnerSplitParams)
 TILING_DATA_FIELD_DEF(uint32_t, mBaseSize)
 TILING_DATA_FIELD_DEF(uint32_t, s2BaseSize)
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(KvQuantSparseFlashAttentionInnerSplitParamsOp,
-    KvQuantSparseFlashAttentionInnerSplitParams)
+REGISTER_TILING_DATA_CLASS(KvQuantSparseFlashAttentionGsaInnerSplitParamsOp,
+    KvQuantSparseFlashAttentionGsaInnerSplitParams)
 
-BEGIN_TILING_DATA_DEF(KvQuantSparseFlashAttentionTilingDataMla)
-TILING_DATA_FIELD_DEF_STRUCT(KvQuantSparseFlashAttentionBaseParamsMla, baseParams);
-TILING_DATA_FIELD_DEF_STRUCT(KvQuantSparseFlashAttentionSplitKVParamsMla, splitKVParams);
-TILING_DATA_FIELD_DEF_STRUCT(KvQuantSparseFlashAttentionSingleCoreParamsMla, singleCoreParams);
-TILING_DATA_FIELD_DEF_STRUCT(KvQuantSparseFlashAttentionSingleCoreTensorSizeMla, singleCoreTensorSize);
-TILING_DATA_FIELD_DEF_STRUCT(KvQuantSparseFlashAttentionInnerSplitParams, innerSplitParams);
+BEGIN_TILING_DATA_DEF(KvQuantSparseFlashAttentionGsaTilingDataMla)
+TILING_DATA_FIELD_DEF_STRUCT(KvQuantSparseFlashAttentionGsaBaseParamsMla, baseParams);
+TILING_DATA_FIELD_DEF_STRUCT(KvQuantSparseFlashAttentionGsaSplitKVParamsMla, splitKVParams);
+TILING_DATA_FIELD_DEF_STRUCT(KvQuantSparseFlashAttentionGsaSingleCoreParamsMla, singleCoreParams);
+TILING_DATA_FIELD_DEF_STRUCT(KvQuantSparseFlashAttentionGsaSingleCoreTensorSizeMla, singleCoreTensorSize);
+TILING_DATA_FIELD_DEF_STRUCT(KvQuantSparseFlashAttentionGsaInnerSplitParams, innerSplitParams);
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(KvQuantSparseFlashAttentionGsa, KvQuantSparseFlashAttentionTilingDataMla)
+REGISTER_TILING_DATA_CLASS(KvQuantSparseFlashAttentionGsa, KvQuantSparseFlashAttentionGsaTilingDataMla)
 
 template <typename T> inline T Align(T num, T rnd)
 {
@@ -376,7 +376,7 @@ private:
     uint32_t aivNum_ = 0;
     size_t libapiSize_ = 0;
 
-    KvQuantSparseFlashAttentionTilingDataMla tilingData_;
+    KvQuantSparseFlashAttentionGsaTilingDataMla tilingData_;
     uint32_t blockDim_{0};
     uint64_t workspaceSize_{0};
     uint64_t tilingKey_{0};

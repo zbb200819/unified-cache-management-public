@@ -42,7 +42,7 @@ echo "[GSA] SOC_VERSION=$SOC_VERSION IS_INSTALL=$IS_INSTALL BUILD_KERNEL=$BUILD_
 # ---------------------------------------------------------------------------
 if [ "$BUILD_KERNEL" = "true" ]; then
     ASCEND_DIR="$ROOT_DIR/ascend"
-    GSA_OP="kv_quant_sparse_flash_attention_gsa"
+    GSA_OPS="kv_quant_sparse_flash_attention_gsa;kv_quant_sparse_flash_attention_v2;lightning_indexer_v2;quant_lightning_indexer_v2"
 
     case "$SOC_VERSION" in
         ascend910b)    SOC_ARG="ascend910b" ;;
@@ -51,11 +51,11 @@ if [ "$BUILD_KERNEL" = "true" ]; then
         *) echo "[GSA] Unsupported SOC: $SOC_VERSION"; exit 1 ;;
     esac
 
-    echo "[GSA] ===== Step 1: Build AscendC kernel ops ($GSA_OP for $SOC_ARG) ====="
+    echo "[GSA] ===== Step 1: Build AscendC kernel ops ($GSA_OPS for $SOC_ARG) ====="
     cd "$ASCEND_DIR"
     echo "[GSA] cwd: $PWD"
     rm -rf build output
-    bash build_ops.sh -n "$GSA_OP" -c "$SOC_ARG"
+    bash build_ops.sh -n "$GSA_OPS" -c "$SOC_ARG"
 
     # ---------------------------------------------------------------------------
     # Step 2: 安装 .run 到 vendors/gsa

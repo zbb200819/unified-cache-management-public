@@ -24,6 +24,9 @@ CHECK_COMPATIBLE="true"
 ASAN="false"
 COV="false"
 VERBOSE="false"
+COMMON_DST="${CURRENT_DIR}/attention/common/op_kernel"
+COMMON_STAGED="false"
+CANN_COMMON=""
 
 if [ "${USER_ID}" != "0" ]; then
     DEFAULT_TOOLKIT_INSTALL_DIR="${HOME}/Ascend/ascend-toolkit/latest"
@@ -57,6 +60,76 @@ function log() {
     local current_time=`date +"%Y-%m-%d %H:%M:%S"`
     echo "[$current_time] "$1
 }
+
+function cleanup_common_deps()
+{
+    if [ "${COMMON_STAGED}" == "true" ]; then
+        rm -rf "${COMMON_DST}"
+    fi
+}
+
+function prepare_common_deps()
+{
+    if [ -e "${COMMON_DST}" ]; then
+        log "ERROR: ${COMMON_DST} must be generated from CANN, not stored in the source tree. Remove it before building."
+        exit 1
+    fi
+
+    if [ -n "${OPS_TRANSFORMER_COMMON_DIR:-}" ]; then
+        CANN_COMMON="${OPS_TRANSFORMER_COMMON_DIR}"
+    else
+        for base in "${ASCEND_CANN_PACKAGE_PATH}" \
+                    "${ASCEND_HOME_PATH:-}" \
+                    "/usr/local/Ascend/ascend-toolkit/latest" \
+                    "/usr/local/Ascend/cann-9.1.0"; do
+            candidate="${base}/opp/built-in/op_impl/ai_core/tbe/impl/ops_transformer/ascendc/common"
+            if [ -n "${base}" ] && [ -f "${candidate}/buffer.h" ]; then
+                CANN_COMMON="${candidate}"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "${CANN_COMMON}" ] || [ ! -d "${CANN_COMMON}" ]; then
+        log "ERROR: CANN ops_transformer common headers not found. Set OPS_TRANSFORMER_COMMON_DIR to the container source directory."
+        exit 1
+    fi
+
+    local common_files=(
+        buffer.h
+        buffer_manager.h
+        buffers_policy.h
+        buffer_mix_core.h
+        CopyInL1.h
+        FixpipeOut.h
+        matmul.h
+        offset_calculator.h
+    )
+    local required_files=("${common_files[@]}" "memcopy")
+    if [[ "${ascend_compute_unit}" == *"ascend950"* ]]; then
+        required_files+=("arch35/vf")
+    fi
+    for file in "${required_files[@]}"; do
+        if [ ! -e "${CANN_COMMON}/${file}" ]; then
+            log "ERROR: Missing ${CANN_COMMON}/${file}"
+            exit 1
+        fi
+    done
+
+    log "Info: copying ops_transformer common headers from ${CANN_COMMON}"
+    mkdir -p "${COMMON_DST}"
+    COMMON_STAGED="true"
+    for file in "${common_files[@]}"; do
+        cp -f "${CANN_COMMON}/${file}" "${COMMON_DST}/"
+    done
+    cp -rf "${CANN_COMMON}/memcopy" "${COMMON_DST}/"
+    if [[ "${ascend_compute_unit}" == *"ascend950"* ]]; then
+        mkdir -p "${COMMON_DST}/arch35"
+        cp -rf "${CANN_COMMON}/arch35/vf" "${COMMON_DST}/arch35/"
+    fi
+}
+
+trap cleanup_common_deps EXIT
 
 function set_env()
 {
@@ -195,6 +268,7 @@ fi
 
 CUSTOM_OPTION="${CUSTOM_OPTION} -DCUSTOM_ASCEND_CANN_PACKAGE_PATH=${ASCEND_CANN_PACKAGE_PATH} -DCHECK_COMPATIBLE=${CHECK_COMPATIBLE}"
 
+prepare_common_deps
 set_env
 clean
 
@@ -205,6 +279,8 @@ if [ -n "${ccache_system}" ];then
 fi
 
 cd ${BUILD_DIR}
+cmake_config
+build generate_compile_cmd
 cmake_config
 build_package
 collect_output

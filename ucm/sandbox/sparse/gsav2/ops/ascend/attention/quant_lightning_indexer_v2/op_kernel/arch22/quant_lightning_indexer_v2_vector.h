@@ -1,0 +1,324 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+/*!
+ * \file quant_lightning_indexer_v2_vector.h
+ * \brief
+ */
+#ifndef QUANT_LIGHTNING_INDEXER_V2_VECTOR_H
+#define QUANT_LIGHTNING_INDEXER_V2_VECTOR_H
+
+#include "kernel_operator.h"
+#include "quant_lightning_indexer_v2_vector.h"
+
+namespace QLIV2ServiceVec {
+using namespace AscendC;
+
+constexpr int32_t NEG_INF = 0xFF800000;
+constexpr uint16_t NEG_INF_BFLOAT = 0xFF80;  // -inf (bfloat16 bits, 与 arch35 对齐)
+constexpr int32_t POS_INF_F32 = 0x7F800000;  // +inf (fp32 bits)
+constexpr int32_t NEG_HUGE_F32 = 0xF14A3E31; // -1e30 (fp32 bits)
+constexpr int32_t INVALID_INDEX = -1;
+constexpr uint8_t VEC_REPEAT_MAX = 255;
+constexpr uint8_t B32_VEC_ELM_NUM = 64;
+constexpr uint8_t B32_BLOCK_ALIGN_NUM = 8;
+constexpr uint8_t B32_VEC_REPEAT_STRIDE = 8;
+constexpr uint64_t VEC_REPEAT_BYTES = 256;
+constexpr int32_t CONST_TWO = 2;
+constexpr int64_t VALUE_AND_INDEX_NUM = 2;
+constexpr int64_t BLOCK_BYTES = 32;
+constexpr int64_t MRG_QUE_0 = 0;
+constexpr int64_t MRG_QUE_1 = 1;
+constexpr int64_t MRG_QUE_2 = 2;
+constexpr int64_t MRG_QUE_3 = 3;
+constexpr int64_t MRG_BLOCK_2 = 2;
+constexpr int64_t MRG_BLOCK_3 = 3;
+constexpr int64_t MRG_BLOCK_4 = 4;
+// MrgSort4Info::validBit: 4 路源 list 的有效性位掩码, 低 N 位为 1 表示前 N 路参与归并
+constexpr uint16_t MRG_VALID_BIT_2 = 0b0011;
+constexpr uint16_t MRG_VALID_BIT_3 = 0b0111;
+constexpr uint16_t MRG_VALID_BIT_4 = 0b1111;
+
+// ============ 向量区间下发的公共规划 ============
+// 背景: dav_c220 的 Level-2 count 版向量接口内部把 repeatTimes 固定为 1 并切到 count 掩码模式
+// (vmax 等指令 count > 一个 repeat 即越界触发 aicore 异常), 故一律改用 Level-0 显式下发:
+//   满 repeat 段: mask 取一个 repeat 的元素个数, repeatTimes 一次给足, 单条指令覆盖整段
+//   尾段 (<1 个 repeat): mask 取 remain, repeatTimes=1, 精确覆盖不多写
+// (旧实现按 B32_VEC_ELM_NUM 分块逐次调 Level-2, 每次要 2 写掩码寄存器 + 2 次模式切换)
+// 单个满 repeat 的元素个数 (作为 Level-0 标量 mask 传入)
+constexpr uint64_t B32_MASK_FULL = static_cast<uint64_t>(B32_VEC_ELM_NUM);
+
+// 规划单次 Level-0 下发: 输出 mask 与 repeatTimes
+// 注: Level-0 标量 mask 形参按"元素个数"语义传 (见 ascendc-api-best-practices
+// references/api-repeat-limits.md 的 SubWithBroadcast 范例: curMask = min(剩余, 每个 repeat 的元素数))
+__aicore__ inline void VecRepeatPlan(int32_t remainEleNum, uint64_t& mask, uint8_t& repeatTimes)
+{
+    if (remainEleNum >= static_cast<int32_t>(B32_VEC_ELM_NUM)) {
+        int32_t repeatNum = remainEleNum / static_cast<int32_t>(B32_VEC_ELM_NUM);
+        mask = static_cast<uint64_t>(B32_VEC_ELM_NUM);
+        repeatTimes = static_cast<uint8_t>(
+            repeatNum < static_cast<int32_t>(VEC_REPEAT_MAX) ? repeatNum : static_cast<int32_t>(VEC_REPEAT_MAX));
+    } else {
+        // 尾段: 只覆盖 remain 个元素, 不越写
+        mask = static_cast<uint64_t>(remainEleNum);
+        repeatTimes = 1;
+    }
+}
+
+// 单次下发可覆盖的最大元素数 (repeatTimes 上限 × 一个 repeat); 超过则调用点的 while 会再发一次
+constexpr int32_t VEC_REPEAT_RANGE_MAX = static_cast<int32_t>(VEC_REPEAT_MAX) * static_cast<int32_t>(B32_VEC_ELM_NUM);
+
+// 连续排布（块步长 1, repeat 步长 8 个 32B 块 = 256B）的标准迭代参数
+__aicore__ inline UnaryRepeatParams B32RepeatParams()
+{
+    return UnaryRepeatParams(1, 1, B32_VEC_REPEAT_STRIDE, B32_VEC_REPEAT_STRIDE);
+}
+
+__aicore__ inline BinaryRepeatParams B32BinaryRepeatParams()
+{
+    return BinaryRepeatParams(1, 1, 1, B32_VEC_REPEAT_STRIDE, B32_VEC_REPEAT_STRIDE, B32_VEC_REPEAT_STRIDE);
+}
+
+/**
+  纯 V 位精确 UB→UB 回拷（int32 视图 Adds(+0)）：Level-0「掩码 + repeat」下发，
+  单条指令最多覆盖 VEC_REPEAT_MAX×B32_VEC_ELM_NUM 个元素，超出则分段。
+  位精确（+0 不改变位型），全程 V 管道，受 PipeBarrier<PIPE_V> 约束。
+ */
+__aicore__ inline void VecCopyExactRun(const LocalTensor<int32_t>& dstI, const LocalTensor<int32_t>& srcI,
+                                       int32_t total)
+{
+    int32_t off = 0;
+    while (off < total) {
+        uint64_t mask = 0;
+        uint8_t repeatTimes = 0;
+        VecRepeatPlan(total - off, mask, repeatTimes);
+        AscendC::Adds(dstI[off], srcI[off], 0, mask, repeatTimes, B32RepeatParams());
+        off += static_cast<int32_t>(repeatTimes) * static_cast<int32_t>(B32_VEC_ELM_NUM);
+    }
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
+template <typename T>
+__aicore__ inline void CopyOut(const GlobalTensor<T>& dstGm, const LocalTensor<T>& srcUb, int64_t copyCount)
+{
+    AscendC::DataCopyParams dataCopyOutyParams;
+    dataCopyOutyParams.blockCount = 1;
+    dataCopyOutyParams.blockLen = copyCount * sizeof(T);
+    dataCopyOutyParams.srcStride = 0;
+    dataCopyOutyParams.dstStride = 0;
+    AscendC::DataCopyPad(dstGm, srcUb, dataCopyOutyParams);
+}
+
+/**
+  src: 传入的初始化空间
+  eleNum: 需要初始化的元素个数需为64整数倍，元素将被初始化为交错排布的-inf，-1
+ */
+__aicore__ inline void InitSortOutBuf(const LocalTensor<float>& src, int64_t eleNum)
+{
+    uint64_t mask1[2] = {0x5555555555555555, 0};
+    uint64_t mask0[2] = {0xaaaaaaaaaaaaaaaa, 0};
+    int64_t repeatNum = eleNum / B32_VEC_ELM_NUM;
+    int64_t forLoop = repeatNum / VEC_REPEAT_MAX;
+    int64_t forRemain = repeatNum % VEC_REPEAT_MAX;
+    for (int i = 0; i < forLoop; i++) {
+        AscendC::Duplicate(src.template ReinterpretCast<int32_t>(), NEG_INF, mask1, VEC_REPEAT_MAX, 1,
+                           B32_VEC_REPEAT_STRIDE);
+        AscendC::Duplicate(src.template ReinterpretCast<int32_t>(), INVALID_INDEX, mask0, VEC_REPEAT_MAX, 1,
+                           B32_VEC_REPEAT_STRIDE);
+    }
+    if (forRemain > 0) {
+        AscendC::Duplicate(src.template ReinterpretCast<int32_t>()[forLoop * VEC_REPEAT_MAX * B32_VEC_ELM_NUM], NEG_INF,
+                           mask1, forRemain, 1, B32_VEC_REPEAT_STRIDE);
+        AscendC::Duplicate(src.template ReinterpretCast<int32_t>()[forLoop * VEC_REPEAT_MAX * B32_VEC_ELM_NUM],
+                           INVALID_INDEX, mask0, forRemain, 1, B32_VEC_REPEAT_STRIDE);
+    }
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
+/**
+  位精确的 UB→UB 回拷（UB 为 Unified Buffer，统一缓冲区）。
+
+  UB→UB 的 DataCopy 走 MTE（Memory Transfer Engine，存储搬运管道），其后的
+  PipeBarrier<PIPE_V> 不构成跨管道 fence：调度敏感场景下，下一次向量读可能读到
+  stale（陈旧）数据。改用 int32 视图的 Adds(+0)：全程在 V（Vector，向量）管道内，
+  受 PipeBarrier 约束，且按位拷贝 —— 避免 -1（0xFFFFFFFF）作为 float 是负符号 NaN、
+  vadd 会被规范化为 0x7FFFFFFF 的问题。
+ */
+__aicore__ inline void VecCopyExact(const LocalTensor<float>& dst, const LocalTensor<float>& src, int32_t num)
+{
+    VecCopyExactRun(dst.template ReinterpretCast<int32_t>(), src.template ReinterpretCast<int32_t>(), num);
+}
+
+/**
+  src: logits和索引，前logitsNum为logits，后logitsNum为索引
+  tmp: 计算使用到的临时空间，大小与src一致
+  logitsNum: 排序的元素个数, 暂只支持[128,256,384,512,1024,2048]
+ */
+__aicore__ inline void SortAll(LocalTensor<float>& src, LocalTensor<float>& tmp, int64_t logitsNum)
+{
+    int64_t sort32Repeats = logitsNum / BLOCK_BYTES;
+    AscendC::Sort32(tmp, src, src[logitsNum].ReinterpretCast<uint32_t>(), sort32Repeats);
+    AscendC::PipeBarrier<PIPE_V>();
+
+    int64_t mrgGroups = sort32Repeats;
+    int64_t mrgElements = BLOCK_BYTES;
+    int64_t i = 0;
+    AscendC::LocalTensor<float> srcTensor;
+    AscendC::LocalTensor<float> dstTensor;
+    while (true) {
+        if (i % CONST_TWO == 0) {
+            srcTensor = tmp;
+            dstTensor = src;
+        } else {
+            srcTensor = src;
+            dstTensor = tmp;
+        }
+        AscendC::MrgSort4Info params;
+        params.elementLengths[0] = mrgElements;
+        params.elementLengths[MRG_QUE_1] = mrgElements;
+        params.elementLengths[MRG_QUE_2] = mrgElements;
+        params.elementLengths[MRG_QUE_3] = mrgElements;
+        params.ifExhaustedSuspension = false;
+        params.validBit = MRG_VALID_BIT_4;
+
+        AscendC::MrgSortSrcList<float> srcList;
+        srcList.src1 = srcTensor[0];
+        srcList.src2 = srcTensor[MRG_QUE_1 * VALUE_AND_INDEX_NUM * mrgElements];
+        srcList.src3 = srcTensor[MRG_QUE_2 * VALUE_AND_INDEX_NUM * mrgElements];
+        srcList.src4 = srcTensor[MRG_QUE_3 * VALUE_AND_INDEX_NUM * mrgElements];
+        if (mrgGroups <= MRG_BLOCK_4) {
+            params.repeatTimes = 1;
+            if (mrgGroups == 1) {
+                break;
+            } else if (mrgGroups == MRG_BLOCK_2) {
+                params.validBit = MRG_VALID_BIT_2;
+            } else if (mrgGroups == MRG_BLOCK_3) {
+                params.validBit = MRG_VALID_BIT_3;
+            } else if (mrgGroups == MRG_BLOCK_4) {
+                params.validBit = MRG_VALID_BIT_4;
+            }
+            AscendC::MrgSort<float>(dstTensor, srcList, params);
+            i += 1;
+            break;
+        } else {
+            params.repeatTimes = mrgGroups / MRG_BLOCK_4;
+            AscendC::MrgSort<float>(dstTensor, srcList, params);
+            i += 1;
+            mrgElements = mrgElements * MRG_BLOCK_4;
+            mrgGroups = mrgGroups / MRG_BLOCK_4;
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+    if (i % CONST_TWO == 0) {
+        VecCopyExact(src, tmp, static_cast<int32_t>(logitsNum * VALUE_AND_INDEX_NUM));
+    }
+}
+
+/**
+  mrgDst: 合并进的Tensor
+  mrgSrc: 待合并的Tensor
+  tmpTensor：空间为mrgDst+mrgSrc
+ */
+__aicore__ inline void MergeSort(const LocalTensor<float>& mrgDst, int32_t mrgDstNum, LocalTensor<float>& mrgSrc,
+                                 int32_t mrgSrcNum, LocalTensor<float>& tmpTensor)
+{
+    AscendC::MrgSort4Info params;
+    params.elementLengths[0] = mrgSrcNum;
+    params.elementLengths[1] = mrgDstNum;
+    params.ifExhaustedSuspension = false;
+    params.validBit = MRG_VALID_BIT_2;
+    params.repeatTimes = 1;
+
+    AscendC::MrgSortSrcList<float> srcList;
+    srcList.src1 = mrgSrc;
+    srcList.src2 = mrgDst;
+
+    AscendC::MrgSort<float>(tmpTensor, srcList, params);
+    AscendC::PipeBarrier<PIPE_V>();
+    VecCopyExact(mrgDst, tmpTensor, mrgDstNum * VALUE_AND_INDEX_NUM);
+}
+
+__aicore__ inline void ExtractIndex(const LocalTensor<uint32_t>& idxULocal, const LocalTensor<uint32_t>& sortLocal,
+                                    int64_t extractNum)
+{
+    AscendC::GatherMaskParams gatherMaskParams;
+    gatherMaskParams.repeatTimes = Ceil(extractNum * sizeof(float) * VALUE_AND_INDEX_NUM, VEC_REPEAT_BYTES);
+    gatherMaskParams.src0BlockStride = 1;
+    gatherMaskParams.src0RepeatStride = B32_VEC_REPEAT_STRIDE;
+    gatherMaskParams.src1RepeatStride = 0;
+    uint64_t rsvdCnt = 0;    // 用于保存筛选后保留下来的元素个数
+    uint8_t src1Pattern = 2; // 固定模式2,表示筛选出奇数索引的数
+    AscendC::GatherMask(idxULocal, sortLocal, src1Pattern, false, static_cast<uint32_t>(0), gatherMaskParams, rsvdCnt);
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
+/**
+  return_value: 从排序后的 (value, index) 交错序列中抽取偶数 lane 的分数。
+  src/dst 均按 uint32 视图操作, 调用方按 float 解释 dst。
+ */
+__aicore__ inline void ExtractValue(const LocalTensor<uint32_t>& valULocal, const LocalTensor<uint32_t>& sortLocal,
+                                    int64_t extractNum)
+{
+    AscendC::GatherMaskParams gatherMaskParams;
+    gatherMaskParams.repeatTimes = Ceil(extractNum * sizeof(float) * VALUE_AND_INDEX_NUM, VEC_REPEAT_BYTES);
+    gatherMaskParams.src0BlockStride = 1;
+    gatherMaskParams.src0RepeatStride = B32_VEC_REPEAT_STRIDE;
+    gatherMaskParams.src1RepeatStride = 0;
+    uint64_t rsvdCnt = 0;
+    uint8_t src1Pattern = 1; // 固定模式1, 表示筛选出偶数索引的数 (value)
+    AscendC::GatherMask(valULocal, sortLocal, src1Pattern, false, static_cast<uint32_t>(0), gatherMaskParams, rsvdCnt);
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
+/**
+  候选路径专用合并: 与 MergeSort 语义相同, 但回拷 mrgDst 用纯向量 Adds (按 B32_VEC_ELM_NUM 分块)。
+  MergeSort 尾部的 UB->UB DataCopy 若走 MTE 管道, 其后的 PipeBarrier<PIPE_V> 不构成 fence,
+  跨 tile/跨行对累加器的下一次 MrgSort 读存在调度敏感竞态 (实测多 tile 场景 tile1 读到 tile0 stale
+  数据, 累加器出现 -inf 位型+8k 垃圾且 tile1 块整段缺失)。纯 V 回拷全程受 PipeBarrier 约束。
+ */
+__aicore__ inline void MergeSortVecCopy(const LocalTensor<float>& mrgDst, int32_t mrgDstNum, LocalTensor<float>& mrgSrc,
+                                        int32_t mrgSrcNum, LocalTensor<float>& tmpTensor, bool accumulatedFirst = false)
+{
+    AscendC::MrgSort4Info params;
+    // accumulatedFirst：让"已累积的旧候选"排在前面，同分时保留更小 ID；
+    // 默认 false 时保持原调用方的 src 顺序。
+    params.elementLengths[0] = accumulatedFirst ? mrgDstNum : mrgSrcNum;
+    params.elementLengths[1] = accumulatedFirst ? mrgSrcNum : mrgDstNum;
+    params.ifExhaustedSuspension = false;
+    params.validBit = MRG_VALID_BIT_2;
+    params.repeatTimes = 1;
+
+    AscendC::MrgSortSrcList<float> srcList;
+    srcList.src1 = accumulatedFirst ? mrgDst : mrgSrc;
+    srcList.src2 = accumulatedFirst ? mrgSrc : mrgDst;
+
+    AscendC::MrgSort<float>(tmpTensor, srcList, params);
+    AscendC::PipeBarrier<PIPE_V>();
+    // 保留逐 64 元素循环：块级逐 tile 归并是唯一对单条长回拷敏感的位置
+    // （实测 VecCopyExactRun 的单条多 repeat 形态会破坏候选块输出，其余回拷均正确）。
+    int32_t copyNum = mrgDstNum * VALUE_AND_INDEX_NUM;
+    LocalTensor<int32_t> dstI = mrgDst.template ReinterpretCast<int32_t>();
+    LocalTensor<int32_t> srcI = tmpTensor.template ReinterpretCast<int32_t>();
+    for (int32_t off = 0; off < copyNum; off += B32_VEC_ELM_NUM) {
+        AscendC::Adds(dstI[off], srcI[off], 0, B32_VEC_ELM_NUM);
+    }
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
+template <HardEvent event>
+__aicore__ inline void SetWaitFlag(HardEvent evt)
+{
+    event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(evt));
+    AscendC::SetFlag<event>(eventId);
+    AscendC::WaitFlag<event>(eventId);
+}
+
+} // namespace QLIV2ServiceVec
+#endif // QUANT_LIGHTNING_INDEXER_V2_VECTOR_H
