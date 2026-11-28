@@ -119,13 +119,14 @@ function prepare_common_deps()
     log "Info: copying ops_transformer common headers from ${CANN_COMMON}"
     mkdir -p "${COMMON_DST}"
     COMMON_STAGED="true"
-    for file in "${common_files[@]}"; do
-        cp -f "${CANN_COMMON}/${file}" "${COMMON_DST}/"
-    done
-    cp -rf "${CANN_COMMON}/memcopy" "${COMMON_DST}/"
     if [[ "${ascend_compute_unit}" == *"ascend950"* ]]; then
-        mkdir -p "${COMMON_DST}/arch35"
-        cp -rf "${CANN_COMMON}/arch35/vf" "${COMMON_DST}/arch35/"
+        # A5 的 QSFA/Lightning 依赖还会递归引用 attn_buffer、arch_info 等头文件。
+        cp -rf "${CANN_COMMON}/." "${COMMON_DST}/"
+    else
+        for file in "${common_files[@]}"; do
+            cp -f "${CANN_COMMON}/${file}" "${COMMON_DST}/"
+        done
+        cp -rf "${CANN_COMMON}/memcopy" "${COMMON_DST}/"
     fi
 }
 
